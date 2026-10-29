@@ -54,6 +54,9 @@ inline constexpr std::size_t kAcceptBatch = 128;
 // on the reactor at TTL expiry is an acceptable trade-off (documented).
 inline constexpr std::chrono::seconds kFallbackResolveTtl{300};
 inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
+// A client's coalesced ME answers are handed to its queue once they reach this
+// size even before the ME read ends, bounding the per-read staging copy.
+inline constexpr std::size_t kS2cBatchFlushBytes = 128U * 1024U;
 
 // Releases a worker scratch buffer that grew for one large frame.
 inline void trim_buffer(std::vector<std::uint8_t>& buffer) {
@@ -95,6 +98,8 @@ inline constexpr std::size_t kMePendingBatch = 4;
 // reached over several ticks, and a synchronously failing endpoint cannot turn
 // one call into a connect storm.
 inline constexpr std::size_t kMeDialBatch = 4;
+// TCP_USER_TIMEOUT for ME sockets (milliseconds).
+inline constexpr unsigned kMeUserTimeoutMs = 30000;
 
 // Bound for configured reactors. Fixed-size statistic arrays use the same cap.
 inline constexpr std::size_t kMaxWorkers = 256;
@@ -120,6 +125,10 @@ inline constexpr std::chrono::milliseconds kPollInterval{150};
 // by the 150 ms housekeeping tick and by an earlier exact EOF deadline, so an
 // EOF close is bounded by this cadence without scanning every epoll batch.
 inline constexpr std::chrono::milliseconds kEofSweepInterval{150};
+
+// After the client's read EOF, how long a session whose only pending work is
+// an unanswered ME request is kept for that reply.
+inline constexpr std::chrono::milliseconds kEofReplyGrace{2000};
 
 // After this much inactivity a client releases its empty per-connection
 // buffers (output block, TLS/decoder reassembly capacity, staged TLS wire).
@@ -511,6 +520,12 @@ struct Runtime::Impl {
         std::optional<protocol::TransportDecoder> decoder;
         std::optional<io::ByteQueue> out;
         std::vector<std::uint8_t> s2c_wire; // ordered TLS wire not yet queued
+        // ME answers for this client decoded during the current ME read,
+        // coalesced into open TLS records and written once per read by
+        // flush_s2c_batches(). Empty outside read_me().
+        std::vector<std::uint8_t> s2c_batch;
+        std::size_t s2c_open_record{protocol::FakeTlsConnection::kNoOpenRecord};
+        bool in_s2c_batch{false};
         std::size_t s2c_offset{0};
         std::deque<protocol::TransportDecoder::Message> c2s;
         std::size_t c2s_capacity{0}; // allocated bytes of c2s message vectors
@@ -587,6 +602,10 @@ struct Runtime::Impl {
         // true between forwarding any C2S message and the next S2C response.
         bool awaiting_reply{false};
         Time last_forward_at{};
+        // First recorded reason this relay session is being closed for;
+        // published once by close_client() for authenticated sessions.
+        control::RelayCloseReason close_reason{control::RelayCloseReason::other};
+        bool close_reason_set{false};
     };
 
     struct StagedFrame {
@@ -801,7 +820,10 @@ struct Runtime::Impl {
     // Clients
     // ------------------------------------------------------------------
     void accept_clients(Time now);
-    Client* make_client(io::UniqueFd fd, Time now, control::RejectReason& failure);
+    // `peer` is the address accept4() returned; nullopt falls back to
+    // getpeername().
+    Client* make_client(io::UniqueFd fd, Time now, control::RejectReason& failure,
+                        std::optional<io::Endpoint> peer = std::nullopt);
     // Client object pool. acquire_client() returns a default-constructed,
     // fully reset Client; recycle_client() returns one after close_client has
     // removed every external reference, and is noexcept.
@@ -841,6 +863,18 @@ struct Runtime::Impl {
     void reject_close(Client& client, control::RejectReason reason,
                       std::optional<control::HandshakeResult> handshake);
     void close_client(std::uint64_t token, bool record_pending_handshake = true);
+    // Appends the current ME read's coalesced answers to every touched client
+    // and writes them with one direct flush each (EPOLLOUT only on EAGAIN).
+    void flush_s2c_batches();
+    // write_now=false only queues (safe inside an ME decoder callback, where a
+    // socket error must not close the client and re-enter the ME session).
+    bool finish_s2c_batch(Client& client, bool write_now = true);
+    static void note_close(Client& client, control::RelayCloseReason reason) noexcept {
+        if (client.close_reason_set) return;
+        client.close_reason_set = true;
+        client.close_reason = reason;
+    }
+    void close_client(std::uint64_t token, control::RelayCloseReason reason);
     void close_fallback_backend(Client& client);
     bool count_client_unique_ip(Client& client);
     void decrement_client_unique_ip(Client& client) noexcept;
@@ -988,10 +1022,17 @@ struct Runtime::Impl {
     Deadlines deadlines_;
 
     std::shared_ptr<const control::UserSnapshot> users_snapshot_;
+    std::vector<std::uint64_t> s2c_batch_tokens_;
+    std::size_t accept_burst_{1};
+    // Pre-keyed ClientHello HMAC per enabled user of hello_keys_snapshot_
+    // (held so the UserRecord pointers stay valid). Rebuilt on snapshot change.
+    std::shared_ptr<const control::UserSnapshot> hello_keys_snapshot_;
+    std::vector<protocol::crypto::HmacSha256Key> hello_keys_;
+    std::vector<const protocol::crypto::HmacSha256Key*> hello_key_ptrs_;
+    std::vector<const control::UserRecord*> hello_key_users_;
     std::shared_ptr<const MeMetadata> metadata_snapshot_;
     std::size_t enabled_users_{0};
     bool warming_{false};
-    std::size_t warm_cursor_{0};
     std::vector<std::int16_t> warm_dcs_;
 
     std::size_t budget_used_{0};
@@ -1013,6 +1054,7 @@ struct Runtime::Impl {
     // so a steady-state sweep allocates nothing.
     std::vector<std::uint64_t> eof_remaining_;
     std::vector<std::uint64_t> fallback_clients_;
+    std::vector<std::uint64_t> fallback_remaining_; // sweep scratch, reused
     std::vector<std::uint64_t> direct_eof_clients_;
     std::map<std::int16_t, std::uint64_t> direct_accepted_;
     std::map<std::int16_t, std::uint64_t> direct_connect_fail_;

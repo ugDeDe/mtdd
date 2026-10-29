@@ -43,6 +43,12 @@ struct Config {
     std::chrono::seconds handshake_timeout{15};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
+    // Client socket liveness. Keepalive probes start after this much silence
+    // (0 disables), and TCP_USER_TIMEOUT resets a peer that leaves data or
+    // probes unacknowledged this long (0 keeps the kernel default). Without
+    // them a vanished mobile client holds its slot until idle_timeout.
+    std::chrono::seconds client_keepalive{60};
+    std::chrono::seconds client_ack_timeout{90};
     std::chrono::seconds metadata_refresh{3600};
     // Opt-in Direct Telegram DC fallback. Disabled by default; only the listed
     // signed DCs use the trusted official direct address table.

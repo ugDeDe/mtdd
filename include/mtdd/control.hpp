@@ -246,6 +246,20 @@ enum class RejectReason {
 };
 
 enum class HandshakeResult { success, failure, timeout, replay };
+// Why an authenticated relay session ended. First recorded reason wins.
+enum class RelayCloseReason : uint8_t {
+  other,
+  client_eof,      // peer half-closed and the session drained
+  client_error,    // recv/send error (reset, broken pipe)
+  client_timeout,  // ETIMEDOUT: TCP keepalive / TCP_USER_TIMEOUT found a dead peer
+  idle_timeout,
+  me_lost,         // the bound ME writer failed or was retired
+  backpressure,    // buffer budget or queue limit
+  remote_close,    // ME sent RPC_CLOSE_CONN
+  revoked,         // user disabled, deleted or rotated
+  shutdown,
+};
+inline constexpr std::size_t kRelayCloseReasons = 10;
 enum class Direction { client_to_server, server_to_client };
 enum class BufferState { queued, pending_write, relay };
 enum class MeResult { success, failure, timeout };
@@ -404,6 +418,7 @@ struct StatisticsSnapshot {
   uint64_t client_reuses_total{0};         // Client objects taken from freelist
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
+  std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
   uint64_t replay_cache_entries{0};
   uint64_t api_requests_total{0};
   uint64_t me_pending_buffer_bytes{0};
@@ -497,6 +512,7 @@ class Statistics {
   void set_client_pool(std::size_t worker, uint64_t pooled, uint64_t allocations,
                        uint64_t reuses) noexcept;
   void add_backpressure(Direction direction) noexcept;
+  void relay_closed(RelayCloseReason reason) noexcept;
   void set_replay_cache_entries(uint64_t entries) noexcept;
   void set_replay_cache_entries(std::size_t worker, uint64_t entries) noexcept;
 

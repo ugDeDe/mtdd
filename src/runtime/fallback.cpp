@@ -464,7 +464,8 @@ void Runtime::Impl::on_fallback_deadline(Client& client, Time now) {
 
 void Runtime::Impl::finish_fallback_pairs(Time now) {
     if (fallback_clients_.empty()) return;
-    std::vector<std::uint64_t> remaining;
+    std::vector<std::uint64_t>& remaining = fallback_remaining_;
+    remaining.clear();
     for (const std::uint64_t token : fallback_clients_) {
         const auto found = clients_.find(token);
         if (found == clients_.end()) continue;
@@ -499,7 +500,8 @@ void Runtime::Impl::finish_fallback_pairs(Time now) {
             remaining.push_back(token);
         }
     }
-    fallback_clients_ = std::move(remaining);
+    fallback_clients_.swap(remaining);
+    remaining.clear();
 }
 
 } // namespace mtdd

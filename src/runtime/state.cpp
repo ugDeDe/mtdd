@@ -56,7 +56,9 @@ void Runtime::Impl::apply_user_snapshot(bool initial) {
                 obsolete.push_back(token);
             }
         }
-        for (const std::uint64_t token : obsolete) close_client(token);
+        for (const std::uint64_t token : obsolete) {
+            close_client(token, control::RelayCloseReason::revoked);
+        }
     }
     if (users_snapshot_) barrier_.acknowledge(worker_index_, users_snapshot_->revision);
     recompute_ready();
@@ -121,47 +123,45 @@ void Runtime::Impl::start_warming(Time now) {
         if (left_abs != right_abs) return left_abs < right_abs;
         return left < right;
     });
-    // Bounded v1 warm set: a dead primary route may not suppress the others.
-    constexpr std::size_t kWarmRoutes = 4;
-    if (distinct.size() > kWarmRoutes) distinct.resize(kWarmRoutes);
+    // Warm every primary and media DC (+/-1..5), not just the first one that
+    // answers: a cold DC makes its first client wait for TCP connect plus the
+    // ME handshake. Scale-down never removes a DC's last writer, so a warmed
+    // pool stays as a floor of one writer. Other ids (CDN/test) stay lazy
+    // unless the metadata lists nothing else.
+    constexpr std::size_t kFallbackWarmRoutes = 4;
+    const auto primary_end = std::find_if(distinct.begin(), distinct.end(),
+                                          [&](std::int16_t dc) { return rank(dc) == 2; });
+    if (primary_end != distinct.begin()) {
+        distinct.erase(primary_end, distinct.end());
+    } else if (distinct.size() > kFallbackWarmRoutes) {
+        distinct.resize(kFallbackWarmRoutes);
+    }
     warm_dcs_ = std::move(distinct);
-    warm_cursor_ = 0;
     warming_ = !warm_dcs_.empty();
     advance_warming(now);
 }
 
 void Runtime::Impl::advance_warming(Time now) {
     if (!warming_ || stopping_) return;
-    for (const auto& [dc, pool] : me_pool_) {
-        (void)dc;
-        for (const auto& connection : pool.conns) {
-            if (connection && !connection->draining &&
-                connection->state == MeConn::State::ready) {
-                warming_ = false;
-                return;
+    bool complete = true;
+    for (const std::int16_t dc : warm_dcs_) {
+        const auto found = me_pool_.find(dc);
+        bool has_member = false;
+        if (found != me_pool_.end()) {
+            for (const auto& connection : found->second.conns) {
+                if (connection && !connection->draining) {
+                    has_member = true;
+                    break;
+                }
             }
         }
+        if (has_member) continue;
+        // ensure_me() bounds the dial batch per pool. A member that fails
+        // synchronously stays in backoff and is retried by housekeeping.
+        // A DC without usable candidates returns null and is not retried here.
+        if (ensure_me(dc, now) != nullptr) complete = false;
     }
-    for (const auto& [dc, pool] : me_pool_) {
-        (void)dc;
-        for (const auto& connection : pool.conns) {
-            if (connection && !connection->draining &&
-                (connection->state == MeConn::State::connecting ||
-                 connection->state == MeConn::State::handshaking)) {
-                return;
-            }
-        }
-    }
-    while (warm_cursor_ < warm_dcs_.size()) {
-        const std::int16_t dc = warm_dcs_[warm_cursor_];
-        ++warm_cursor_;
-        MeConn* me = ensure_me(dc, now);
-        if (me == nullptr) continue;
-        if (me->state == MeConn::State::backoff) continue; // failed synchronously
-        recompute_ready();
-        return;
-    }
-    warming_ = false;
+    if (complete) warming_ = false;
     recompute_ready();
 }
 

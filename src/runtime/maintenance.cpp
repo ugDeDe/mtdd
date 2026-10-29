@@ -83,6 +83,7 @@ void Runtime::Impl::reaccount(Client& client) {
     if (client.c2b) next += client.c2b->capacity_bytes();
     if (client.direct_out) next += client.direct_out->capacity_bytes();
     next += client.s2c_wire.capacity();
+    next += client.s2c_batch.capacity();
     next += client.c2s_capacity;
     if (next >= client.accounted) {
         budget_used_ += next - client.accounted;
@@ -298,7 +299,9 @@ void Runtime::Impl::shutdown_pump(Time now) {
             closing.push_back(token);
         }
     }
-    for (const std::uint64_t token : closing) close_client(token);
+    for (const std::uint64_t token : closing) {
+        close_client(token, control::RelayCloseReason::shutdown);
+    }
     for (auto& [dc, pool] : me_pool_) {
         (void)dc;
         for (auto& me : pool.conns) {
@@ -322,7 +325,9 @@ void Runtime::Impl::finalize() {
         (void)client;
         tokens.push_back(token);
     }
-    for (const std::uint64_t token : tokens) close_client(token);
+    for (const std::uint64_t token : tokens) {
+        close_client(token, control::RelayCloseReason::shutdown);
+    }
     for (auto& [dc, pool] : me_pool_) {
         for (auto& me : pool.conns) {
             if (!me) continue;

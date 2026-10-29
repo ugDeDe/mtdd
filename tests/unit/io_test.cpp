@@ -8,6 +8,8 @@
 #include "mtdd/io.hpp"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -718,4 +720,38 @@ TEST(SocketTest, NumericAddressHelpersStayOffline) {
     const auto v6 = io::resolve_numeric_host("::1");
     ASSERT_TRUE(v6.has_value());
     EXPECT_EQ(*v6, "::1");
+}
+
+TEST(SocketOptionsTest, UserTimeoutAndKeepaliveAreApplied) {
+    mtdd::io::UniqueFd fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    ASSERT_TRUE(fd.valid());
+    ASSERT_TRUE(mtdd::io::set_tcp_user_timeout(fd.get(), 90000));
+    unsigned timeout = 0;
+    socklen_t length = sizeof(timeout);
+    ASSERT_EQ(::getsockopt(fd.get(), IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, &length), 0);
+    EXPECT_EQ(timeout, 90000U);
+    // Zero restores the kernel default before close().
+    EXPECT_TRUE(mtdd::io::set_tcp_user_timeout(fd.get(), 0));
+    ASSERT_EQ(::getsockopt(fd.get(), IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, &length), 0);
+    EXPECT_EQ(timeout, 0U);
+
+    ASSERT_TRUE(mtdd::io::set_tcp_keepalive(fd.get(), 60, 15, 4));
+    int idle = 0;
+    length = sizeof(idle);
+    ASSERT_EQ(::getsockopt(fd.get(), IPPROTO_TCP, TCP_KEEPIDLE, &idle, &length), 0);
+    EXPECT_EQ(idle, 60);
+    EXPECT_FALSE(mtdd::io::set_tcp_user_timeout(-1, 1000));
+}
+
+TEST(SocketOptionsTest, EndpointFromAcceptAddressMatchesPeerEndpoint) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(4433);
+    ASSERT_EQ(::inet_pton(AF_INET, "203.0.113.7", &address.sin_addr), 1);
+    const auto endpoint = mtdd::io::endpoint_from_address(&address, sizeof(address));
+    ASSERT_TRUE(endpoint.has_value());
+    EXPECT_EQ(endpoint->address, "203.0.113.7");
+    EXPECT_EQ(endpoint->port, 4433);
+    EXPECT_FALSE(mtdd::io::endpoint_from_address(&address, 2).has_value());
+    EXPECT_FALSE(mtdd::io::endpoint_from_address(nullptr, 0).has_value());
 }

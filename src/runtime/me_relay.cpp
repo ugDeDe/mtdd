@@ -378,6 +378,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     const std::size_t required = payload.size() * 2 + 64U * 1024U;
     if (!budget_allows(required)) {
         stats_.add_backpressure(control::Direction::server_to_client);
+        note_close(client, control::RelayCloseReason::backpressure);
         defer_close(client.token);
         return;
     }
@@ -386,19 +387,21 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         // transport header/padding is written directly into the TLS record body
         // (byte-identical wire for the same random stream), so no separate
         // frame buffer and no second full-payload copy are needed.
-        wire_buffer_.clear();
-        if (client.tls->send_transport_message(client.tls->proto_tag(), payload, wire_buffer_,
-                                               random_) != protocol::Status::Ok) {
+        // Answers decoded in the same ME read are appended to one open TLS
+        // record per client and written once by flush_s2c_batches().
+        if (client.tls->send_transport_message(client.tls->proto_tag(), payload,
+                                               client.s2c_batch, random_,
+                                               &client.s2c_open_record) !=
+            protocol::Status::Ok) {
             defer_close(client.token);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
             return;
         }
-        if (!push_client_wire(client, wire_buffer_)) {
-            stats_.add_backpressure(control::Direction::server_to_client);
-            defer_close(client.token);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
+        if (!client.in_s2c_batch) {
+            client.in_s2c_batch = true;
+            s2c_batch_tokens_.push_back(client.token);
+        }
+        if (client.s2c_batch.size() >= detail::kS2cBatchFlushBytes &&
+            !finish_s2c_batch(client, false)) {
             return;
         }
     } catch (const std::bad_alloc&) {
@@ -425,8 +428,6 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     client.awaiting_reply = false;
     ++me.ans_delivered;
     stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::delivered);
-    detail::trim_scratch(wire_buffer_);
-    reaccount_shared();
 }
 
 void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
@@ -453,17 +454,16 @@ void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
     try {
         frame_buffer_.clear();
         protocol::encode_quick_ack(client.tls->proto_tag(), confirm, frame_buffer_);
-        wire_buffer_.clear();
-        if (client.tls->send(frame_buffer_, wire_buffer_) != protocol::Status::Ok) {
+        // Same ordered stream as payload answers of this ME read.
+        if (client.tls->send(frame_buffer_, client.s2c_batch, &client.s2c_open_record) !=
+            protocol::Status::Ok) {
             defer_close(client.token);
             detail::trim_scratch(frame_buffer_);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
             return;
         }
-        if (!push_client_wire(client, wire_buffer_)) {
-            stats_.add_backpressure(control::Direction::server_to_client);
-            defer_close(client.token);
+        if (!client.in_s2c_batch) {
+            client.in_s2c_batch = true;
+            s2c_batch_tokens_.push_back(client.token);
         }
     } catch (const std::bad_alloc&) {
         defer_close(client.token);
@@ -473,8 +473,6 @@ void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
         defer_me_failure(me);
     }
     detail::trim_scratch(frame_buffer_);
-    detail::trim_scratch(wire_buffer_);
-    reaccount_shared();
 }
 
 void Runtime::Impl::MeSink::on_proxy_payload(const detail::ConnId& id,
@@ -502,7 +500,12 @@ void Runtime::Impl::MeSink::on_quick_ack(const detail::ConnId& id,
 void Runtime::Impl::MeSink::on_remote_close(const detail::ConnId& id) {
     try {
         const auto found = impl->clients_by_conn_.find(id);
-        if (found != impl->clients_by_conn_.end()) impl->defer_close(found->second);
+        if (found == impl->clients_by_conn_.end()) return;
+        const auto client = impl->clients_.find(found->second);
+        if (client != impl->clients_.end()) {
+            note_close(*client->second, control::RelayCloseReason::remote_close);
+        }
+        impl->defer_close(found->second);
     } catch (...) {
     }
 }

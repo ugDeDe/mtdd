@@ -402,6 +402,7 @@ sudo bash install.sh     # то же меню через сам установщ
 | `global_buffer_bytes` | Бюджет буферов пересылки, делится между workers. По умолчанию 256 МиБ; установщик записывает четверть RAM (от 64 МиБ до 1 ГиБ), если параметр не задан |
 | `connection_queue_bytes`, `max_frame_bytes` | Размер очереди и предел собираемого кадра |
 | `handshake_timeout_seconds`, `idle_timeout_seconds` | Тайм-аут рукопожатия и простоя соединения |
+| `client_keepalive_seconds`, `client_ack_timeout_seconds` | TCP keepalive (по умолчанию 60 с) и `TCP_USER_TIMEOUT` (90 с) для клиентских сокетов: пропавшие клиенты закрываются ядром, а не через `idle_timeout`. `0` отключает |
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
 | `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 16 |
 | `me_clients_per_writer` | Целевой порог клиентов для роста пула, по умолчанию 400 |

@@ -120,6 +120,25 @@ TEST(Config, MeClientsPerWriterIsConfigurableAndBounded) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, ClientLivenessTimeoutsHaveDefaultsAndBounds) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.client_keepalive.count(), 60);
+    EXPECT_EQ(defaults.client_ack_timeout.count(), 90);
+    auto value = minimal_config();
+    value["client_keepalive_seconds"] = 0;
+    value["client_ack_timeout_seconds"] = 0;
+    const auto disabled = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(disabled.client_keepalive.count(), 0);
+    EXPECT_EQ(disabled.client_ack_timeout.count(), 0);
+    value["client_ack_timeout_seconds"] = 5;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["client_ack_timeout_seconds"] = 3601;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["client_ack_timeout_seconds"] = 30;
+    value["client_keepalive_seconds"] = -1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, ExplicitWorkersRequirePerReactorBufferBudget) {
     auto value = minimal_config();
     value["workers"] = 4;

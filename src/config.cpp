@@ -94,7 +94,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "global_buffer_bytes", "handshake_timeout_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
         "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
-        "me_clients_per_writer"};
+        "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -184,6 +184,10 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     config.idle_timeout = std::chrono::seconds(number(value, "idle_timeout_seconds", 1800, 30, 86400));
     config.shutdown_timeout = std::chrono::seconds(number(value, "shutdown_timeout_seconds", 10, 1, 120));
     config.metadata_refresh = std::chrono::seconds(number(value, "metadata_refresh_seconds", 3600, 60, 86400));
+    config.client_keepalive = std::chrono::seconds(number(value, "client_keepalive_seconds", 60, 0, 7200));
+    config.client_ack_timeout = std::chrono::seconds(number(value, "client_ack_timeout_seconds", 90, 0, 3600));
+    if (config.client_ack_timeout.count() != 0 && config.client_ack_timeout.count() < 10)
+        throw std::invalid_argument("client_ack_timeout_seconds must be 0 or at least 10");
     config.direct_fallback_enabled =
         boolean(value, "direct_fallback_enabled", config.direct_fallback_enabled);
     if (value.contains("direct_fallback_dcs")) {

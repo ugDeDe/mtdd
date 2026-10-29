@@ -16,6 +16,34 @@
 
 namespace mtdd::protocol {
 
+RandomFn buffered_random() {
+  struct Pool {
+    std::array<std::uint8_t, 16384> bytes{};
+    std::size_t used{16384};
+    ~Pool() { OPENSSL_cleanse(bytes.data(), bytes.size()); }
+  };
+  auto pool = std::make_shared<Pool>();
+  return [pool](std::span<std::uint8_t> out) {
+    if (out.empty()) return;
+    if (out.size() > 4096) {
+      if (RAND_bytes(out.data(), static_cast<int>(out.size())) != 1) {
+        throw std::runtime_error("openssl: RAND_bytes failed");
+      }
+      return;
+    }
+    if (pool->bytes.size() - pool->used < out.size()) {
+      if (RAND_bytes(pool->bytes.data(), static_cast<int>(pool->bytes.size())) != 1) {
+        throw std::runtime_error("openssl: RAND_bytes failed");
+      }
+      pool->used = 0;
+    }
+    std::memcpy(out.data(), pool->bytes.data() + pool->used, out.size());
+    // Served bytes are erased so the block never hands out a value twice.
+    OPENSSL_cleanse(pool->bytes.data() + pool->used, out.size());
+    pool->used += out.size();
+  };
+}
+
 RandomFn system_random() {
   return [](std::span<std::uint8_t> out) {
     if (out.empty()) return;
@@ -82,6 +110,66 @@ std::array<std::uint8_t, 32> hmac_sha256(std::span<const std::uint8_t> key,
       len != out.size()) {
     fail("hmac");
   }
+  return out;
+}
+
+struct HmacSha256Key::Impl {
+  EVP_MD_CTX* inner{nullptr};
+  EVP_MD_CTX* outer{nullptr};
+  ~Impl() {
+    EVP_MD_CTX_free(inner);
+    EVP_MD_CTX_free(outer);
+  }
+};
+
+HmacSha256Key::HmacSha256Key(std::span<const std::uint8_t, 16> key) : impl_(std::make_unique<Impl>()) {
+  std::copy(key.begin(), key.end(), key_.begin());
+  std::array<std::uint8_t, 64> ipad{};
+  std::array<std::uint8_t, 64> opad{};
+  ipad.fill(0x36);
+  opad.fill(0x5c);
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    ipad[i] = static_cast<std::uint8_t>(ipad[i] ^ key[i]);
+    opad[i] = static_cast<std::uint8_t>(opad[i] ^ key[i]);
+  }
+  impl_->inner = EVP_MD_CTX_new();
+  impl_->outer = EVP_MD_CTX_new();
+  const bool ok = impl_->inner != nullptr && impl_->outer != nullptr &&
+                  EVP_DigestInit_ex(impl_->inner, EVP_sha256(), nullptr) == 1 &&
+                  EVP_DigestUpdate(impl_->inner, ipad.data(), ipad.size()) == 1 &&
+                  EVP_DigestInit_ex(impl_->outer, EVP_sha256(), nullptr) == 1 &&
+                  EVP_DigestUpdate(impl_->outer, opad.data(), opad.size()) == 1;
+  secure_zero(ipad);
+  secure_zero(opad);
+  if (!ok) {
+    secure_zero(key_);
+    fail("hmac key");
+  }
+}
+
+HmacSha256Key::~HmacSha256Key() { secure_zero(key_); }
+HmacSha256Key::HmacSha256Key(HmacSha256Key&&) noexcept = default;
+HmacSha256Key& HmacSha256Key::operator=(HmacSha256Key&&) noexcept = default;
+
+std::array<std::uint8_t, 32> HmacSha256Key::mac(std::span<const std::uint8_t> data) const {
+  if (!impl_) fail("hmac key moved-from");
+  struct Ctx {
+    EVP_MD_CTX* value{EVP_MD_CTX_new()};
+    ~Ctx() { EVP_MD_CTX_free(value); }
+  } ctx;
+  std::array<std::uint8_t, 32> inner{};
+  std::array<std::uint8_t, 32> out{};
+  unsigned int len = 0;
+  if (ctx.value == nullptr || EVP_MD_CTX_copy_ex(ctx.value, impl_->inner) != 1 ||
+      EVP_DigestUpdate(ctx.value, data.data(), data.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx.value, inner.data(), &len) != 1 || len != inner.size() ||
+      EVP_MD_CTX_copy_ex(ctx.value, impl_->outer) != 1 ||
+      EVP_DigestUpdate(ctx.value, inner.data(), inner.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx.value, out.data(), &len) != 1 || len != out.size()) {
+    secure_zero(inner);
+    fail("hmac");
+  }
+  secure_zero(inner);
   return out;
 }
 

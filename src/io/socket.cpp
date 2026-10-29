@@ -234,10 +234,23 @@ bool set_tcp_keepalive(int fd, int idle_seconds, int interval_seconds,
     return ok;
 }
 
+bool set_tcp_user_timeout(int fd, unsigned timeout_ms) noexcept {
+    if (fd < 0) return false;
+    return ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout_ms,
+                        sizeof(timeout_ms)) == 0;
+}
+
 bool set_tcp_nodelay(int fd) noexcept {
     if (fd < 0) return false;
     const int enable = 1;
     return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) == 0;
+}
+
+std::optional<Endpoint> endpoint_from_address(const void* address, std::size_t length) {
+    if (address == nullptr || length > sizeof(sockaddr_storage)) return std::nullopt;
+    sockaddr_storage storage{};
+    std::memcpy(&storage, address, length);
+    return endpoint_from(storage, static_cast<socklen_t>(length));
 }
 
 std::optional<Endpoint> peer_endpoint(int fd) {

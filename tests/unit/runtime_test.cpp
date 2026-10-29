@@ -205,6 +205,25 @@ TEST(Runtime, WarmupFallsBackToAlternateDc) {
         5s));
 }
 
+TEST(Runtime, WarmupConnectsEveryPrimaryDcWithoutClients) {
+    FakeMe primary{me_secret()};
+    FakeMe secondary{me_secret()};
+    Daemon daemon(primary.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for 2 127.0.0.1:" << primary.port() << ";\n";
+        file << "proxy_for 4 127.0.0.1:" << secondary.port() << ";\n";
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    const auto connected = [&](const char* dc) {
+        const auto snapshot = daemon.services.stats.snapshot();
+        const auto found = snapshot.me_dcs.find(dc);
+        return found != snapshot.me_dcs.end() && found->second.connected;
+    };
+    EXPECT_TRUE(wait_for([&] { return connected("2") && connected("4"); }, 5s));
+    EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 0U);
+}
+
 TEST(Runtime, BurstIsChunkedThroughSharedMiddleEndWriter) {
     FakeMe me{me_secret(), kBurstCount, 120ms};
     Daemon daemon(me.port(), true);
@@ -258,6 +277,46 @@ TEST(Runtime, ReadinessDropsAndRecoversAcrossMeReconnect) {
     ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
     EXPECT_TRUE(wait_for([&] { return !daemon.services.stats.ready(); }, 4s));
     EXPECT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 6s));
+}
+
+TEST(Runtime, RelayCloseReasonsAreCounted) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    const auto closes = [&](mtdd::control::RelayCloseReason reason) {
+        return daemon.services.stats.snapshot()
+            .relay_closes_total[static_cast<std::size_t>(reason)];
+    };
+    {
+        TestClient client(daemon.port(), secret_bytes());
+        ASSERT_TRUE(client.valid());
+        ASSERT_TRUE(client.send_hello());
+        ASSERT_TRUE(client.start_obfuscation(2));
+        ASSERT_TRUE(client.send_message(burst_payload(0)));
+        Bytes response;
+        ASSERT_TRUE(client.read_message(response, 3000));
+        client.close();
+    }
+    EXPECT_TRUE(wait_for(
+        [&] { return closes(mtdd::control::RelayCloseReason::client_eof) == 1; }, 3s));
+    EXPECT_EQ(closes(mtdd::control::RelayCloseReason::other), 0U);
+
+    // A user revocation is attributed to "revoked", not to the peer.
+    TestClient revoked(daemon.port(), secret_bytes());
+    ASSERT_TRUE(revoked.valid());
+    ASSERT_TRUE(revoked.send_hello(0, 1));
+    ASSERT_TRUE(revoked.start_obfuscation(2));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.snapshot().connections_active == 1; },
+                         3s));
+    ASSERT_TRUE(daemon.services.store->delete_user(mtdd::control::DeleteUserRequest{"alice", {}})
+                    .ok());
+    EXPECT_TRUE(revoked.wait_closed_for(3000));
+    EXPECT_TRUE(wait_for(
+        [&] { return closes(mtdd::control::RelayCloseReason::revoked) == 1; }, 3s));
+    const auto metrics = daemon.services.stats.prometheus_text();
+    EXPECT_NE(metrics.find("mtdd_relay_closes_total{reason=\"client_eof\"} 1"),
+              std::string::npos);
 }
 
 TEST(Runtime, FailedDcDoesNotCollapseOtherReadyDcOrItsClient) {
@@ -613,6 +672,38 @@ TEST(RuntimeDrain, AwaitingReplyEofHonorsReadEofDeadline) {
     EXPECT_GE(elapsed, 700ms);
     EXPECT_LT(elapsed, 2500ms);
     EXPECT_GE(EofDrainCounts::read().closes, 1U);
+}
+
+// With the default 10 s shutdown_timeout, a half-closed client whose only
+// pending work is an unanswered ME request is kept just for the short reply
+// grace (kEofReplyGrace), not the whole shutdown_timeout.
+TEST(RuntimeDrain, AwaitingReplyEofUsesShortReplyGrace) {
+    FakeMe me{me_secret(), 1, 8000ms};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+    std::this_thread::sleep_for(250ms);
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_EQ(::shutdown(client.fd(), SHUT_WR), 0);
+
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 1U)
+        << "awaiting-reply EOF closed before the reply grace";
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 3000ms));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, 1800ms);
+    EXPECT_LT(elapsed, 3500ms);
+    EXPECT_EQ(daemon.services.stats.snapshot()
+                  .relay_closes_total[static_cast<std::size_t>(
+                      mtdd::control::RelayCloseReason::client_eof)],
+              1U);
 }
 
 // A delayed ME reply is the only progress event. The half-closed client must be

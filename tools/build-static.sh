@@ -101,6 +101,15 @@ CURL_TARBALL=curl-$CURL_VERSION.tar.xz
 CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
 CURL_URL=https://github.com/curl/curl/releases/download/curl-8_23_0/$CURL_TARBALL
 
+# Optional allocator: MTDD_STATIC_MIMALLOC=1 links mimalloc's override object
+# ahead of musl libc, replacing musl's mallocng (which unmaps freed groups
+# eagerly and showed ~1k mmap/munmap per second under relay load).
+MIMALLOC=${MTDD_STATIC_MIMALLOC:-0}
+MIMALLOC_VERSION=2.1.7
+MIMALLOC_TARBALL=mimalloc-$MIMALLOC_VERSION.tar.gz
+MIMALLOC_SHA256=0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d
+MIMALLOC_URL=https://github.com/microsoft/mimalloc/archive/refs/tags/v$MIMALLOC_VERSION.tar.gz
+
 mkdir -p "$CACHE" "$SRC" "$PREFIX" "$BUILD" "$OUT" "$LOGS" "$TOOLCHAIN_ROOT"
 
 if ((CLEAN)); then
@@ -137,6 +146,7 @@ fetch "$TOOLCHAIN_TARBALL" "$TOOLCHAIN_SHA256" \
 fetch "$OPENSSL_TARBALL" "$OPENSSL_SHA256" "$OPENSSL_URL"
 fetch "$LIBEVENT_TARBALL" "$LIBEVENT_SHA256" "$LIBEVENT_URL"
 fetch "$CURL_TARBALL" "$CURL_SHA256" "$CURL_URL"
+if ((MIMALLOC)); then fetch "$MIMALLOC_TARBALL" "$MIMALLOC_SHA256" "$MIMALLOC_URL"; fi
 
 extract() { # extract <tarball> <target-dir> <sentinel-path>
     local tarball=$CACHE/$1 target=$2 sentinel=$3
@@ -152,6 +162,9 @@ extract "$TOOLCHAIN_TARBALL" "$TOOLCHAIN_ROOT" "$TOOLCHAIN_ROOT/$TOOLCHAIN_NAME/
 extract "$OPENSSL_TARBALL" "$SRC" "$SRC/openssl-$OPENSSL_VERSION/Configure"
 extract "$LIBEVENT_TARBALL" "$SRC" "$SRC/libevent-$LIBEVENT_VERSION/configure"
 extract "$CURL_TARBALL" "$SRC" "$SRC/curl-$CURL_VERSION/configure"
+if ((MIMALLOC)); then
+    extract "$MIMALLOC_TARBALL" "$SRC" "$SRC/mimalloc-$MIMALLOC_VERSION/CMakeLists.txt"
+fi
 
 TC_DIR="$TOOLCHAIN_ROOT/$TOOLCHAIN_NAME"
 [[ -d $TC_DIR ]] || die "toolchain directory not found: $TC_DIR"
@@ -293,9 +306,37 @@ build_curl() {
 
 OPENSSL_BUILD_ID=$(openssl_build_id)
 log "OpenSSL build id: $OPENSSL_BUILD_ID"
+build_mimalloc() {
+    if [[ -f $PREFIX/lib/mimalloc.o && -f $PREFIX/.mimalloc-version ]] \
+        && [[ $(<"$PREFIX/.mimalloc-version") == "$MIMALLOC_VERSION" ]]; then
+        return
+    fi
+    log "building mimalloc $MIMALLOC_VERSION (static override object, musl)"
+    local dir="$BUILD/mimalloc"
+    rm -rf "$dir"
+    cmake -S "$SRC/mimalloc-$MIMALLOC_VERSION" -B "$dir" -G Ninja \
+        -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-O2 -fno-pie" \
+        -DMI_LIBC_MUSL=ON -DMI_OVERRIDE=ON -DMI_BUILD_SHARED=OFF \
+        -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=ON -DMI_BUILD_TESTS=OFF \
+        -DMI_SECURE=OFF -DMI_DEBUG_FULL=OFF \
+        >"$LOGS/mimalloc-configure.log" 2>&1
+    cmake --build "$dir" -j "$JOBS" >"$LOGS/mimalloc-build.log" 2>&1
+    local object
+    object=$(find "$dir" -name 'mimalloc*.o' | head -n 1)
+    [[ -n $object ]] || die "mimalloc object was not produced"
+    install -m 0644 "$object" "$PREFIX/lib/mimalloc.o"
+    printf '%s\n' "$MIMALLOC_VERSION" >"$PREFIX/.mimalloc-version"
+}
+
 build_openssl
 build_libevent
 build_curl
+MIMALLOC_LINK=""
+if ((MIMALLOC)); then
+    build_mimalloc
+    MIMALLOC_LINK="$PREFIX/lib/mimalloc.o"
+fi
 
 # nlohmann/json is header-only. Stage the host 3.12.0 header with a minimal
 # CMake package so CMake cannot accidentally resolve the host glibc package.
@@ -342,7 +383,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 set(CMAKE_C_FLAGS_INIT "-O2 -fno-pie -pthread -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
 set(CMAKE_CXX_FLAGS_INIT "-O2 -fno-pie -pthread -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -no-pie -pthread -Wl,--build-id=none")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -no-pie -pthread -Wl,--build-id=none $MIMALLOC_LINK")
 EOF
 
 BUILD_DIR="$BUILD/mtdd"

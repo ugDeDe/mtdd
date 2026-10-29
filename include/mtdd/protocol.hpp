@@ -35,6 +35,12 @@ using ClockFn = std::function<std::int64_t()>;
 // CSPRNG-backed random source (OpenSSL RAND_bytes) for production callers.
 // Tests inject deterministic sources instead.
 RandomFn system_random();
+// Same CSPRNG, served from a private 16 KiB block refilled with one RAND_bytes
+// call. OpenSSL's RAND_bytes checks getpid() for fork safety on every call
+// (a real system call under musl); per-message padding asked for 1-3 bytes at
+// a time and each handshake for ~3 KiB. Requests above 4 KiB bypass the block.
+// Not thread-safe: give each reactor its own instance.
+RandomFn buffered_random();
 
 inline constexpr std::size_t kObfuscationHandshakeSize = 64;
 inline constexpr std::size_t kFakeTlsMaxClientHello = 4096;
@@ -91,6 +97,29 @@ std::array<std::uint8_t, 16> md5(std::span<const std::uint8_t> data);
 std::array<std::uint8_t, 32> hmac_sha256(std::span<const std::uint8_t> key,
                                         std::span<const std::uint8_t> data);
 std::uint32_t crc32(std::span<const std::uint8_t> data);
+
+// HMAC-SHA256 with a fixed 16-byte key whose inner/outer pad blocks are
+// absorbed once. mac() only copies the two digest states, so checking one
+// ClientHello against many user secrets costs two short hashes per secret
+// instead of a full keyed HMAC setup. Byte-identical to hmac_sha256().
+class HmacSha256Key {
+ public:
+  explicit HmacSha256Key(std::span<const std::uint8_t, 16> key);
+  ~HmacSha256Key();
+  HmacSha256Key(HmacSha256Key&&) noexcept;
+  HmacSha256Key& operator=(HmacSha256Key&&) noexcept;
+  HmacSha256Key(const HmacSha256Key&) = delete;
+  HmacSha256Key& operator=(const HmacSha256Key&) = delete;
+
+  std::array<std::uint8_t, 32> mac(std::span<const std::uint8_t> data) const;
+  std::span<const std::uint8_t, 16> key() const noexcept { return key_; }
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  std::array<std::uint8_t, 16> key_{};
+};
+
 // Castagnoli CRC-32C (reflected polynomial 0x82F63B78), as negotiated by the ME
 // RPC_HANDSHAKE flag USE_CRC32C. Uses SSE4.2 crc32 instructions when the CPU
 // supports them (runtime CPUID check) and a slicing-by-8 fallback otherwise; the
@@ -226,6 +255,14 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out);
 
+// Same contract, tried against every key with the canonical HMAC input built
+// once. On Ok, @p matched is the index of the first authenticating key; any
+// other status leaves it unspecified. Unauthenticated means no key matched.
+HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
+                                  std::span<const crypto::HmacSha256Key* const> keys,
+                                  std::int64_t now_unix, std::uint32_t skew_seconds,
+                                  ClientHelloInfo& out, std::size_t& matched);
+
 // Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
 // x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
 std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random);
@@ -313,7 +350,16 @@ class FakeTlsConnection {
 
   // Encrypts and TLS-frames payload for the client, appending to to_client.
   // Splits into <=16 KiB application-data records.
-  Status send(std::span<const std::uint8_t> plaintext, std::vector<std::uint8_t>& to_client);
+  //
+  // Record coalescing: when @p open_record is non-null and holds the offset of
+  // the last ApplicationData record header in @p to_client (kNoOpenRecord when
+  // there is none), bytes are first appended to that record's body until it
+  // reaches 16 KiB, then new records follow. On return it names the last record
+  // written. AES-CTR is a continuous stream, so the client decodes extended and
+  // fresh records identically; this only removes per-message record headers.
+  static constexpr std::size_t kNoOpenRecord = static_cast<std::size_t>(-1);
+  Status send(std::span<const std::uint8_t> plaintext, std::vector<std::uint8_t>& to_client,
+              std::size_t* open_record = nullptr);
 
   // Fused transport framing + TLS record encoding: equivalent to
   // encode_transport_message(tag, payload, tmp, &random) followed by
@@ -322,7 +368,8 @@ class FakeTlsConnection {
   // straight into the TLS record body and applies AES-CTR in place. This removes
   // one full-payload copy and one scratch buffer from the S2C hot path.
   Status send_transport_message(ProtoTag tag, std::span<const std::uint8_t> payload,
-                                std::vector<std::uint8_t>& to_client, const RandomFn& random);
+                                std::vector<std::uint8_t>& to_client, const RandomFn& random,
+                                std::size_t* open_record = nullptr);
 
   State state() const;
   ProtoTag proto_tag() const;

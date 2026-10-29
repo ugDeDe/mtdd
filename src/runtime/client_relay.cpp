@@ -127,13 +127,94 @@ void Runtime::Impl::pump_client_out(Client& client) {
     if (!client.out->empty()) {
         const auto result = client.out->flush_to(client.fd.get(), detail::kWriteBatch);
         if (result.status == io::FlushStatus::error) {
-            close_client(client.token);
+            close_client(client.token, result.error == ETIMEDOUT
+                                           ? control::RelayCloseReason::client_timeout
+                                           : control::RelayCloseReason::client_error);
             return;
         }
         if (result.bytes_written > 0) touch(client, Clock::now());
     }
     reaccount(client);
     update_client_interest(client);
+}
+
+bool Runtime::Impl::finish_s2c_batch(Client& client, bool write_now) {
+    // A mid-read hand-off keeps the client listed so the end-of-read flush
+    // still writes what was queued here.
+    if (write_now) client.in_s2c_batch = false;
+    client.s2c_open_record = protocol::FakeTlsConnection::kNoOpenRecord;
+    const std::uint64_t token = client.token;
+    if (!client.s2c_batch.empty()) {
+        const auto release = [&client] {
+            // Small batches keep their block for the next read; a large media
+            // batch returns its memory instead of pinning it per idle client.
+            if (client.s2c_batch.capacity() > 4096U) {
+                std::vector<std::uint8_t>().swap(client.s2c_batch);
+            } else {
+                client.s2c_batch.clear();
+            }
+        };
+        if (client.close_requested || !client.out) {
+            release();
+            reaccount(client);
+            return false;
+        }
+        std::span<const std::uint8_t> pending(client.s2c_batch);
+        if (write_now && client.out->empty() && client.s2c_offset >= client.s2c_wire.size()) {
+            // Nothing queued ahead: send straight from the batch instead of
+            // copying every byte into the queue first. Only the unsent tail
+            // (EAGAIN/partial write) is queued, and EPOLLOUT covers it.
+            const ssize_t sent = ::send(client.fd.get(), pending.data(), pending.size(),
+                                        MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (sent > 0) {
+                pending = pending.subspan(static_cast<std::size_t>(sent));
+                touch(client, Clock::now());
+            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                const int error = errno;
+                release();
+                close_client(token, error == ETIMEDOUT
+                                        ? control::RelayCloseReason::client_timeout
+                                        : control::RelayCloseReason::client_error);
+                return false;
+            }
+        }
+        const bool queued = pending.empty() || push_client_wire(client, pending, false);
+        release();
+        if (!queued) {
+            stats_.add_backpressure(control::Direction::server_to_client);
+            note_close(client, control::RelayCloseReason::backpressure);
+            defer_close(token);
+            reaccount(client);
+            return false;
+        }
+    }
+    if (!write_now || client.close_requested) {
+        reaccount(client);
+        return !client.close_requested;
+    }
+    // Write now instead of arming EPOLLOUT and waiting for the next epoll
+    // round: the socket is normally writable, so this saves two epoll_ctl
+    // transitions and a wakeup per answered client. EPOLLOUT is armed by
+    // pump_client_out() only when the kernel buffer is full.
+    pump_client_out(client);
+    return clients_.find(token) != clients_.end();
+}
+
+void Runtime::Impl::flush_s2c_batches() {
+    if (s2c_batch_tokens_.empty()) return;
+    // Swap out first: a flush can close clients but never appends answers, so
+    // the list cannot grow while it is being processed.
+    std::vector<std::uint64_t> tokens;
+    tokens.swap(s2c_batch_tokens_);
+    for (const std::uint64_t token : tokens) {
+        const auto found = clients_.find(token);
+        if (found == clients_.end()) continue;
+        (void)finish_s2c_batch(*found->second);
+    }
+    tokens.clear();
+    if (s2c_batch_tokens_.empty()) s2c_batch_tokens_.swap(tokens);
+    reaccount_shared();
 }
 
 void Runtime::Impl::enqueue_ready(Client& client) {
@@ -177,7 +258,7 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
             // longer fits the relay budget closes only this logical client
             // instead of sitting silently in a queue.
             stats_.add_backpressure(control::Direction::client_to_server);
-            close_client(token);
+            close_client(token, control::RelayCloseReason::backpressure);
             return;
         }
         try {
@@ -259,7 +340,7 @@ void Runtime::Impl::on_client_deadline(Client& client, Time now) {
     }
     const auto idle = config_.idle_timeout;
     if (now - client.last_activity >= idle) {
-        close_client(token);
+        close_client(token, control::RelayCloseReason::idle_timeout);
     } else {
         deadlines_.set(token, client.last_activity + idle);
     }
@@ -280,10 +361,18 @@ void Runtime::Impl::reject_close(Client& client, control::RejectReason reason,
     close_client(client.token);
 }
 
+void Runtime::Impl::close_client(std::uint64_t token, control::RelayCloseReason reason) {
+    const auto found = clients_.find(token);
+    if (found == clients_.end()) return;
+    note_close(*found->second, reason);
+    close_client(token);
+}
+
 void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handshake) {
     const auto found = clients_.find(token);
     if (found == clients_.end()) return;
     Client& client = *found->second;
+    if (client.phase == Client::Phase::relay) stats_.relay_closed(client.close_reason);
 
     if (client.handshake_pending) {
         if (record_pending_handshake) {
@@ -325,7 +414,10 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     if (client.backend_token != 0) close_fallback_backend(client);
 
     deadlines_.erase(token);
-    if (client.fd.valid()) set_interest(token, client.fd.get(), client.armed, 0);
+    // No EPOLL_CTL_DEL: close() below removes the descriptor from the epoll
+    // set (it is never dup'ed), and stale events of this batch are dropped by
+    // the targets_ lookup once remove_target() ran. Saves one syscall per close.
+    client.armed = 0;
     if (client.in_me_queue) {
         // Lazy removal: the token stays in the deque and is dropped by the next
         // pump. Clearing the flag keeps the unique-client gauge truthful and
@@ -349,6 +441,14 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     }
     client.direct_fd.close();
     remove_target(token);
+    // TCP_USER_TIMEOUT also governs the orphaned socket after close(): with
+    // 90 s a client that never ACKs our FIN kept FIN_WAIT1 for 90 s instead of
+    // the host's tcp_orphan_retries bound. Restore the kernel default first.
+    // A peer that sent its own FIN (read_eof) is alive and ACKs ours promptly,
+    // so the reset is only needed for the remaining (dead/aborted) closes.
+    if (client.fd.valid() && config_.client_ack_timeout.count() > 0 && !client.read_eof) {
+        (void)io::set_tcp_user_timeout(client.fd.get(), 0);
+    }
     client.fd.close();
     if (client.ip_counted) decrement_client_unique_ip(client);
     if (client.metrics_counted && client.metrics) client.metrics->connection_closed();

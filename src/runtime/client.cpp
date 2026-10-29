@@ -130,7 +130,15 @@ void Runtime::Impl::release_client_pool() noexcept {
 }
 
 void Runtime::Impl::accept_clients(Time now) {
-    for (std::size_t iteration = 0; iteration < detail::kAcceptBatch; ++iteration) {
+    // Adaptive burst: the listener is level-triggered and the loop turns over
+    // far more often than connections arrive, so normally one accept per event
+    // is enough and the EAGAIN-only probe (~half of all accept4 calls) is
+    // skipped. A burst that fills the limit doubles it for the next event; a
+    // drained backlog (EAGAIN) shrinks it back to one.
+    const std::size_t burst = accept_burst_;
+    bool drained = false;
+    std::size_t accepted_now = 0;
+    for (std::size_t iteration = 0; iteration < burst; ++iteration) {
         if (config_.max_connections != 0 &&
             (clients_.size() >= static_cast<std::size_t>(config_.max_connections) ||
              shared_->connections.load(std::memory_order_relaxed) >=
@@ -148,8 +156,10 @@ void Runtime::Impl::accept_clients(Time now) {
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
+            drained = errno == EAGAIN || errno == EWOULDBLOCK;
             break;
         }
+        ++accepted_now;
         // Reserve one process-wide connection slot before counting the socket as
         // accepted; a socket refused by the global cap is a rejection, not an
         // accepted-and-immediately-closed connection. Each reactor also keeps
@@ -166,7 +176,9 @@ void Runtime::Impl::accept_clients(Time now) {
         try {
             io::UniqueFd owned{fd};
             control::RejectReason failure = control::RejectReason::overload;
-            Client* client = make_client(std::move(owned), now, failure);
+            Client* client = make_client(
+                std::move(owned), now, failure,
+                io::endpoint_from_address(&address, static_cast<std::size_t>(length)));
             if (client == nullptr) {
                 // `overload` is reserved for capacity/admission limits. An
                 // accepted socket without a usable peer address (reset before
@@ -182,16 +194,22 @@ void Runtime::Impl::accept_clients(Time now) {
             shared_->release_connection();
         }
     }
+    if (drained) {
+        accept_burst_ = 1;
+    } else if (accepted_now == burst) {
+        accept_burst_ = std::min(burst * 2, detail::kAcceptBatch);
+    }
     update_listener_interest();
 }
 
 Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
-                                                 control::RejectReason& failure) {
+                                                 control::RejectReason& failure,
+                                                 std::optional<io::Endpoint> accepted_peer) {
     if (!budget_allows(detail::kBudgetHeadroom + 8192)) {
         failure = control::RejectReason::overload;
         return nullptr;
     }
-    const auto peer = io::peer_endpoint(fd.get());
+    const auto peer = accepted_peer ? std::move(accepted_peer) : io::peer_endpoint(fd.get());
     if (!peer || peer->port == 0) {
         failure = control::RejectReason::other;
         return nullptr;
@@ -224,7 +242,9 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     }
     owned->fd = std::move(fd);
     // Client-facing FakeTLS records are latency-sensitive and often small.
-    (void)io::set_tcp_nodelay(owned->fd.get());
+    // TCP_NODELAY, keepalive and TCP_USER_TIMEOUT are set once on the listener
+    // (setup()) and inherited by every accepted socket: no per-connection
+    // setsockopt calls on the accept path.
     owned->peer = *protocol_peer;
     owned->phase = Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
@@ -350,6 +370,11 @@ void Runtime::Impl::read_client(Client& client, Time now) {
                                  now);
             if (clients_.find(token) == clients_.end()) return;
             if (client.phase == Client::Phase::fallback) return;
+            // A short read drained the socket. The listener is level-triggered
+            // and EPOLLIN stays armed until recv()==0, so new bytes or a FIN
+            // raise another event; probing again only returned EAGAIN (~40% of
+            // all recv calls under load).
+            if (bytes < limit) break;
         } else if (received == 0) {
             latch_read_eof(client, now);
             return;
@@ -358,7 +383,8 @@ void Runtime::Impl::read_client(Client& client, Time now) {
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         } else {
-            close_client(token);
+            close_client(token, errno == ETIMEDOUT ? control::RelayCloseReason::client_timeout
+                                                   : control::RelayCloseReason::client_error);
             return;
         }
     }
@@ -493,26 +519,37 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
     (void)now;
     const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
     if (!snapshot) return false;
-    const std::int64_t now_unix = unix_now();
-    for (const auto& candidate : snapshot->users) {
-        if (!candidate.enabled) continue;
-        std::array<std::uint8_t, 16> secret{};
-        if (!parse_user_secret(candidate.secret_hex, secret)) continue;
-        protocol::ClientHelloInfo found;
-        const auto status = protocol::validate_client_hello(record, secret, now_unix, 120, found);
-        protocol::crypto::secure_zero(secret);
-        if (status == protocol::HelloStatus::Ok) {
-            if (!config_.tls_domain.empty() &&
-                !ascii_iequals(found.server_name, config_.tls_domain)) {
-                return false;
-            }
-            info = std::move(found);
-            user = &candidate;
-            return true;
+    if (hello_keys_snapshot_ != snapshot) {
+        // Parse and pre-key every enabled secret once per user snapshot, not
+        // once per user for every ClientHello. Order (and therefore which user
+        // wins a duplicate secret) is the snapshot order, as before.
+        hello_keys_.clear();
+        hello_key_ptrs_.clear();
+        hello_key_users_.clear();
+        hello_keys_snapshot_.reset();
+        hello_keys_.reserve(snapshot->users.size());
+        for (const auto& candidate : snapshot->users) {
+            if (!candidate.enabled) continue;
+            std::array<std::uint8_t, 16> secret{};
+            if (!parse_user_secret(candidate.secret_hex, secret)) continue;
+            hello_keys_.emplace_back(secret);
+            protocol::crypto::secure_zero(secret);
+            hello_key_users_.push_back(&candidate);
         }
-        if (status != protocol::HelloStatus::Unauthenticated) return false;
+        for (const auto& key : hello_keys_) hello_key_ptrs_.push_back(&key);
+        hello_keys_snapshot_ = snapshot;
     }
-    return false;
+    protocol::ClientHelloInfo found;
+    std::size_t matched = 0;
+    const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, unix_now(),
+                                                        120, found, matched);
+    if (status != protocol::HelloStatus::Ok || matched >= hello_key_users_.size()) return false;
+    if (!config_.tls_domain.empty() && !ascii_iequals(found.server_name, config_.tls_domain)) {
+        return false;
+    }
+    info = std::move(found);
+    user = hello_key_users_[matched];
+    return true;
 }
 
 void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& user,

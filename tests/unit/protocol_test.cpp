@@ -351,6 +351,70 @@ TEST(FakeTls, ClientHelloKnownAnswer) {
   EXPECT_TRUE(info.server_name.empty());
 }
 
+TEST(Crypto, BufferedRandomServesFreshBytesAcrossRefills) {
+  const auto random = buffered_random();
+  std::set<Bytes> seen;
+  std::size_t served = 0;
+  // Small requests cross several 4 KiB refills; large ones bypass the block.
+  for (const std::size_t size : {1U, 3U, 16U, 32U, 257U, 4096U}) {
+    for (int round = 0; round < 300; ++round) {
+      Bytes out(size, 0);
+      random(out);
+      served += size;
+      if (size >= 16) {
+        EXPECT_TRUE(seen.insert(out).second) << "repeated block of " << size;
+        EXPECT_NE(out, Bytes(size, 0));
+      }
+    }
+  }
+  EXPECT_GT(served, 3U * 4096U);
+  Bytes empty;
+  random(empty);
+}
+
+TEST(Crypto, PrekeyedHmacMatchesOneShotHmac) {
+  A16 key{};
+  for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::uint8_t>(i * 7 + 1);
+  const crypto::HmacSha256Key keyed(key);
+  for (const std::size_t size : {0U, 1U, 55U, 64U, 517U, 4096U}) {
+    Bytes data(size);
+    for (std::size_t i = 0; i < size; ++i) data[i] = static_cast<std::uint8_t>(i ^ 0xa5);
+    EXPECT_EQ(keyed.mac(data), crypto::hmac_sha256(key, data)) << size;
+    // The keyed state is reusable: a second call gives the same answer.
+    EXPECT_EQ(keyed.mac(data), crypto::hmac_sha256(key, data)) << size;
+  }
+  crypto::HmacSha256Key source(key);
+  crypto::HmacSha256Key moved(std::move(source));
+  EXPECT_EQ(moved.mac(Bytes{1, 2, 3}), crypto::hmac_sha256(key, Bytes{1, 2, 3}));
+}
+
+TEST(FakeTls, ClientHelloMultiKeyPicksFirstMatchingKey) {
+  auto rec = from_hex(kClientHelloHex);
+  A16 wrong{};
+  wrong.fill(0x5a);
+  const crypto::HmacSha256Key bad_key(wrong);
+  const crypto::HmacSha256Key good_key(kSecret);
+  const crypto::HmacSha256Key* keys[] = {&bad_key, nullptr, &good_key, &good_key};
+  ClientHelloInfo info;
+  std::size_t matched = 99;
+  ASSERT_EQ(validate_client_hello(rec, keys, kNow, 120, info, matched), HelloStatus::Ok);
+  EXPECT_EQ(matched, 2U);
+  EXPECT_EQ(info.timestamp, 1600000000u);
+  EXPECT_EQ(info.secret, kSecret);
+  ClientHelloInfo single;
+  ASSERT_EQ(validate_client_hello(rec, kSecret, kNow, 120, single), HelloStatus::Ok);
+  EXPECT_EQ(info.canonical_hmac, single.canonical_hmac);
+
+  const crypto::HmacSha256Key* only_bad[] = {&bad_key};
+  EXPECT_EQ(validate_client_hello(rec, only_bad, kNow, 120, info, matched),
+            HelloStatus::Unauthenticated);
+  EXPECT_EQ(validate_client_hello(rec, std::span<const crypto::HmacSha256Key* const>{}, kNow,
+                                  120, info, matched),
+            HelloStatus::Unauthenticated);
+  EXPECT_EQ(validate_client_hello(rec, keys, kNow + 121, 120, info, matched),
+            HelloStatus::ClockSkew);
+}
+
 TEST(FakeTls, ClientHelloRejectsTamperWrongSecretAndSkew) {
   auto rec = from_hex(kClientHelloHex);
   ClientHelloInfo info;

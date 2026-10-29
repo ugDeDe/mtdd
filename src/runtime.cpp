@@ -166,7 +166,7 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
                      : std::make_shared<detail::SharedState>(
                            1, config.global_buffer_bytes)),
       worker_index_(worker_index), reuse_port_(reuse_port),
-      signal_owner_(signal_owner), random_(protocol::system_random()) {
+      signal_owner_(signal_owner), random_(protocol::buffered_random()) {
     if (config_.max_frame_bytes == 0 || config_.connection_queue_bytes == 0) {
         throw std::invalid_argument("runtime configuration has zero limits");
     }
@@ -241,6 +241,19 @@ void Runtime::Impl::setup() {
         throw syscall_error("cannot bind proxy listener");
     }
     listener_ = std::move(listener.fd);
+    // Accepted sockets inherit these from the listener (Linux copies the
+    // listening socket's options on accept), so the accept path issues no
+    // per-connection setsockopt. Small FakeTLS records: no Nagle. Keepalive and
+    // TCP_USER_TIMEOUT find vanished peers instead of idle_timeout.
+    (void)io::set_tcp_nodelay(listener_.get());
+    if (config_.client_keepalive.count() > 0) {
+        const int idle = static_cast<int>(config_.client_keepalive.count());
+        (void)io::set_tcp_keepalive(listener_.get(), idle, std::clamp(idle / 4, 5, 30), 4);
+    }
+    if (config_.client_ack_timeout.count() > 0) {
+        (void)io::set_tcp_user_timeout(
+            listener_.get(), static_cast<unsigned>(config_.client_ack_timeout.count()) * 1000U);
+    }
 
     const auto local = io::local_endpoint(listener_.get());
     if (!local) throw std::runtime_error("cannot read bound proxy port");
@@ -493,7 +506,9 @@ void Runtime::Impl::run() {
             // 150 ms housekeeping tick.
             const Time finished = Clock::now();
             finish_eof_clients(finished);
-            finish_fallback_pairs(finished);
+            // Fallback pairs are pumped by their own read/write events; the
+            // sweep only closes finished or expired pairs, so it runs from the
+            // 150 ms housekeeping tick instead of after every epoll batch.
         }
     } catch (...) {
         fatal = std::current_exception();
@@ -610,7 +625,11 @@ int Runtime::Impl::wait_timeout_ms(Time now) const {
     if (next_gauge_ < limit) limit = next_gauge_;
     if (const auto deadline = deadlines_.next(); deadline && *deadline < limit) limit = *deadline;
     // Wake for the earliest FIN/read-EOF expiry even when no traffic arrives.
-    if (next_eof_deadline_ < limit) limit = next_eof_deadline_;
+    // The sweep never runs before next_eof_sweep_, so waking earlier is wasted.
+    if (next_eof_deadline_ != Time::max()) {
+        const Time eof_wake = std::max(next_eof_deadline_, next_eof_sweep_);
+        if (eof_wake < limit) limit = eof_wake;
+    }
     if (stopping_ && shutdown_deadline_ < limit) limit = shutdown_deadline_;
     if (limit <= now) return 0;
     // Round a positive sub-millisecond delay up: truncating it to 0 would turn

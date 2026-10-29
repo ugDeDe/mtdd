@@ -53,7 +53,9 @@ void Runtime::Impl::latch_read_eof(Client& client, Time now) {
         client.drain_tracked = true;
         eof_clients_.push_back(client.token);
     }
-    const Time expiry = now + config_.shutdown_timeout;
+    // Earliest possible expiry (the reply-only grace); the sweep recomputes it.
+    const Time expiry = now + std::min<std::chrono::nanoseconds>(detail::kEofReplyGrace,
+                                                                 config_.shutdown_timeout);
     if (expiry < next_eof_deadline_) next_eof_deadline_ = expiry;
     update_client_interest(client);
 }
@@ -65,9 +67,11 @@ void Runtime::Impl::finish_eof_clients(Time now, bool force) {
         return;
     }
     // Coalesce the after-batch call: a full sweep runs at most once per
-    // kEofSweepInterval, or earlier when an exact FIN/read-EOF deadline is due.
-    // Housekeeping passes force=true (its own 150 ms tick).
-    if (!force && now < next_eof_sweep_ && now < next_eof_deadline_) return;
+    // kEofSweepInterval. A due FIN/read-EOF deadline does not start an extra
+    // sweep: under churn some deadline expires every few milliseconds, which
+    // turned this O(tracked) scan into a per-batch cost. Expiry is therefore
+    // late by at most kEofSweepInterval. Housekeeping passes force=true.
+    if (!force && now < next_eof_sweep_) return;
     next_eof_sweep_ = now + detail::kEofSweepInterval;
     telemetry.sweeps.fetch_add(1, std::memory_order_relaxed);
 
@@ -134,10 +138,22 @@ void Runtime::Impl::finish_eof_clients(Time now, bool force) {
             const bool drained = client->c2s.empty() && !client_wants_write(*client) &&
                                  !client->awaiting_reply && !direct_open &&
                                  (!client->direct_out || client->direct_out->empty());
-            const Time expiry = client->read_eof_at + config_.shutdown_timeout;
+            // Nothing left to deliver except a hoped-for ME reply: the peer has
+            // closed its side, so wait only a short grace instead of the full
+            // shutdown_timeout. Each such client holds a socket in CLOSE_WAIT
+            // and a conn id on the shared ME writer.
+            const bool reply_only = client->awaiting_reply && client->c2s.empty() &&
+                                    !client_wants_write(*client) && !direct_open &&
+                                    (!client->direct_out || client->direct_out->empty());
+            const Time expiry =
+                client->read_eof_at + (reply_only ? std::min<std::chrono::nanoseconds>(
+                                                        detail::kEofReplyGrace,
+                                                        config_.shutdown_timeout)
+                                                  : std::chrono::nanoseconds(
+                                                        config_.shutdown_timeout));
             if (drained || now >= expiry || client->close_requested) {
                 telemetry.closes.fetch_add(1, std::memory_order_relaxed);
-                close_client(token);
+                close_client(token, control::RelayCloseReason::client_eof);
             } else {
                 remaining.push_back(token);
                 if (expiry < deadline) deadline = expiry;
