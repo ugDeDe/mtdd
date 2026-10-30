@@ -24,6 +24,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -287,6 +288,7 @@ struct ControlServer::Impl {
       case ApiRoute::users: handle_users(request, method, status); break;
       case ApiRoute::user: handle_user(request, method, route.name, status); break;
       case ApiRoute::user_links: handle_links(request, route.name, status); break;
+      case ApiRoute::user_devices: handle_devices(request, route.name, status); break;
       case ApiRoute::rotate_secret:
         handle_rotate(request, route.name, status);
         break;
@@ -1052,6 +1054,40 @@ struct ControlServer::Impl {
     status = 200;
     send_json(request, status, json{{"data", {{"name", user->name}, {"enabled", user->enabled},
         {"links", {{"telegram", "https://t.me/proxy?" + query}, {"native", "tg://proxy?" + query}}}}}}, users->revision);
+  }
+
+  void handle_devices(evhttp_request* request, const std::string& name, int& status) {
+    if (!validate_name(request, name)) { status = 400; return; }
+    const auto users = store.snapshot();
+    if (!users->find(name)) {
+      status = 404;
+      send_error(request, status, "not_found", "user not found", users->revision);
+      return;
+    }
+    auto devices = stats.devices(name);
+    // Connected first, then the most recently seen.
+    std::sort(devices.begin(), devices.end(), [](const auto& a, const auto& b) {
+      if ((a.connections != 0) != (b.connections != 0)) return a.connections != 0;
+      if (a.idle_seconds != b.idle_seconds) return a.idle_seconds < b.idle_seconds;
+      return a.dc < b.dc;
+    });
+    json list = json::array();
+    for (const auto& device : devices) {
+      char id[9];
+      std::snprintf(id, sizeof(id), "%08x", device.id);
+      list.push_back({{"id", id}, {"dc", device.dc}, {"connections", device.connections},
+                      {"connected", device.connections != 0},
+                      {"idle_seconds", device.idle_seconds}, {"ip", device.ip},
+                      {"platform", device.platform}});
+    }
+    const auto metrics = stats.user(name);
+    status = 200;
+    send_json(request, status,
+              json{{"data", {{"name", name},
+                             {"devices_connected", metrics ? metrics->devices_connected() : 0},
+                             {"devices", metrics ? metrics->devices() : 0},
+                             {"keys", std::move(list)}}}},
+              users->revision);
   }
 
   void handle_rotate(evhttp_request* request, const std::string& name,

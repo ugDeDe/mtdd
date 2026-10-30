@@ -372,7 +372,8 @@ sudo bash install.sh     # то же меню через сам установщ
 | `install.sh users enable\|disable ИМЯ` | Включить или отключить пользователя, отозвать сессии |
 | `install.sh users remove ИМЯ [--yes]` | Удалить пользователя; `--yes` — без подтверждения |
 | `install.sh users rotate ИМЯ` · `install.sh rotate ИМЯ` | Новый секрет и ссылка; старая перестаёт работать |
-| `install.sh users show ИМЯ` | Политика и статистика пользователя: срок, квота (израсходовано/лимит), лимиты |
+| `install.sh users show ИМЯ` | Политика и статистика пользователя: срок, квота (израсходовано/лимит), лимиты, устройства |
+| `install.sh users devices ИМЯ` | Устройства пользователя: платформа (Apple, Android, Linux, Windows, Undefined), DC, IP, подключено сейчас или когда отключилось |
 | `install.sh users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ` | Задать или снять (`none`) `expires_at`, `data_quota_bytes`, `max_unique_ips`, `max_devices`, `rate_limit_up_bytes_per_sec`, `rate_limit_down_bytes_per_sec`, `note`; размеры — `10G`, `2M` |
 | `install.sh users reset-quota ИМЯ` | Обнулить израсходованную квоту |
 | `install.sh users audit [N]` | Последние N изменений из журнала API (по умолчанию 20) |

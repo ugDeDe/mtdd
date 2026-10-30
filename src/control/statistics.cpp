@@ -20,7 +20,7 @@ namespace {
 constexpr size_t kRejectReasonCount = 10;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 18;
+constexpr size_t kApiRouteCount = 19;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
@@ -43,7 +43,7 @@ constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/users/{name}/links", "/v1/system/info", "/v1/config",
     "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
     "/v1/users/{name}/enable", "/v1/users/{name}/disable",
-    "/v1/users/{name}/reset-quota"};
+    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -114,6 +114,7 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::user_enable: return 15;
     case ApiRoute::user_disable: return 16;
     case ApiRoute::user_reset_quota: return 17;
+    case ApiRoute::user_devices: return 18;
   }
   return 7;
 }
@@ -487,6 +488,8 @@ struct Statistics::Impl {
   ShardHighWater shard_high_water{};
   std::array<WorkerGauges, kMaxWorkers> gauges;
   mutable std::mutex build_mutex;
+  mutable std::mutex device_mutex;
+  Statistics::DeviceLister device_lister;
   std::string build_version;
   std::atomic<uint64_t> accepted{0};
   std::atomic<uint64_t> active{0};
@@ -551,6 +554,17 @@ bool Statistics::ready() const noexcept {
 void Statistics::set_build_info(std::string version) {
   std::lock_guard<std::mutex> lock(impl_->build_mutex);
   impl_->build_version = std::move(version);
+}
+
+void Statistics::set_device_lister(DeviceLister lister) {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  impl_->device_lister = std::move(lister);
+}
+
+std::vector<Statistics::DeviceInfo> Statistics::devices(const std::string& user) const {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  if (!impl_->device_lister) return {};
+  return impl_->device_lister(user);
 }
 
 void Statistics::connection_accepted() noexcept {

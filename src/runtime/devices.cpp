@@ -2,6 +2,8 @@
 // auth_key_id each connection presents (see detail::DeviceTable).
 #include "internal.hpp"
 
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +34,8 @@ DeviceTable::Count DeviceTable::prune_locked(Keys& keys, Clock::time_point now,
 }
 
 DeviceTable::Admit DeviceTable::admit(const std::string& user, std::int16_t dc,
-                                      std::uint64_t key, std::uint32_t max_devices,
+                                      std::uint64_t key, const protocol::Endpoint& peer,
+                                      Platform platform, std::uint32_t max_devices,
                                       Clock::time_point now, std::chrono::seconds window,
                                       Count& devices) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -42,6 +45,8 @@ DeviceTable::Admit DeviceTable::admit(const std::string& user, std::int16_t dc,
     if (const auto found = keys.find(id); found != keys.end()) {
         ++found->second.open;
         found->second.last = now;
+        found->second.peer = peer;
+        if (platform != Platform::undefined) found->second.platform = platform;
         devices = prune_locked(keys, now, window);
         return Admit::ok;
     }
@@ -66,7 +71,7 @@ DeviceTable::Admit DeviceTable::admit(const std::string& user, std::int16_t dc,
             keys.erase(idle);
         }
     }
-    keys.emplace(id, Entry{1, now});
+    keys.emplace(id, Entry{1, now, peer, platform});
     devices = prune_locked(keys, now, window);
     return Admit::ok;
 }
@@ -85,6 +90,38 @@ void DeviceTable::release(const std::string& user, std::int16_t dc, std::uint64_
         found->second.last = now;
     }
     devices = prune_locked(user_it->second, now, window);
+}
+
+std::vector<control::Statistics::DeviceInfo> DeviceTable::list(const std::string& user,
+                                                               Clock::time_point now,
+                                                               std::chrono::seconds window) {
+    std::vector<control::Statistics::DeviceInfo> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = users_.find(user);
+    if (found == users_.end()) return out;
+    prune_locked(found->second, now, window);
+    out.reserve(found->second.size());
+    for (const auto& [id, entry] : found->second) {
+        control::Statistics::DeviceInfo info;
+        // A short stable tag, not the key itself.
+        info.id = static_cast<std::uint32_t>((id.auth_key_id * 0x9E3779B97F4A7C15ULL) >> 32);
+        info.dc = id.dc;
+        info.connections = entry.open;
+        info.idle_seconds =
+            entry.open != 0
+                ? 0
+                : std::chrono::duration_cast<std::chrono::seconds>(now - entry.last).count();
+        char text[INET6_ADDRSTRLEN] = {};
+        if (entry.peer.ipv6) {
+            ::inet_ntop(AF_INET6, entry.peer.address.data(), text, sizeof(text));
+        } else {
+            ::inet_ntop(AF_INET, entry.peer.address.data(), text, sizeof(text));
+        }
+        info.ip = text;
+        info.platform = platform_name(entry.platform);
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 void DeviceTable::prune(Clock::time_point now, std::chrono::seconds window,
@@ -110,7 +147,7 @@ bool Runtime::Impl::register_device(Client& client, std::uint64_t auth_key_id, T
     if (client.device_registered || auth_key_id == 0 || client.user_name.empty()) return true;
     detail::DeviceTable::Count devices;
     const auto result = shared_->devices.admit(client.user_name, client.device_dc, auth_key_id,
-                                               client.max_devices, now, config_.device_window,
+                                               client.peer, client.platform, client.max_devices, now, config_.device_window,
                                                devices);
     if (client.metrics) client.metrics->set_devices(devices.recent, devices.connected);
     if (result == detail::DeviceTable::Admit::limit) {

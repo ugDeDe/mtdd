@@ -348,6 +348,7 @@ enum class ApiRoute {
   user_enable,
   user_disable,
   user_reset_quota,
+  user_devices,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -615,6 +616,20 @@ class Statistics {
   void set_ready(std::size_t worker, bool ready) noexcept;
   bool ready() const noexcept;
   void set_build_info(std::string version);
+
+  // Per-user device list (max_devices accounting), provided by the runtime.
+  // An empty lister (no runtime) yields no devices.
+  struct DeviceInfo {
+    uint32_t id{0};           // short tag derived from the auth_key_id
+    int16_t dc{0};            // signed DC
+    uint32_t connections{0};  // open connections presenting this key
+    int64_t idle_seconds{0};  // since the last connection closed; 0 while connected
+    std::string ip;           // address of the most recent connection
+    std::string platform{"Undefined"};  // Apple, Android, Linux, Windows, Undefined
+  };
+  using DeviceLister = std::function<std::vector<DeviceInfo>(const std::string& user)>;
+  void set_device_lister(DeviceLister lister);
+  std::vector<DeviceInfo> devices(const std::string& user) const;
 
   // Global connection counters.
   void connection_accepted() noexcept;

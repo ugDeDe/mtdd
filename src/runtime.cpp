@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/eventfd.h>
@@ -17,6 +18,13 @@
 #include <system_error>
 #include <string>
 #include <utility>
+
+#ifndef TCP_SAVE_SYN
+#define TCP_SAVE_SYN 27  // Linux 4.2+
+#endif
+#ifndef TCP_SAVED_SYN
+#define TCP_SAVED_SYN 28
+#endif
 
 namespace mtdd {
 namespace {
@@ -247,6 +255,12 @@ void Runtime::Impl::setup() {
     // per-connection setsockopt. Small FakeTLS records: no Nagle. Keepalive and
     // TCP_USER_TIMEOUT find vanished peers instead of idle_timeout.
     (void)io::set_tcp_nodelay(listener_.get());
+    // Keep each connection's SYN for the platform fingerprint (read once in
+    // make_client; the kernel frees it on read or close).
+    {
+        const int enable = 1;
+        (void)::setsockopt(listener_.get(), IPPROTO_TCP, TCP_SAVE_SYN, &enable, sizeof(enable));
+    }
     if (config_.client_keepalive.count() > 0) {
         const int idle = static_cast<int>(config_.client_keepalive.count());
         (void)io::set_tcp_keepalive(listener_.get(), idle, std::clamp(idle / 4, 5, 30), 4);

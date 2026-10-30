@@ -415,6 +415,11 @@ TEST(RuntimePolicy, DisconnectedDeviceFreesItsSlotForANewOne) {
         ASSERT_TRUE(first.send_message(keyed_message(0x1111)));
         ASSERT_TRUE(wait_for([&] { return metrics->devices() == 1U; }, 3s));
         EXPECT_EQ(metrics->devices_connected(), 1U);
+        const auto listed = daemon.services.stats.devices("alice");
+        ASSERT_EQ(listed.size(), 1U);
+        EXPECT_EQ(listed[0].dc, 2);
+        EXPECT_EQ(listed[0].connections, 1U);
+        EXPECT_EQ(listed[0].ip, "127.0.0.1");
     }
     ASSERT_TRUE(wait_for([&] {
         return daemon.services.stats.snapshot().users.at("alice").active_connections == 0U;
@@ -454,19 +459,29 @@ TEST(DeviceTable, CountsPerSignedDcAndDisplacesOnlyIdleKeys) {
     const auto t0 = std::chrono::steady_clock::now();
     mtdd::detail::DeviceTable::Count devices;
     using Admit = mtdd::detail::DeviceTable::Admit;
-    EXPECT_EQ(table.admit("u", 2, 1, 1, t0, 60s, devices), Admit::ok);
+    const auto peer = mtdd::protocol::Endpoint::v4({10, 0, 0, 7}, 4000);
+    constexpr auto kPlatform = mtdd::detail::Platform::android;
+    EXPECT_EQ(table.admit("u", 2, 1, peer, kPlatform, 1, t0, 60s, devices), Admit::ok);
     // A media DC key is counted on its own DC, not as a second device.
-    EXPECT_EQ(table.admit("u", -2, 7, 1, t0, 60s, devices), Admit::ok);
+    EXPECT_EQ(table.admit("u", -2, 7, peer, kPlatform, 1, t0, 60s, devices), Admit::ok);
     EXPECT_EQ(devices.recent, 1U);
     // Key 1 has an open connection: key 2 is held off.
-    EXPECT_EQ(table.admit("u", 2, 2, 1, t0, 60s, devices), Admit::limit);
+    EXPECT_EQ(table.admit("u", 2, 2, peer, kPlatform, 1, t0, 60s, devices), Admit::limit);
     table.release("u", 2, 1, t0, 60s, devices);
+    const auto listed = table.list("u", t0 + 5s, 60s);
+    ASSERT_EQ(listed.size(), 2U);
+    for (const auto& device : listed) {
+        EXPECT_EQ(device.ip, "10.0.0.7");
+        EXPECT_EQ(device.platform, "Android");
+        EXPECT_EQ(device.connections, device.dc == 2 ? 0U : 1U);
+        EXPECT_EQ(device.idle_seconds, device.dc == 2 ? 5 : 0);
+    }
     EXPECT_EQ(devices.recent, 1U);  // still listed within the window
     EXPECT_EQ(devices.connected, 1U);  // the media key is still open
     // Idle key 1 gives way at once.
-    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 1s, 60s, devices), Admit::ok);
+    EXPECT_EQ(table.admit("u", 2, 2, peer, kPlatform, 1, t0 + 1s, 60s, devices), Admit::ok);
     EXPECT_EQ(devices.recent, 1U);
-    EXPECT_EQ(table.admit("u", 2, 1, 1, t0 + 2s, 60s, devices), Admit::limit);
+    EXPECT_EQ(table.admit("u", 2, 1, peer, kPlatform, 1, t0 + 2s, 60s, devices), Admit::limit);
     std::vector<std::pair<std::string, mtdd::detail::DeviceTable::Count>> counts;
     table.release("u", 2, 2, t0 + 2s, 60s, devices);
     table.release("u", -2, 7, t0 + 2s, 60s, devices);
@@ -476,4 +491,107 @@ TEST(DeviceTable, CountsPerSignedDcAndDisplacesOnlyIdleKeys) {
     EXPECT_EQ(counts[0].second.connected, 0U);
     table.prune(t0 + 200s, 60s, counts);
     EXPECT_TRUE(counts.empty());
+}
+
+namespace {
+
+// IPv4 + TCP SYN header bytes as TCP_SAVED_SYN returns them.
+Bytes saved_syn(std::uint8_t ttl, std::uint16_t window, const Bytes& options) {
+    Bytes syn(20, 0);
+    syn[0] = 0x45;
+    syn[8] = ttl;
+    syn[9] = 6;
+    Bytes tcp(20, 0);
+    const std::size_t padded = (options.size() + 3) / 4 * 4;
+    tcp[12] = static_cast<std::uint8_t>(((20 + padded) / 4) << 4);
+    tcp[13] = 0x02;
+    tcp[14] = static_cast<std::uint8_t>(window >> 8);
+    tcp[15] = static_cast<std::uint8_t>(window);
+    syn.insert(syn.end(), tcp.begin(), tcp.end());
+    syn.insert(syn.end(), options.begin(), options.end());
+    syn.resize(20 + 20 + padded, 0);
+    return syn;
+}
+
+const Bytes kTs{8, 10, 1, 2, 3, 4, 0, 0, 0, 0};
+Bytes concat(std::initializer_list<Bytes> parts) {
+    Bytes out;
+    for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+const Bytes kAppleSyn = saved_syn(53, 65535, concat({{2, 4, 0x05, 0xb4, 1, 3, 3, 6, 1, 1}, kTs, {4, 2, 0}}));
+const Bytes kLinuxSyn = saved_syn(57, 64240, concat({{2, 4, 0x05, 0xb4, 4, 2}, kTs, {1, 3, 3, 7}}));
+const Bytes kAndroidSyn = saved_syn(55, 65535, concat({{2, 4, 0x05, 0xac, 4, 2}, kTs, {1, 3, 3, 9}}));
+const Bytes kWindowsSyn = saved_syn(117, 65535, {2, 4, 0x05, 0x9c, 1, 3, 3, 8, 1, 1, 4, 2});
+const Bytes kScannerSyn = saved_syn(236, 1024, {});
+
+// A ClientHello record with the given extension types (empty bodies).
+Bytes client_hello(std::initializer_list<std::uint16_t> extensions) {
+    Bytes body{0x03, 0x03};
+    body.resize(2 + 32, 0x11);
+    body.push_back(0);                       // session id
+    body.insert(body.end(), {0, 2, 0x13, 0x01});  // one cipher suite
+    body.insert(body.end(), {1, 0});         // compression
+    Bytes ext;
+    for (const auto type : extensions) {
+        ext.insert(ext.end(), {static_cast<std::uint8_t>(type >> 8),
+                               static_cast<std::uint8_t>(type), 0, 0});
+    }
+    body.push_back(static_cast<std::uint8_t>(ext.size() >> 8));
+    body.push_back(static_cast<std::uint8_t>(ext.size()));
+    body.insert(body.end(), ext.begin(), ext.end());
+    Bytes record{0x16, 0x03, 0x01, 0, 0, 0x01, 0, 0, 0};
+    const std::size_t hs = body.size();
+    record[3] = static_cast<std::uint8_t>((hs + 4) >> 8);
+    record[4] = static_cast<std::uint8_t>(hs + 4);
+    record[7] = static_cast<std::uint8_t>(hs >> 8);
+    record[8] = static_cast<std::uint8_t>(hs);
+    record.insert(record.end(), body.begin(), body.end());
+    return record;
+}
+
+const Bytes kSafariHello = client_hello(
+    {0x0a0a, 0, 23, 65281, 10, 11, 16, 5, 13, 18, 51, 45, 43, 27, 0x1a1a});
+const Bytes kChromeHello = client_hello(
+    {0x2a2a, 65281, 51, 17613, 45, 11, 10, 27, 16, 43, 18, 5, 13, 0, 35, 23, 65037, 0x3a3a});
+const Bytes kGoHello = client_hello({5, 10, 11, 13, 65281, 23, 18, 43, 51});
+
+mtdd::detail::Platform platform_of(const Bytes& syn, const Bytes& hello) {
+    return mtdd::detail::classify_platform(mtdd::detail::parse_saved_syn(syn),
+                                           mtdd::detail::classify_client_hello(hello));
+}
+
+} // namespace
+
+TEST(Platform, ReferenceFingerprintsClassify) {
+    using mtdd::detail::Platform;
+    EXPECT_EQ(platform_of(kAppleSyn, kSafariHello), Platform::apple);
+    EXPECT_EQ(platform_of(kAndroidSyn, kSafariHello), Platform::apple);  // TLS decides
+    EXPECT_EQ(platform_of(kLinuxSyn, kChromeHello), Platform::linux_desktop);
+    EXPECT_EQ(platform_of(kAndroidSyn, kChromeHello), Platform::android);
+    EXPECT_EQ(platform_of(kWindowsSyn, kChromeHello), Platform::windows);
+    EXPECT_EQ(platform_of(kAppleSyn, kChromeHello), Platform::apple);  // macOS Desktop
+    EXPECT_EQ(platform_of(kScannerSyn, kChromeHello), Platform::undefined);
+    EXPECT_EQ(platform_of(kLinuxSyn, kGoHello), Platform::undefined);
+    EXPECT_EQ(platform_of({}, kChromeHello), Platform::undefined);
+    const auto syn = mtdd::detail::parse_saved_syn(kWindowsSyn);
+    EXPECT_EQ(syn.ttl, 117);
+    EXPECT_EQ(syn.wscale, 8);
+    EXPECT_EQ(syn.mss, 1436);
+    EXPECT_FALSE(syn.timestamps);
+    EXPECT_STREQ(mtdd::detail::platform_name(Platform::undefined), "Undefined");
+}
+
+TEST(Platform, TruncatedInputIsUndefinedNotACrash) {
+    for (std::size_t cut = 0; cut < kChromeHello.size(); ++cut) {
+        const Bytes part(kChromeHello.begin(), kChromeHello.begin() + static_cast<long>(cut));
+        (void)mtdd::detail::classify_client_hello(part);
+    }
+    for (std::size_t cut = 0; cut < kAppleSyn.size(); ++cut) {
+        const Bytes part(kAppleSyn.begin(), kAppleSyn.begin() + static_cast<long>(cut));
+        (void)mtdd::detail::parse_saved_syn(part);
+    }
+    Bytes bogus = kAppleSyn;
+    bogus[20 + 12] = 0xf0;  // data offset beyond the buffer
+    (void)mtdd::detail::parse_saved_syn(bogus);
 }

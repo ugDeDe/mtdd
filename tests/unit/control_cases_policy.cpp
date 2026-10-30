@@ -207,3 +207,34 @@ TEST(Rfc3339Test, ParsesAndFormatsUtc) {
 }
 
 }  // namespace
+
+TEST(UserPolicyHttpTest, DevicesRouteListsConnectedFirst) {
+  Harness h;
+  ASSERT_EQ(h.req("POST", "/v1/users", make_user_body("alice")).status, 201);
+  EXPECT_EQ(h.req("GET", "/v1/users/nobody/devices").status, 404);
+  auto empty = h.req("GET", "/v1/users/alice/devices");
+  ASSERT_EQ(empty.status, 200) << empty.body;
+  EXPECT_TRUE(parse_json(empty)["data"]["keys"].empty());
+
+  h.stats().set_device_lister([](const std::string& user) {
+    std::vector<Statistics::DeviceInfo> out;
+    if (user != "alice") return out;
+    out.push_back({0x1a2b3c4d, 2, 0, 120, "10.0.0.1"});
+    out.push_back({0x0000beef, -2, 3, 0, "10.0.0.2"});
+    return out;
+  });
+  h.stats().user("alice")->set_devices(2, 1);
+  const auto listed = h.req("GET", "/v1/users/alice/devices");
+  ASSERT_EQ(listed.status, 200) << listed.body;
+  const auto data = parse_json(listed)["data"];
+  EXPECT_EQ(data["devices_connected"], 1);
+  EXPECT_EQ(data["devices"], 2);
+  ASSERT_EQ(data["keys"].size(), 2u);
+  EXPECT_EQ(data["keys"][0]["id"], "0000beef");
+  EXPECT_EQ(data["keys"][0]["connected"], true);
+  EXPECT_EQ(data["keys"][0]["dc"], -2);
+  EXPECT_EQ(data["keys"][1]["idle_seconds"], 120);
+  EXPECT_EQ(data["keys"][1]["ip"], "10.0.0.1");
+  EXPECT_EQ(h.req("POST", "/v1/users/alice/devices").status, 405);
+  h.stats().set_device_lister({});
+}

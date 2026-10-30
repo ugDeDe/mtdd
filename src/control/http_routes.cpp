@@ -120,7 +120,8 @@ RouteInfo classify_route(evhttp_request* request) {
       {"rotate-secret", ApiRoute::rotate_secret},
       {"enable", ApiRoute::user_enable},
       {"disable", ApiRoute::user_disable},
-      {"reset-quota", ApiRoute::user_reset_quota}};
+      {"reset-quota", ApiRoute::user_reset_quota},
+      {"devices", ApiRoute::user_devices}};
   for (const auto& [suffix, route] : kActions) {
     if (action == suffix && (slash == std::string::npos) == suffix.empty()) {
       info.route = route;
@@ -138,6 +139,7 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
     case ApiRoute::status:
     case ApiRoute::metrics:
     case ApiRoute::user_links:
+    case ApiRoute::user_devices:
     case ApiRoute::system_info:
     case ApiRoute::config:
     case ApiRoute::stats_summary:

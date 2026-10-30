@@ -193,6 +193,7 @@ mtdd — установка и управление MTProto-прокси
   users remove ИМЯ [--yes]        Удалить пользователя (без подтверждения с --yes)
   users rotate ИМЯ                Заменить секрет и показать новую ссылку
   users show ИМЯ                  Политики и статистика пользователя
+  users devices ИМЯ               Устройства: платформа, DC, IP, подключено ли
   users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости, заметка (none — снять)
   users reset-quota ИМЯ           Сбросить использованную квоту
   users audit [N]                 Последние N событий журнала аудита
@@ -517,12 +518,14 @@ users = data["users"]
 print("  Пользователей: {} · ревизия: {}".format(len(users), data.get("revision", "?")))
 if not users:
     sys.exit(0)
-print("  {:<20} {:<4} {:>10} {:>12}".format("Имя", "Вкл", "Соединений", "Уникальных IP"))
+print("  {:<20} {:<4} {:>10} {:>12} {:>16}".format("Имя", "Вкл", "Соединений", "Уникальных IP", "Устройств сейчас"))
 for u in users:
     stats = u.get("stats", {})
-    print("  {:<20} {:<4} {:>10} {:>12}".format(
+    limit = u.get("max_devices")
+    devices = str(stats.get("devices_connected", 0)) + ("" if limit is None else " / " + str(limit))
+    print("  {:<20} {:<4} {:>10} {:>12} {:>16}".format(
         str(u.get("name", "?")), "да" if u.get("enabled") else "нет",
-        str(stats.get("active_connections", 0)), str(stats.get("unique_ips_active", 0))))
+        str(stats.get("active_connections", 0)), str(stats.get("unique_ips_active", 0)), devices))
 ' || { err 'Не удалось разобрать список пользователей'; return 1; }
 }
 
@@ -798,6 +801,46 @@ for label, value in rows:
     while IFS=$'\t' read -r label value; do
         kv "$label" "$value"
     done <<<"$rows"
+    cmd_users_devices "$name" quiet
+}
+
+cmd_users_devices() { # cmd_users_devices ИМЯ [quiet] — ключи устройств: платформа, DC, IP
+    local name=${1-} quiet=${2-} response
+    valid_user_name "$name" || { err 'Неверное имя пользователя'; return 1; }
+    response=$(api_try GET "/v1/users/$name/devices" 2>&1) \
+        || { [[ -n $quiet ]] && return 0; err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    api_check "$response" 2>/dev/null || { [[ -n $quiet ]] && return 0; err "Не удалось получить устройства $name:$(api_check "$response" 2>&1 || true)"; return 1; }
+    [[ -n $quiet ]] || section "Устройства · $name"
+    printf '%s' "$response" | python3 -c '
+import json, sys
+data = json.load(sys.stdin).get("data") or {}
+keys = data.get("keys") or []
+print()
+print("  Подключено сейчас: {} · за 15 мин: {}".format(data.get("devices_connected", 0), data.get("devices", 0)))
+if not keys:
+    print("  Устройств нет")
+    sys.exit(0)
+
+
+def ago(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return "{} с назад".format(seconds)
+    if seconds < 3600:
+        return "{} мин назад".format(seconds // 60)
+    return "{} ч назад".format(seconds // 3600)
+
+
+print("  {:<10} {:<9} {:>4} {:<22} {:<39}".format("Платформа", "Ключ", "DC", "Состояние", "IP"))
+for key in keys:
+    if key.get("connected"):
+        state = "подключено ({})".format(key.get("connections", 0))
+    else:
+        state = ago(key.get("idle_seconds", 0))
+    print("  {:<10} {:<9} {:>4} {:<22} {:<39}".format(
+        str(key.get("platform", "Undefined")), str(key.get("id", "?")),
+        str(key.get("dc", "?")), state, str(key.get("ip", ""))))
+' || { err "Не удалось разобрать устройства $name"; return 1; }
 }
 
 cmd_audit() { # cmd_audit [ЧИСЛО] — последние события журнала аудита
@@ -861,6 +904,9 @@ cmd_users() {
         show)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users show ИМЯ'; return 1; }
             cmd_users_show "${cargs[1]}" ;;
+        devices)
+            ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users devices ИМЯ'; return 1; }
+            cmd_users_devices "${cargs[1]}" ;;
         set)
             ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
@@ -870,7 +916,7 @@ cmd_users() {
         audit)
             cmd_audit "${cargs[1]-}" ;;
         *)
-            err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate|show|set|reset-quota|audit)"
+            err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate|show|devices|set|reset-quota|audit)"
             return 1 ;;
     esac
 }
@@ -2036,7 +2082,8 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
         menu_row 3 'Квота трафика' 8 'Включить'
         menu_row 4 'Лимит уникальных IP' 9 'Отключить'
         menu_row 5 'Лимит скорости ↑' 10 'Сбросить квоту'
-        menu_row 11 'Лимит устройств' 0 'Назад'
+        menu_row 11 'Лимит устройств' 12 'Устройства'
+        menu_row 0 'Назад'
         menu_footer
         menu_read choice '  › ' || return 0
         case $choice in
@@ -2050,6 +2097,7 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
             8) menu_run cmd_users_action "$name" enable; menu_pause ;;
             9) menu_run cmd_users_action "$name" disable; menu_pause ;;
             10) menu_run cmd_users_action "$name" reset-quota; menu_pause ;;
+            12) menu_run cmd_users_devices "$name"; menu_pause ;;
             11) menu_ask_set "$name" max_devices 'Макс. устройств (по auth_key_id; Enter/none — без лимита)'; menu_pause ;;
             0|q|Q) return 0 ;;
             *) : ;;

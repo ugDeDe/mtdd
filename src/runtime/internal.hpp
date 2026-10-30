@@ -388,6 +388,26 @@ private:
         order_;
 };
 
+// Coarse client platform (see platform.cpp for the reference fingerprints).
+enum class Platform : std::uint8_t { undefined, apple, android, linux_desktop, windows };
+enum class SynLayout : std::uint8_t { other, linux_stack, apple_stack, windows_stack };
+enum class TlsTemplate : std::uint8_t { other, safari, chrome };
+struct SynPrint {
+    bool valid{false};
+    std::uint8_t ttl{0};
+    std::uint16_t window{0};
+    std::uint16_t mss{0};
+    std::int8_t wscale{-1};
+    bool timestamps{false};
+    SynLayout layout{SynLayout::other};
+};
+const char* platform_name(Platform platform) noexcept;
+// `syn` is what TCP_SAVED_SYN returns: the IP header followed by the TCP header.
+SynPrint parse_saved_syn(std::span<const std::uint8_t> syn) noexcept;
+// `record` is the whole ClientHello TLS record, header included.
+TlsTemplate classify_client_hello(std::span<const std::uint8_t> record) noexcept;
+Platform classify_platform(const SynPrint& syn, TlsTemplate tls) noexcept;
+
 // Leading client frames inspected for a non-zero auth_key_id. Key exchange
 // (auth_key_id 0) takes a few frames; nothing after the first key is read.
 inline constexpr std::uint8_t kDeviceScanFrames = 16;
@@ -413,10 +433,15 @@ public:
     };
 
     Admit admit(const std::string& user, std::int16_t dc, std::uint64_t key,
-                std::uint32_t max_devices, Clock::time_point now,
+                const protocol::Endpoint& peer, Platform platform, std::uint32_t max_devices,
+                Clock::time_point now,
                 std::chrono::seconds window, Count& devices);
     void release(const std::string& user, std::int16_t dc, std::uint64_t key,
                  Clock::time_point now, std::chrono::seconds window, Count& devices);
+    // The keys of one user, for GET /v1/users/{name}/devices.
+    std::vector<control::Statistics::DeviceInfo> list(const std::string& user,
+                                                      Clock::time_point now,
+                                                      std::chrono::seconds window);
     // Drops expired keys; reports the device count of every known user.
     void prune(Clock::time_point now, std::chrono::seconds window,
                std::vector<std::pair<std::string, Count>>& counts);
@@ -438,6 +463,8 @@ private:
     struct Entry {
         std::uint32_t open{0};
         Clock::time_point last{};
+        protocol::Endpoint peer{};
+        Platform platform{Platform::undefined};
     };
     using Keys = std::unordered_map<Key, Entry, KeyHash>;
     static Count prune_locked(Keys& keys, Clock::time_point now,
@@ -740,6 +767,8 @@ struct Runtime::Impl {
         // Device accounting (max_devices): the first non-zero auth_key_id the
         // connection presents, registered once in SharedState::devices.
         std::uint64_t auth_key_id{0};
+        detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
+        detail::Platform platform{detail::Platform::undefined};
         std::int16_t device_dc{0};      // signed DC
         std::uint32_t max_devices{0};   // user's policy, 0 = unlimited
         std::uint8_t device_scan_left{0};  // messages still inspected for a key
@@ -1311,6 +1340,7 @@ public:
     std::vector<std::thread> threads;
     // Quota counter persistence (no-op without Config::usage_state_path).
     std::unique_ptr<control::UsageStateKeeper> usage_keeper;
+    control::Statistics* statistics_{nullptr};
     // A concurrent destructor must not clear reactors/threads while run() is
     // still starting or joining workers. The destructor requests stop first,
     // then waits here for run() to publish its terminal state.

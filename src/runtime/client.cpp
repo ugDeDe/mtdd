@@ -1,5 +1,7 @@
 #include "internal.hpp"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,6 +19,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef TCP_SAVE_SYN
+#define TCP_SAVE_SYN 27  // Linux 4.2+
+#endif
+#ifndef TCP_SAVED_SYN
+#define TCP_SAVED_SYN 28
+#endif
 
 namespace mtdd {
 namespace {
@@ -246,6 +255,13 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     // (setup()) and inherited by every accepted socket: no per-connection
     // setsockopt calls on the accept path.
     owned->peer = *protocol_peer;
+    {
+        std::array<std::uint8_t, 128> syn{};
+        socklen_t length = sizeof(syn);
+        if (::getsockopt(owned->fd.get(), IPPROTO_TCP, TCP_SAVED_SYN, syn.data(), &length) == 0) {
+            owned->syn = detail::parse_saved_syn(std::span<const std::uint8_t>(syn.data(), length));
+        }
+    }
     owned->phase = Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
     owned->last_activity = now;
@@ -488,6 +504,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     }
 
     if (client.phase != Client::Phase::tls_hello) return;
+    client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
     client.user_name = user->name;
     client.generation = user->generation;
     client.metrics = stats_.user(user->name);

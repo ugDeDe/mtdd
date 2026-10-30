@@ -990,6 +990,20 @@ class UserPolicyApiTest(PolicyShellCase):
                      "friend", "без лимита"):
             self.assertIn(text, result.stdout)
 
+    def test_devices_lists_platform_state_and_ip(self):
+        keys = [{"id": "0000beef", "dc": 2, "connections": 3, "connected": True,
+                 "idle_seconds": 0, "ip": "10.0.0.2", "platform": "Android"},
+                {"id": "1a2b3c4d", "dc": 4, "connections": 0, "connected": False,
+                 "idle_seconds": 180, "ip": "10.0.0.1", "platform": "Undefined"}]
+        self.start_api({("GET", "/v1/users/bob/devices"): (200, {"ok": True, "request_id": 5,
+                        "data": {"name": "bob", "devices_connected": 1, "devices": 2,
+                                 "keys": keys}})})
+        result = self.sh("NO_COLOR=1; cmd_users_devices bob")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text in ("Подключено сейчас: 1 · за 15 мин: 2", "Android", "подключено (3)",
+                     "10.0.0.2", "Undefined", "3 мин назад", "1a2b3c4d"):
+            self.assertIn(text, result.stdout)
+
     def test_show_without_quota_used_still_works(self):
         user = {"name": "bob", "enabled": False, "data_quota_bytes": 5 * 1024 ** 2, "note": ""}
         self.start_api({("GET", "/v1/users/bob"): (200, {"ok": True, "request_id": 3,

@@ -96,9 +96,20 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     // reactors that were never created (their ack would never arrive).
     statistics.configure_workers(workers);
     barrier.configure_workers(workers);
+    statistics_ = &statistics;
+    statistics.set_device_lister(
+        [weak = std::weak_ptr<detail::SharedState>(shared),
+         window = config.device_window](const std::string& user) {
+            std::vector<control::Statistics::DeviceInfo> out;
+            if (const auto state = weak.lock()) {
+                out = state->devices.list(user, std::chrono::steady_clock::now(), window);
+            }
+            return out;
+        });
 }
 
 Runtime::RuntimeState::~RuntimeState() {
+    if (statistics_) statistics_->set_device_lister({});
     request_stop();
     {
         std::unique_lock lock{run_mutex_};
