@@ -547,6 +547,7 @@ struct ControlServer::Impl {
            {"unique_ips_seen", row.metrics.unique_ips_active},
            {"unique_ips_active", row.metrics.unique_ips_qualified},
            {"devices", row.metrics.devices},
+           {"devices_connected", row.metrics.devices_connected},
            {"payload_bytes_c2s", row.metrics.payload_c2s_bytes},
            {"payload_bytes_s2c", row.metrics.payload_s2c_bytes},
            {"payload_bytes_total",

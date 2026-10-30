@@ -414,10 +414,13 @@ TEST(RuntimePolicy, DisconnectedDeviceFreesItsSlotForANewOne) {
         ASSERT_TRUE(first.start_obfuscation(2));
         ASSERT_TRUE(first.send_message(keyed_message(0x1111)));
         ASSERT_TRUE(wait_for([&] { return metrics->devices() == 1U; }, 3s));
+        EXPECT_EQ(metrics->devices_connected(), 1U);
     }
     ASSERT_TRUE(wait_for([&] {
         return daemon.services.stats.snapshot().users.at("alice").active_connections == 0U;
     }, 3s));
+    EXPECT_EQ(metrics->devices_connected(), 0U);
+    EXPECT_EQ(metrics->devices(), 1U);  // still listed within the window
     // The first device is gone: a new one takes its slot immediately.
     TestClient second(daemon.port(), secret_bytes());
     ASSERT_TRUE(second.valid());
@@ -449,26 +452,28 @@ TEST(RuntimePolicy, DisconnectedDeviceFreesItsSlotForANewOne) {
 TEST(DeviceTable, CountsPerSignedDcAndDisplacesOnlyIdleKeys) {
     mtdd::detail::DeviceTable table;
     const auto t0 = std::chrono::steady_clock::now();
-    std::uint64_t devices = 0;
+    mtdd::detail::DeviceTable::Count devices;
     using Admit = mtdd::detail::DeviceTable::Admit;
     EXPECT_EQ(table.admit("u", 2, 1, 1, t0, 60s, devices), Admit::ok);
     // A media DC key is counted on its own DC, not as a second device.
     EXPECT_EQ(table.admit("u", -2, 7, 1, t0, 60s, devices), Admit::ok);
-    EXPECT_EQ(devices, 1U);
+    EXPECT_EQ(devices.recent, 1U);
     // Key 1 has an open connection: key 2 is held off.
     EXPECT_EQ(table.admit("u", 2, 2, 1, t0, 60s, devices), Admit::limit);
     table.release("u", 2, 1, t0, 60s, devices);
-    EXPECT_EQ(devices, 1U);  // still listed within the window
+    EXPECT_EQ(devices.recent, 1U);  // still listed within the window
+    EXPECT_EQ(devices.connected, 1U);  // the media key is still open
     // Idle key 1 gives way at once.
     EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 1s, 60s, devices), Admit::ok);
-    EXPECT_EQ(devices, 1U);
+    EXPECT_EQ(devices.recent, 1U);
     EXPECT_EQ(table.admit("u", 2, 1, 1, t0 + 2s, 60s, devices), Admit::limit);
-    std::vector<std::pair<std::string, std::uint64_t>> counts;
+    std::vector<std::pair<std::string, mtdd::detail::DeviceTable::Count>> counts;
     table.release("u", 2, 2, t0 + 2s, 60s, devices);
     table.release("u", -2, 7, t0 + 2s, 60s, devices);
     table.prune(t0 + 200s, 60s, counts);
     ASSERT_EQ(counts.size(), 1U);
-    EXPECT_EQ(counts[0].second, 0U);
+    EXPECT_EQ(counts[0].second.recent, 0U);
+    EXPECT_EQ(counts[0].second.connected, 0U);
     table.prune(t0 + 200s, 60s, counts);
     EXPECT_TRUE(counts.empty());
 }

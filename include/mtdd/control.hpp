@@ -365,8 +365,10 @@ struct UserMetricsSnapshot {
   uint64_t unique_ips_active{0};
   // Online IPs whose connections moved >= unique_ip_min_bytes ("active").
   uint64_t unique_ips_qualified{0};
-  // Distinct devices (MTProto auth keys, max over DCs) within the window.
+  // Distinct devices (MTProto auth keys, max over DCs) seen within the device
+  // window, and those of them with an open connection right now.
   uint64_t devices{0};
+  uint64_t devices_connected{0};
   uint64_t payload_c2s_bytes{0};
   uint64_t payload_s2c_bytes{0};
   // c2s + s2c payload bytes counted against UserPolicy::data_quota_bytes.
@@ -566,8 +568,9 @@ class UserMetrics {
   uint64_t active_unique_ips() const noexcept;
   void set_qualified_unique_ips(uint64_t value) noexcept;
   uint64_t qualified_unique_ips() const noexcept;
-  void set_devices(uint64_t value) noexcept;
+  void set_devices(uint64_t recent, uint64_t connected) noexcept;
   uint64_t devices() const noexcept;
+  uint64_t devices_connected() const noexcept;
   uint64_t payload_c2s_bytes() const noexcept;
   uint64_t payload_s2c_bytes() const noexcept;
 
@@ -576,6 +579,7 @@ class UserMetrics {
   std::atomic<uint64_t> unique_ips_{0};
   std::atomic<uint64_t> qualified_ips_{0};
   std::atomic<uint64_t> devices_{0};
+  std::atomic<uint64_t> devices_connected_{0};
   std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
   // Quota usage is (c2s + s2c) - quota_base_: the hot path pays only the

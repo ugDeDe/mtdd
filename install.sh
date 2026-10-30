@@ -789,7 +789,7 @@ rows = [
     ("Заметка", user.get("note") or "—"),
     ("Соединений", str(stats.get("active_connections", 0))),
     ("Уникальных IP", str(stats.get("unique_ips_active", 0))),
-    ("Устройств", str(stats.get("devices", 0))),
+    ("Устройств", "{} подключено · {} за 15 мин".format(stats.get("devices_connected", 0), stats.get("devices", 0))),
 ]
 for label, value in rows:
     print("{}\t{}".format(label, str(value).replace("\n", " ")))

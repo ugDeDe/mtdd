@@ -480,6 +480,7 @@ json user_json(const UserRecord& user, const StatisticsSnapshot& stats) {
                     {"unique_ips_active", metrics.unique_ips_qualified},
                     {"unique_ips_seen", metrics.unique_ips_active},
                     {"devices", metrics.devices},
+                    {"devices_connected", metrics.devices_connected},
                     {"payload_bytes_c2s", metrics.payload_c2s_bytes},
                     {"payload_bytes_s2c", metrics.payload_s2c_bytes},
                     {"quota_used_bytes", metrics.quota_used_bytes}};

@@ -406,15 +406,20 @@ class DeviceTable {
 public:
     using Clock = std::chrono::steady_clock;
     enum class Admit : std::uint8_t { ok, limit };
+    // Max over DCs of the listed keys, and of the keys with an open connection.
+    struct Count {
+        std::uint64_t recent{0};
+        std::uint64_t connected{0};
+    };
 
     Admit admit(const std::string& user, std::int16_t dc, std::uint64_t key,
                 std::uint32_t max_devices, Clock::time_point now,
-                std::chrono::seconds window, std::uint64_t& devices);
+                std::chrono::seconds window, Count& devices);
     void release(const std::string& user, std::int16_t dc, std::uint64_t key,
-                 Clock::time_point now, std::chrono::seconds window, std::uint64_t& devices);
+                 Clock::time_point now, std::chrono::seconds window, Count& devices);
     // Drops expired keys; reports the device count of every known user.
     void prune(Clock::time_point now, std::chrono::seconds window,
-               std::vector<std::pair<std::string, std::uint64_t>>& counts);
+               std::vector<std::pair<std::string, Count>>& counts);
 
 private:
     struct Key {
@@ -435,7 +440,7 @@ private:
         Clock::time_point last{};
     };
     using Keys = std::unordered_map<Key, Entry, KeyHash>;
-    static std::uint64_t prune_locked(Keys& keys, Clock::time_point now,
+    static Count prune_locked(Keys& keys, Clock::time_point now,
                                       std::chrono::seconds window);
 
     std::mutex mutex_;
