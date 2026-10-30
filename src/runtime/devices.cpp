@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 namespace mtdd {
@@ -150,6 +151,14 @@ bool Runtime::Impl::register_device(Client& client, std::uint64_t auth_key_id, T
                                                client.peer, client.platform, client.max_devices, now, config_.device_window,
                                                devices);
     if (client.metrics) client.metrics->set_devices(devices.recent, devices.connected);
+    if (client.watched) {
+        char key[24];
+        std::snprintf(key, sizeof(key), "%016llx", static_cast<unsigned long long>(auth_key_id));
+        watch_log(client, "device",
+                  std::string("auth_key_id=") + key + " dc=" + std::to_string(client.device_dc) +
+                      " platform=" + detail::platform_name(client.platform) + " result=" +
+                      (result == detail::DeviceTable::Admit::limit ? "device_limit" : "ok"));
+    }
     if (result == detail::DeviceTable::Admit::limit) {
         note_close(client, control::RelayCloseReason::device_limit);
         defer_close(client.token);
@@ -199,6 +208,10 @@ bool Runtime::Impl::scan_direct_auth_key(Client& client, std::span<const std::ui
         for (int i = 3; i >= 0; --i) length = (length << 8) | client.direct_scan_head[i];
         for (int i = 11; i >= 4; --i) key = (key << 8) | client.direct_scan_head[i];
         length &= 0x7fffffffU;
+        if (client.watched) {
+            watch_frame(client, std::span<const std::uint8_t>(client.direct_scan_head).subspan(4),
+                        length);
+        }
         client.direct_scan_have = 0;
         --client.device_scan_left;
         if (key != 0) return register_device(client, key, now);

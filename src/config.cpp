@@ -139,7 +139,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
-        "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds",
+        "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds", "watch_ips",
         "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
@@ -190,6 +190,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     if (!config.api_read_token_env.empty() && config.api_read_token_env == config.metrics_token_env)
         throw std::invalid_argument("token variables must be distinct environment variable names");
     config.control_allow = networks(value, "control_allow", {});
+    config.watch_ips = networks(value, "watch_ips", {});
     config.metrics_host = text(value, "metrics_host", config.metrics_host);
     if (!numeric_ip(config.metrics_host)) throw std::invalid_argument("metrics_host must be a numeric IP address");
     config.metrics_port = static_cast<std::uint16_t>(number(value, "metrics_port", config.metrics_port, 0, 65535));

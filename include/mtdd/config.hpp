@@ -72,6 +72,11 @@ struct Config {
     // How long a device's auth key stays listed in the devices gauge after its
     // last connection closed. An idle key never blocks a new device.
     std::chrono::seconds device_window{900};
+    // Investigation aid: connections from these addresses/CIDRs get a
+    // per-stage log in the journal ("mtdd watch: ..."): SYN fingerprint,
+    // first bytes, ClientHello, auth result, masking, DC, auth_key_id,
+    // MTProto frames, close reason and kernel byte counts. Empty = off.
+    std::vector<std::string> watch_ips;
     std::chrono::seconds metadata_refresh{3600};
     // Opt-in Direct Telegram DC fallback. Disabled by default; only the listed
     // signed DCs use the trusted official direct address table.

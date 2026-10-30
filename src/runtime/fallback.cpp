@@ -136,6 +136,7 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
         }
     }
     if (targets.empty()) {
+        if (client.watched) watch_log(client, "masking", "target=none");
         close_client(client.token);
         return true;
     }
@@ -145,6 +146,10 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
         const std::string address = ensure_fallback_address(now, host);
         if (address.empty()) continue;
         auto attempt = io::connect_tcp(address, port);
+        if (client.watched) {
+            watch_log(client, "masking", "target=" + host + ":" + std::to_string(port) +
+                                             (attempt.ok() ? "" : " connect_failed"));
+        }
         if (attempt.ok()) {
             connected = std::move(attempt);
             dialled = true;

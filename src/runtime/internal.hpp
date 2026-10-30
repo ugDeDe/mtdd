@@ -408,6 +408,14 @@ SynPrint parse_saved_syn(std::span<const std::uint8_t> syn) noexcept;
 TlsTemplate classify_client_hello(std::span<const std::uint8_t> record) noexcept;
 Platform classify_platform(const SynPrint& syn, TlsTemplate tls) noexcept;
 
+// Config::watch_ips entry: IPv4 is stored IPv4-mapped, its prefix offset by 96.
+struct WatchNet {
+    std::array<std::uint8_t, 16> address{};
+    std::uint8_t prefix{128};
+};
+std::optional<WatchNet> parse_watch_net(std::string_view text);
+bool watch_net_contains(const WatchNet& net, const protocol::Endpoint& peer) noexcept;
+
 // Leading client frames inspected for a non-zero auth_key_id. Key exchange
 // (auth_key_id 0) takes a few frames; nothing after the first key is read.
 inline constexpr std::uint8_t kDeviceScanFrames = 16;
@@ -768,6 +776,10 @@ struct Runtime::Impl {
         // connection presents, registered once in SharedState::devices.
         std::uint64_t auth_key_id{0};
         detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
+        // Config::watch_ips: this connection is logged stage by stage.
+        bool watched{false};
+        std::uint8_t watch_frames{0};
+        Time watch_start{};
         detail::Platform platform{detail::Platform::undefined};
         std::int16_t device_dc{0};      // signed DC
         std::uint32_t max_devices{0};   // user's policy, 0 = unlimited
@@ -1045,6 +1057,13 @@ struct Runtime::Impl {
     bool scan_direct_auth_key(Client& client, std::span<const std::uint8_t> plain, Time now);
     void release_device(Client& client, Time now) noexcept;
     void publish_devices(Time now);
+    // Config::watch_ips investigation log (watch.cpp). Callers check
+    // client.watched first; nothing here runs for other connections.
+    void watch_accept(Client& client, Time now);
+    void watch_log(const Client& client, std::string_view event, std::string_view detail);
+    void watch_hello(const Client& client, std::span<const std::uint8_t> record);
+    void watch_frame(Client& client, std::span<const std::uint8_t> payload, std::size_t length);
+    void watch_close(const Client& client);
     // Fair-share rate limits: recompute this connection's share, and publish
     // this reactor's active-connection counts (1 Hz, from the gauge pass).
     void recompute_rate_share(Client& client) noexcept;
@@ -1230,6 +1249,7 @@ struct Runtime::Impl {
     std::vector<std::uint64_t> s2c_batch_tokens_;
     std::size_t accept_burst_{1};
     Time next_device_prune_{};
+    std::vector<detail::WatchNet> watch_;
     // sweep_user_policy(): users with an expiry or quota, by name, valid for
     // policy_index_snapshot_ (held so the record pointers stay valid).
     std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;

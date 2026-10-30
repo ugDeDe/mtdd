@@ -262,6 +262,14 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
             owned->syn = detail::parse_saved_syn(std::span<const std::uint8_t>(syn.data(), length));
         }
     }
+    if (!watch_.empty()) {
+        for (const auto& net : watch_) {
+            if (detail::watch_net_contains(net, owned->peer)) {
+                owned->watched = true;
+                break;
+            }
+        }
+    }
     owned->phase = Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
     owned->last_activity = now;
@@ -287,6 +295,7 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         deadlines_.set(token, now + config_.handshake_timeout);
         reaccount(*raw);
         update_client_interest(*raw);
+        if (raw->watched) watch_accept(*raw, now);
     } catch (...) {
         // close_client() is safe here: handshake accounting is still pending and
         // no user metrics have been attached yet.
@@ -421,6 +430,7 @@ void Runtime::Impl::consume_client_bytes(Client& client,
                              (client.hello[2] == 0x01 || client.hello[2] == 0x03);
             if (!tls || record_length < 100 ||
                 record_length > protocol::kFakeTlsMaxClientHello) {
+                if (client.watched) watch_hello(client, client.hello);
                 if (masking_enabled()) {
                     start_fallback(client, client.hello, now);
                     return;
@@ -468,9 +478,11 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         return;
     }
 
+    if (client.watched) watch_hello(client, record);
     protocol::ClientHelloInfo info;
     const control::UserRecord* user = nullptr;
     if (!authenticate_hello(client, record, now, info, user)) {
+        if (client.watched) watch_log(client, "auth", "result=bad_secret");
         if (masking_enabled()) {
             start_fallback(client, record, now);
             return;
@@ -486,6 +498,9 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // rejected by every other one.
     const auto outcome = shared_->replay.insert(info.canonical_hmac, now);
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
+    if (client.watched && outcome != detail::ReplayCache::Outcome::accepted) {
+        watch_log(client, "auth", "result=replay");
+    }
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
@@ -506,6 +521,10 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (client.phase != Client::Phase::tls_hello) return;
     client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
     client.user_name = user->name;
+    if (client.watched) {
+        watch_log(client, "auth", "result=ok user=" + user->name +
+                                      " platform=" + detail::platform_name(client.platform));
+    }
     client.generation = user->generation;
     client.metrics = stats_.user(user->name);
     if (!client.metrics) {
@@ -716,6 +735,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         const std::size_t cap_limit =
             std::max(config_.connection_queue_bytes, config_.max_frame_bytes + 4096);
         for (auto& message : messages) {
+            if (client.watched) watch_frame(client, message.data, message.data.size());
             if (client.device_scan_left != 0) {
                 --client.device_scan_left;
                 if (message.data.size() >= 8) {
@@ -763,6 +783,12 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     // per DC, and Android uses a separate temporary key for media DCs.
     client.device_dc = dc;
     client.device_scan_left = detail::kDeviceScanFrames;
+    if (client.watched) {
+        watch_log(client, "tls_ready",
+                  "dc=" + std::to_string(dc) + " proto=" +
+                      (tag == protocol::ProtoTag::Secure ? "secure" : "other") +
+                      " route=" + (direct_route_enabled(dc) ? "direct" : "me"));
+    }
     // The share was first computed at authentication, before the DC (and so
     // the media class) was known.
     if (client.media) recompute_rate_share(client);

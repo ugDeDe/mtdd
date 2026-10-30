@@ -178,6 +178,11 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
     if (config_.max_frame_bytes == 0 || config_.connection_queue_bytes == 0) {
         throw std::invalid_argument("runtime configuration has zero limits");
     }
+    for (const auto& entry : config_.watch_ips) {
+        auto net = detail::parse_watch_net(entry);
+        if (!net) throw std::invalid_argument("invalid watch_ips entry: " + entry);
+        watch_.push_back(*net);
+    }
     if (std::all_of(config_.ad_tag.begin(), config_.ad_tag.end(),
                     [](std::uint8_t byte) { return byte == 0; })) {
         throw std::invalid_argument("runtime requires a non-zero 16-byte ad tag");

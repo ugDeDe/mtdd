@@ -608,3 +608,75 @@ TEST(Platform, TruncatedInputIsUndefinedNotACrash) {
     bogus[20 + 12] = 0xf0;  // data offset beyond the buffer
     (void)mtdd::detail::parse_saved_syn(bogus);
 }
+
+TEST(Watch, NetworkParsingAndMatching) {
+    using mtdd::detail::parse_watch_net;
+    using mtdd::detail::watch_net_contains;
+    const auto host = parse_watch_net("2.63.211.145");
+    ASSERT_TRUE(host);
+    EXPECT_TRUE(watch_net_contains(*host, mtdd::protocol::Endpoint::v4({2, 63, 211, 145}, 1)));
+    EXPECT_FALSE(watch_net_contains(*host, mtdd::protocol::Endpoint::v4({2, 63, 211, 146}, 1)));
+    const auto net = parse_watch_net("185.104.251.0/24");
+    ASSERT_TRUE(net);
+    EXPECT_TRUE(watch_net_contains(*net, mtdd::protocol::Endpoint::v4({185, 104, 251, 54}, 1)));
+    EXPECT_FALSE(watch_net_contains(*net, mtdd::protocol::Endpoint::v4({185, 104, 252, 54}, 1)));
+    const auto v6 = parse_watch_net("2001:db8::/32");
+    ASSERT_TRUE(v6);
+    std::array<std::uint8_t, 16> address{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    EXPECT_TRUE(watch_net_contains(*v6, mtdd::protocol::Endpoint::v6(address, 1)));
+    EXPECT_FALSE(watch_net_contains(*v6, mtdd::protocol::Endpoint::v4({32, 1, 13, 184}, 1)));
+    for (const char* bad : {"", "1.2.3.4/33", "::/129", "host.example", "1.2.3.4/x"}) {
+        EXPECT_FALSE(parse_watch_net(bad)) << bad;
+    }
+}
+
+TEST(Watch, LogsEveryStageOfAWatchedConnection) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    testing::internal::CaptureStderr();
+    {
+        Daemon daemon(1, true, [](mtdd::Config& config) {
+            enable_policy_direct(config);
+            config.watch_ips = {"127.0.0.1"};
+        });
+        mtdd::control::UserPolicy policy;
+        ASSERT_TRUE(add_policy_user(daemon, policy));
+        ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+        {
+            TestClient client(daemon.port(), secret_bytes());
+            ASSERT_TRUE(client.valid());
+            ASSERT_TRUE(client.send_hello());
+            ASSERT_TRUE(client.start_obfuscation(2));
+            ASSERT_TRUE(client.send_message(keyed_message(0)));
+            ASSERT_TRUE(client.send_message(keyed_message(0x1111)));
+            ASSERT_TRUE(wait_for([&] {
+                return daemon.services.stats.user("alice")->devices() == 1U;
+            }, 3s));
+        }
+        {
+            TestClient probe(daemon.port(), secret_bytes());
+            ASSERT_TRUE(probe.valid());
+            const std::string get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+            ASSERT_EQ(::send(probe.fd(), get.data(), get.size(), MSG_NOSIGNAL),
+                      static_cast<ssize_t>(get.size()));
+            EXPECT_TRUE(probe.wait_closed_for(3000));
+        }
+        // Not watched: no log lines for 127.0.0.2.
+        const int other_fd = connect_from("127.0.0.2", daemon.port());
+        ASSERT_GE(other_fd, 0);
+        TestClient other(TestClient::Adopt{}, other_fd, secret_bytes());
+        EXPECT_TRUE(other.send_hello(0, 1));
+        ASSERT_TRUE(wait_for([&] {
+            return daemon.services.stats.snapshot().users.at("alice").active_connections <= 1U;
+        }, 3s));
+    }
+    const std::string log = testing::internal::GetCapturedStderr();
+    for (const char* text :
+         {"mtdd watch: conn=", " accept syn=", " hello bytes=", "tls=other", " auth result=ok user=alice",
+          " tls_ready dc=2 proto=secure route=direct", " frame len=", "auth_key_id=0000000000000000",
+          " device auth_key_id=0000000000001111 dc=2", "result=ok", " close phase=relay",
+          " rx=", " first_bytes bytes=", "not_tls", "text=GET./.HTTP/1.1"}) {
+        EXPECT_NE(log.find(text), std::string::npos) << text << "\n" << log;
+    }
+    EXPECT_EQ(log.find("peer=127.0.0.2"), std::string::npos) << log;
+}

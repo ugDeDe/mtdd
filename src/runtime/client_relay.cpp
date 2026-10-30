@@ -362,6 +362,7 @@ void Runtime::Impl::reject_close(Client& client, control::RejectReason reason,
                                  std::optional<control::HandshakeResult> handshake) {
     if (handshake && client.handshake_pending) record_handshake(client, *handshake);
     stats_.connection_rejected(reason);
+    if (client.watched) watch_log(client, "reject", std::string("reason=") + control::to_string(reason));
     close_client(client.token);
 }
 
@@ -376,6 +377,7 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     const auto found = clients_.find(token);
     if (found == clients_.end()) return;
     Client& client = *found->second;
+    if (client.watched) watch_close(client);
     if (client.phase == Client::Phase::relay) stats_.relay_closed(client.close_reason);
 
     if (client.handshake_pending) {
