@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -48,6 +50,23 @@ bool sni_domain_matches(std::string_view sni, std::string_view domain) {
 }
 
 }  // namespace
+
+namespace {
+std::mutex g_masking_override_mutex;
+std::optional<detail::DirectEndpointOverride> g_masking_override;
+
+std::optional<detail::DirectEndpointOverride> masking_override() {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    return g_masking_override;
+}
+}  // namespace
+
+namespace detail {
+void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value) {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    g_masking_override = std::move(value);
+}
+}  // namespace detail
 
 bool Runtime::Impl::fallback_enabled() const noexcept { return config_.fallback_port != 0; }
 
@@ -126,13 +145,20 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
     if (fallback_enabled()) {
         targets.emplace_back(ensure_fallback_address(now, config_.fallback_host),
                              config_.fallback_port);
-    } else if (config_.masking) {
+    } else if (config_.masking && !config_.tls_domain.empty()) {
         const auto sni = protocol::client_hello_sni(prefetched);
         if (sni && sni_domain_matches(*sni, config_.tls_domain)) {
             targets.emplace_back(*sni, 443U);
             if (to_lower(*sni) != to_lower(config_.tls_domain)) {
                 targets.emplace_back(config_.tls_domain, 443U);
             }
+        } else {
+            // A foreign or missing SNI, or bytes that are not TLS at all: the
+            // real site of tls_domain answers, as it would if the probe had
+            // reached it directly. Closing instead (an RST for the unread
+            // bytes) would single this server out. The target is fixed, so
+            // this never relays to an address chosen by the client.
+            targets.emplace_back(config_.tls_domain, 443U);
         }
     }
     if (targets.empty()) {
@@ -142,8 +168,11 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
     }
     auto connected = io::FdResult{};
     bool dialled = false;
-    for (const auto& [host, port] : targets) {
-        const std::string address = ensure_fallback_address(now, host);
+    const auto override_target = fallback_enabled() ? std::nullopt : masking_override();
+    for (const auto& [host, target_port] : targets) {
+        const std::string address =
+            override_target ? override_target->host : ensure_fallback_address(now, host);
+        const std::uint16_t port = override_target ? override_target->port : target_port;
         if (address.empty()) continue;
         auto attempt = io::connect_tcp(address, port);
         if (client.watched) {

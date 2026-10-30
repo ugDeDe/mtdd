@@ -209,6 +209,9 @@ struct DirectEndpointOverride {
     std::uint16_t port{443};
 };
 void set_direct_endpoint_override(std::optional<DirectEndpointOverride> value);
+// Test-only: every automatic masking target (SNI name or tls_domain) dials
+// this endpoint instead, so tests never resolve or reach the real domain.
+void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value);
 
 // Test-only fault injection. Production never calls these; they let the local
 // tests prove failure paths without touching sockets or real crypto.

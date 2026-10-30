@@ -1025,26 +1025,63 @@ TEST(Runtime, FallbackConnectRefusalClosesPairNotProcess) {
         [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
 }
 
-TEST(Runtime, MaskingClosesProbeForForeignServerName) {
-    // Auto masking is on and no fixed target is configured: a probe whose SNI
-    // does not belong to tls_domain must be closed without touching the network.
-    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
-    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+namespace {
+
+struct MaskingEndpointScope {
+    explicit MaskingEndpointScope(std::uint16_t port) {
+        mtdd::detail::set_masking_endpoint_override(
+            mtdd::detail::DirectEndpointOverride{"127.0.0.1", port});
+    }
+    ~MaskingEndpointScope() { mtdd::detail::set_masking_endpoint_override(std::nullopt); }
+    MaskingEndpointScope(const MaskingEndpointScope&) = delete;
+    MaskingEndpointScope& operator=(const MaskingEndpointScope&) = delete;
+};
+
+// Sends `wire` and expects the masking target (an echo server) to return it.
+void expect_relayed_to_mask_domain(Daemon& daemon, EchoBackend& echo, const Bytes& wire) {
     const int fd = connect_loopback(daemon.port());
     ASSERT_GE(fd, 0);
+    ASSERT_TRUE(send_all(fd, wire));
+    Bytes echoed(wire.size());
+    EXPECT_TRUE(recv_exact(fd, echoed.data(), echoed.size(), 3000));
+    EXPECT_EQ(echoed, wire);
+    ::close(fd);
+    EXPECT_GE(echo.accepted(), 1U);
+}
+
+} // namespace
+
+TEST(Runtime, MaskingRelaysForeignServerNameToTheMaskDomain) {
+    // No fixed target: a probe whose SNI does not belong to tls_domain is
+    // answered by the real tls_domain site, never closed with an RST.
+    EchoBackend echo;
+    MaskingEndpointScope scope(echo.port());
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
     A16 wrong{};
     for (std::size_t i = 0; i < wrong.size(); ++i) wrong[i] = 0xaa;
     const auto timestamp = static_cast<std::uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
-    const Bytes wire = make_client_hello(wrong, timestamp, "foreign.test", 3);
-    ASSERT_TRUE(send_all(fd, wire));
-    EXPECT_TRUE(wait_closed(fd, 3000));
-    ::close(fd);
+    expect_relayed_to_mask_domain(daemon, echo,
+                                  make_client_hello(wrong, timestamp, "foreign.test", 3));
     EXPECT_GE(stat_counter(daemon.services.stats, "handshakes", "failure"), 1U);
+}
+
+TEST(Runtime, MaskingRelaysNonTlsProbeToTheMaskDomain) {
+    // Plain text (an HTTP request, or a proxy secret sent as text by a crude
+    // scanner) reaches the real site too.
+    EchoBackend echo;
+    MaskingEndpointScope scope(echo.port());
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
+    for (const std::string& text :
+         {std::string("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+          std::string("eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275")}) {
+        expect_relayed_to_mask_domain(daemon, echo, Bytes(text.begin(), text.end()));
+    }
     EXPECT_TRUE(wait_for(
-        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
+        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 3000ms));
 }
 
 TEST(Runtime, MaskingDisabledClosesProbeWithoutFixedTarget) {
