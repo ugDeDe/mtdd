@@ -1230,42 +1230,49 @@ TEST(Runtime, MediaUserRateLimitSlowsDownloadsWithoutDroppingThem) {
     EXPECT_GE(throttled, 1U);
 }
 
-TEST(RateBucket, LimitsAverageRateWithOneSecondBurstAndDebt) {
-    mtdd::detail::RateBucket bucket;
+TEST(Runtime, MediaUserRateIsSplitEvenlyAcrossConnections) {
+    // Two parallel media connections of one user share a 4000 kbit/s
+    // (500 KB/s) limit. Each fetches 1 MiB: neither may starve the other, and
+    // together they cannot beat the user limit by much.
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    constexpr std::size_t kCount = 8;
+    FakeMe me{me_secret(), 100000, 0ms, 2, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.media_user_rate_kbps = 4000;
+        config.idle_timeout = 60s;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::array<std::chrono::milliseconds, 2> elapsed{-1ms, -1ms};
     const auto start = std::chrono::steady_clock::now();
-    EXPECT_FALSE(bucket.blocked(start)) << "rate 0 is unlimited";
-    bucket.consume(10'000'000, start);
-    EXPECT_FALSE(bucket.blocked(start));
-    bucket.set_rate(1000);  // bytes per second
-    EXPECT_FALSE(bucket.blocked(start));  // starts with a full one-second burst
-    bucket.consume(1500, start);
-    EXPECT_TRUE(bucket.blocked(start)) << "debt of 500 bytes";
-    EXPECT_TRUE(bucket.blocked(start + 400ms));
-    EXPECT_FALSE(bucket.blocked(start + 600ms)) << "debt repaid after 0.5 s";
-    // The burst is capped at one second of rate.
-    EXPECT_FALSE(bucket.blocked(start + 60s));
-    bucket.consume(1001, start + 60s);
-    EXPECT_TRUE(bucket.blocked(start + 60s));
-}
-
-TEST(RateBucket, InterleavedStaleTimestampsDoNotInflateTheRate) {
-    // Two reactors feed the shared bucket with times that alternate between a
-    // fresh and a 2 ms stale stamp. Over 10 s at 1 MB/s at most 10 MB + the
-    // 1 s burst may pass, regardless of the interleaving.
-    mtdd::detail::RateBucket bucket;
-    bucket.set_rate(1'000'000);
-    const auto start = std::chrono::steady_clock::now();
-    std::uint64_t passed = 0;
-    for (int tick = 0; tick < 100'000; ++tick) {
-        const auto fresh = start + std::chrono::microseconds(tick * 100);
-        const auto stale = fresh - std::chrono::milliseconds(2);
-        for (const auto now : {fresh, stale}) {
-            if (!bucket.blocked(now)) {
-                bucket.consume(1000, now);
-                passed += 1000;
-            }
+    const auto fetch = [&](std::size_t slot, std::uint8_t variant) {
+        TestClient client(daemon.port(), secret_bytes());
+        if (!client.valid() || !client.send_hello(0, variant) || !client.start_obfuscation(-2)) {
+            return;
         }
-    }
-    EXPECT_LE(passed, 11'100'000U) << "stale stamps re-credited elapsed time";
-    EXPECT_GE(passed, 10'000'000U);
+        for (std::size_t index = 0; index < kCount; ++index) {
+            if (!client.send_message(burst_payload(index))) return;
+            Bytes response;
+            if (!client.read_message(response, 15000) || response.size() != kAnswer) return;
+        }
+        elapsed[slot] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    };
+    std::thread first(fetch, 0, 0);
+    std::thread second(fetch, 1, 1);
+    first.join();
+    second.join();
+    ASSERT_GE(elapsed[0].count(), 0) << "first connection did not complete";
+    ASSERT_GE(elapsed[1].count(), 0) << "second connection did not complete";
+    const auto slowest = std::max(elapsed[0], elapsed[1]);
+    const auto fastest = std::min(elapsed[0], elapsed[1]);
+    // 2 MiB at 500 KB/s with a one-second burst per connection: >= ~2 s.
+    EXPECT_GE(slowest, 1800ms);
+    EXPECT_LT(slowest, 12000ms);
+    // Even split: the two connections finish close together.
+    EXPECT_LT(static_cast<double>(slowest.count()),
+              2.0 * static_cast<double>(fastest.count()))
+        << "fastest=" << fastest.count() << "ms slowest=" << slowest.count() << "ms";
 }

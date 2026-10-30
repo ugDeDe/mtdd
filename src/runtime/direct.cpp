@@ -220,8 +220,7 @@ void Runtime::Impl::update_direct_interest(Client& client) {
         desired |= EPOLLOUT;
     } else {
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
-        if (!client.direct_eof && !client.direct_budget_paused && !client.media_throttled &&
-            !client.rate_pause_s2c) {
+        if (!client.direct_eof && !client.direct_budget_paused && !client.rate_pause_s2c) {
             // While paused, keep EPOLLIN out of the mask or a level-triggered
             // epoll wakes forever on the unread DC bytes. RDHUP is persistent
             // once seen, so it is also removed during pause and after latching
@@ -301,12 +300,6 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
         update_direct_interest(client);
         return;
     }
-    if (client.media && media_blocked(client, now)) {
-        // Leave the DC bytes in the kernel: TCP flow control slows the DC.
-        media_throttle(client);
-        update_direct_interest(client);
-        return;
-    }
     const std::uint64_t token = client.token;
     std::size_t total = 0;
     bool eof = false;
@@ -347,7 +340,7 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
                     charge_rate(client, control::Direction::server_to_client, bytes, now);
                 }
             }
-            media_account(client, bytes, now);
+            note_activity(client, bytes);
             client.awaiting_reply = false;
             // Short read: the DC socket is drained; level-triggered EPOLLIN
             // reports more data, so skip the EAGAIN-only recv.

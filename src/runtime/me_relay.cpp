@@ -425,7 +425,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         return;
     }
     client.metrics->add_payload(control::Direction::server_to_client, payload.size());
-    media_account(client, payload.size(), now);
+    note_activity(client, payload.size());
     note_ip_payload(client, payload.size());
     // ME shares one socket across users, so s2c cannot be gated at the source.
     // Charge the bucket anyway: an overdrawn bucket pauses this client's c2s

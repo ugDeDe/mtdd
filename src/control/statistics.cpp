@@ -271,6 +271,20 @@ int64_t rate_ns_for(uint64_t bytes, uint64_t rate) noexcept {
 }
 }  // namespace
 
+void UserMetrics::add_active_connections(int64_t all, int64_t media) noexcept {
+  if (all != 0) active_rate_conns_.fetch_add(all, std::memory_order_relaxed);
+  if (media != 0) active_media_conns_.fetch_add(media, std::memory_order_relaxed);
+  if (all != 0 || media != 0) active_generation_.fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::active_generation() const noexcept {
+  return active_generation_.load(std::memory_order_relaxed);
+}
+int64_t UserMetrics::active_rate_connections() const noexcept {
+  return active_rate_conns_.load(std::memory_order_relaxed);
+}
+int64_t UserMetrics::active_media_connections() const noexcept {
+  return active_media_conns_.load(std::memory_order_relaxed);
+}
 uint64_t UserMetrics::rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept {
   return std::max(rate_bytes_per_sec, kRateMinBurstBytes);
 }

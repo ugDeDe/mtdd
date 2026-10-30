@@ -371,8 +371,19 @@ void Runtime::Impl::run() {
                 std::uint64_t relay = 0;
                 std::uint64_t me_pending = 0;
                 std::map<std::int16_t, std::uint64_t> direct_active;
+                // Fair-share rate limits: a limited connection silent for a
+                // second stops counting as active; every limited connection
+                // re-reads its share of the user's (and media) limits.
                 for (auto& [token, client] : clients_) {
                     (void)token;
+                    if (client->counted_active && client->window_bytes == 0) {
+                        set_counted_active(*client, false);
+                    }
+                    client->window_bytes = 0;
+                    if (client->counted_active || client->rate_up != 0 ||
+                        client->rate_down != 0 || rate_limited(*client)) {
+                        recompute_rate_share(*client);
+                    }
                     if (now - client->last_activity >= detail::kIdleTrimAfter) {
                         trim_idle_client(*client);
                     }
@@ -516,7 +527,6 @@ void Runtime::Impl::run() {
             // This makes a drained EOF close prompt instead of waiting for the
             // 150 ms housekeeping tick.
             const Time finished = Clock::now();
-            media_release(finished);
             finish_eof_clients(finished);
             // Fallback pairs are pumped by their own read/write events; the
             // sweep only closes finished or expired pairs, so it runs from the
@@ -585,10 +595,6 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // EPOLLIN stays armed until recv()==0. A pending FIN alone must NOT stop
     // reading: bytes may still be queued behind the FIN. Budget pause disables
     // it temporarily; the unpause path re-arms it so the tail is preserved.
-    // A throttled media client whose held requests reached the queue size is
-    // not read further, so shaping never turns into a queue-overflow close.
-    const bool media_hold = client.media_throttled &&
-                            client.c2s_capacity >= config_.connection_queue_bytes;
     // A rate-limited direction stops reading its source. On the ME route the
     // shared ME socket cannot be paused per user, so a drained s2c bucket
     // throttles the requests that drive downloads (c2s) instead.
@@ -596,7 +602,7 @@ void Runtime::Impl::update_client_interest(Client& client) {
         client.rate_pause_c2s ||
         (client.rate_pause_s2c && client.route != Client::Route::direct);
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested && !media_hold && !rate_paused) {
+        !client.close_requested && !rate_paused) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
@@ -652,7 +658,6 @@ int Runtime::Impl::wait_timeout_ms(Time now) const {
         const Time eof_wake = std::max(next_eof_deadline_, next_eof_sweep_);
         if (eof_wake < limit) limit = eof_wake;
     }
-    if (!media_throttled_.empty() && next_media_check_ < limit) limit = next_media_check_;
     if (next_rate_resume_ < limit) limit = next_rate_resume_;
     if (stopping_ && shutdown_deadline_ < limit) limit = shutdown_deadline_;
     if (limit <= now) return 0;

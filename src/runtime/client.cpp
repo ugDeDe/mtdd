@@ -669,6 +669,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             client.metrics->add_payload(control::Direction::client_to_server,
                                         plain_buffer_.size());
             note_ip_payload(client, plain_buffer_.size());
+            note_activity(client, plain_buffer_.size());
             if (client.rate_up != 0) {
                 charge_rate(client, control::Direction::client_to_server,
                             plain_buffer_.size(), now);
@@ -705,6 +706,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             client.metrics->add_payload(control::Direction::client_to_server,
                                         message.data.size());
             note_ip_payload(client, message.data.size());
+            note_activity(client, message.data.size());
             if (client.rate_up != 0) {
                 charge_rate(client, control::Direction::client_to_server,
                             message.data.size(), now);
@@ -727,6 +729,9 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     const auto tag = client.tls->proto_tag();
     const std::int16_t dc = client.tls->dc_id();
     client.media = dc < 0;
+    // The share was first computed at authentication, before the DC (and so
+    // the media class) was known.
+    if (client.media) recompute_rate_share(client);
     if (tag != protocol::ProtoTag::Secure || dc == 0) {
         reject_close(client, control::RejectReason::auth_failed,
                      client.handshake_pending ? std::optional{control::HandshakeResult::failure}

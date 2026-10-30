@@ -545,6 +545,14 @@ class UserMetrics {
                          int64_t now_ns) const noexcept;
   // Burst allowance in bytes for a rate: max(rate, 64 KiB).
   static uint64_t rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept;
+  // Connections of this user that moved payload in the last second (all, and
+  // media DCs only), summed over reactors. Rate limits are split by these.
+  void add_active_connections(int64_t all, int64_t media) noexcept;
+  int64_t active_rate_connections() const noexcept;
+  int64_t active_media_connections() const noexcept;
+  // Bumped on every active-count change, so connections can refresh their
+  // share as soon as the split changes instead of on the next 1 Hz pass.
+  uint64_t active_generation() const noexcept;
 
   uint64_t active_connections() const noexcept;
   void set_active_unique_ips(uint64_t value) noexcept;
@@ -566,6 +574,9 @@ class UserMetrics {
   std::atomic<int64_t> quota_reset_at_{0};
   // Own cache line: rate buckets are written by every reactor serving the user.
   alignas(64) std::atomic<int64_t> rate_tat_[2]{};
+  std::atomic<int64_t> active_rate_conns_{0};
+  std::atomic<int64_t> active_media_conns_{0};
+  std::atomic<uint64_t> active_generation_{0};
 };
 
 // Thread-safe. Label sets are bounded by construction (enums and fixed label
