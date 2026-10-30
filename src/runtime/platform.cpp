@@ -6,12 +6,18 @@
 //             unofficial clients built on Telegram-iOS look the same)
 //           SYN: mss,nop,ws6,nop,nop,ts,sackOK,eol, window 65535, TTL 64
 //   Windows ClientHello: Chrome template (shuffled extensions, ALPS, ECH)
-//           SYN: mss,nop,ws8,nop,nop,sackOK, no timestamps, TTL 128
+//           SYN: mss,nop,ws8,nop,nop,sackOK, TTL 128; with timestamps
+//           enabled mss,nop,ws8,sackOK,ts.
+//
+// TTL is not checked: it is commonly rewritten (to 64 or 128) to hide
+// tethering from mobile carriers. The option layout and window are kept.
 //   Linux   ClientHello: Chrome template
 //           SYN: mss,sackOK,ts,nop,ws7, window 64240 (44 x MSS), TTL 64
 //   Android ClientHello: Chrome template
 //           SYN: mss,sackOK,ts,nop,ws9, window 65535, TTL 64
 //
+// Option layouts are compared without NOPs: middleboxes add and remove them,
+// and some replace the timestamps option with NOPs (Linux mss,sackOK,ws).
 // Anything else is undefined. Middleboxes that terminate TCP (proxy VPNs)
 // replace the SYN; the result is then undefined or the middlebox's OS.
 #include "internal.hpp"
@@ -22,9 +28,12 @@
 namespace mtdd::detail {
 namespace {
 
-constexpr std::array<std::uint8_t, 5> kLinuxLayout{2, 4, 8, 1, 3};
-constexpr std::array<std::uint8_t, 7> kAppleLayout{2, 1, 3, 1, 1, 8, 4};
-constexpr std::array<std::uint8_t, 6> kWindowsLayout{2, 1, 3, 1, 1, 4};
+// Option kinds in order, NOPs removed: 2 mss, 3 wscale, 4 sackOK, 8 timestamps.
+constexpr std::array<std::uint8_t, 4> kLinuxLayout{2, 4, 8, 3};
+constexpr std::array<std::uint8_t, 3> kLinuxNoTsLayout{2, 4, 3};
+constexpr std::array<std::uint8_t, 4> kAppleLayout{2, 3, 8, 4};
+constexpr std::array<std::uint8_t, 3> kWindowsLayout{2, 3, 4};
+constexpr std::array<std::uint8_t, 4> kWindowsTsLayout{2, 3, 4, 8};
 constexpr std::array<std::uint16_t, 10> kSafariOrder{0, 23, 65281, 10, 11, 16, 5, 13, 18, 51};
 
 bool grease(std::uint16_t value) noexcept {
@@ -37,9 +46,8 @@ std::uint16_t be16(std::span<const std::uint8_t> data, std::size_t at) noexcept 
 
 template <std::size_t N>
 bool layout_is(const std::array<std::uint8_t, 8>& kinds, std::uint8_t count,
-               const std::array<std::uint8_t, N>& expected, bool exact) noexcept {
-    if (count < N || (exact && count != N)) return false;
-    return std::equal(expected.begin(), expected.end(), kinds.begin());
+               const std::array<std::uint8_t, N>& expected) noexcept {
+    return count == N && std::equal(expected.begin(), expected.end(), kinds.begin());
 }
 
 } // namespace
@@ -75,12 +83,12 @@ SynPrint parse_saved_syn(std::span<const std::uint8_t> syn) noexcept {
     for (std::size_t at = tcp + 20; at < end;) {
         const std::uint8_t kind = syn[at];
         if (kind == 0) break;  // EOL ends the list
-        if (count < kinds.size()) kinds[count] = kind;
-        ++count;
         if (kind == 1) {
             ++at;
             continue;
         }
+        if (count < kinds.size()) kinds[count] = kind;
+        ++count;
         if (at + 1 >= end || syn[at + 1] < 2 || at + syn[at + 1] > end) break;
         const std::uint8_t length = syn[at + 1];
         if (kind == 2 && length == 4) print.mss = be16(syn, at + 2);
@@ -88,11 +96,12 @@ SynPrint parse_saved_syn(std::span<const std::uint8_t> syn) noexcept {
         if (kind == 8) print.timestamps = true;
         at += length;
     }
-    if (layout_is(kinds, count, kLinuxLayout, true)) {
+    if (layout_is(kinds, count, kLinuxLayout) || layout_is(kinds, count, kLinuxNoTsLayout)) {
         print.layout = SynLayout::linux_stack;
-    } else if (layout_is(kinds, count, kAppleLayout, true)) {
+    } else if (layout_is(kinds, count, kAppleLayout)) {
         print.layout = SynLayout::apple_stack;
-    } else if (layout_is(kinds, count, kWindowsLayout, true)) {
+    } else if (layout_is(kinds, count, kWindowsLayout) ||
+               layout_is(kinds, count, kWindowsTsLayout)) {
         print.layout = SynLayout::windows_stack;
     }
     print.valid = true;
@@ -133,12 +142,10 @@ Platform classify_platform(const SynPrint& syn, TlsTemplate tls) noexcept {
     if (tls != TlsTemplate::chrome || !syn.valid) return Platform::undefined;
     switch (syn.layout) {
         case SynLayout::apple_stack:
-            return syn.ttl <= 64 ? Platform::apple : Platform::undefined;  // macOS Desktop
+            return Platform::apple;  // Telegram Desktop on macOS
         case SynLayout::windows_stack:
-            return syn.ttl > 64 && syn.ttl <= 128 && !syn.timestamps ? Platform::windows
-                                                                      : Platform::undefined;
+            return Platform::windows;
         case SynLayout::linux_stack:
-            if (syn.ttl > 64) return Platform::undefined;
             if (syn.window == 65535 || syn.wscale >= 8) return Platform::android;
             if (syn.wscale >= 0 && syn.wscale <= 7) return Platform::linux_desktop;
             return Platform::undefined;

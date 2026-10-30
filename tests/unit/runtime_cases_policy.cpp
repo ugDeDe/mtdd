@@ -524,6 +524,12 @@ const Bytes kLinuxSyn = saved_syn(57, 64240, concat({{2, 4, 0x05, 0xb4, 4, 2}, k
 const Bytes kAndroidSyn = saved_syn(55, 65535, concat({{2, 4, 0x05, 0xac, 4, 2}, kTs, {1, 3, 3, 9}}));
 const Bytes kWindowsSyn = saved_syn(117, 65535, {2, 4, 0x05, 0x9c, 1, 3, 3, 8, 1, 1, 4, 2});
 const Bytes kScannerSyn = saved_syn(236, 1024, {});
+// Seen in the field: Windows with timestamps, Windows with TTL rewritten to
+// 64 (tethering), and Android behind a box that replaced timestamps with NOPs.
+const Bytes kWindowsTsSyn = saved_syn(119, 65535, concat({{2, 4, 0x05, 0xac, 1, 3, 3, 8, 4, 2}, kTs}));
+const Bytes kWindowsTtl64Syn = saved_syn(55, 64240, {2, 4, 0x05, 0xb4, 1, 3, 3, 8, 1, 1, 4, 2});
+const Bytes kAndroidNoTsSyn = saved_syn(
+    54, 65535, {2, 4, 0x05, 0x50, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 10});
 
 // A ClientHello record with the given extension types (empty bodies).
 Bytes client_hello(std::initializer_list<std::uint16_t> extensions) {
@@ -572,6 +578,13 @@ TEST(Platform, ReferenceFingerprintsClassify) {
     EXPECT_EQ(platform_of(kWindowsSyn, kChromeHello), Platform::windows);
     EXPECT_EQ(platform_of(kAppleSyn, kChromeHello), Platform::apple);  // macOS Desktop
     EXPECT_EQ(platform_of(kScannerSyn, kChromeHello), Platform::undefined);
+    EXPECT_EQ(platform_of(kWindowsTsSyn, kChromeHello), Platform::windows);
+    EXPECT_EQ(platform_of(kWindowsTtl64Syn, kChromeHello), Platform::windows);
+    EXPECT_EQ(platform_of(kAndroidNoTsSyn, kChromeHello), Platform::android);
+    // Android with its TTL rewritten to 128.
+    EXPECT_EQ(platform_of(saved_syn(115, 65535, concat({{2, 4, 0x05, 0xb4, 4, 2}, kTs, {1, 3, 3, 9}})),
+                          kChromeHello),
+              Platform::android);
     EXPECT_EQ(platform_of(kLinuxSyn, kGoHello), Platform::undefined);
     EXPECT_EQ(platform_of({}, kChromeHello), Platform::undefined);
     const auto syn = mtdd::detail::parse_saved_syn(kWindowsSyn);

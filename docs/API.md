@@ -203,14 +203,16 @@ POST /v1/users
   производная от `auth_key_id`, не сам ключ), `dc`, `connections`,
   `connected`, `idle_seconds`, `ip` последнего подключения и `platform`.
   Одно устройство даёт по ключу на каждый DC, с которым работает.
-- **Платформа** определяется грубо, по SYN (`TCP_SAVE_SYN`: TTL, окно, порядок
-  TCP-опций) и шаблону FakeTLS ClientHello: шаблон Safari — `Apple` (iOS и
-  macOS неотличимы, неофициальные клиенты на коде Telegram-iOS тоже);
-  шаблон Chrome плюс стек Windows (TTL около 128, без timestamps) —
-  `Windows`; шаблон Chrome плюс стек Linux — `Android` (окно 65535 или
-  wscale ≥ 8) или `Linux` (wscale ≤ 7); остальное — `Undefined`. VPN,
-  который сам держит TCP (прокси-типа), подменяет SYN: тогда платформа
-  `Undefined` или ОС самого VPN.
+- **Платформа** определяется грубо, по SYN (`TCP_SAVE_SYN`: порядок
+  TCP-опций без учёта NOP, окно, wscale) и шаблону FakeTLS ClientHello:
+  шаблон Safari — `Apple` (iOS и macOS неотличимы, неофициальные клиенты на
+  коде Telegram-iOS тоже); шаблон Chrome плюс стек Windows
+  (`mss,ws,sok[,ts]`) — `Windows`; плюс стек Linux (`mss,sok[,ts],ws`) —
+  `Android` (окно 65535 или wscale ≥ 8) или `Linux` (wscale ≤ 7); плюс стек
+  Apple — `Apple` (Telegram Desktop на macOS); остальное — `Undefined`. TTL
+  не учитывается: его часто переписывают (64 или 128), чтобы оператор не
+  видел раздачу интернета. VPN, который сам держит TCP (прокси-типа),
+  подменяет SYN: тогда платформа будет ОС самого VPN.
 - **ME-маршрут, направление вниз.** Соединение с Middle-End общее для многих
   клиентов, его нельзя притормозить ради одного. Перерасход ведра
   приостанавливает чтение запросов этого клиента, поэтому замедляются загрузки,
