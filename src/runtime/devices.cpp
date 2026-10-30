@@ -44,13 +44,23 @@ DeviceTable::Admit DeviceTable::admit(const std::string& user, std::int16_t dc,
     }
     if (max_devices != 0) {
         std::uint64_t on_dc = 0;
-        for (const auto& [other, entry] : keys) {
-            (void)entry;
-            if (other.dc == dc) ++on_dc;
+        auto idle = keys.end();
+        for (auto it = keys.begin(); it != keys.end(); ++it) {
+            if (it->first.dc != dc) continue;
+            ++on_dc;
+            if (it->second.open == 0 && (idle == keys.end() || it->second.last < idle->second.last)) {
+                idle = it;
+            }
         }
         if (on_dc >= max_devices) {
-            devices = prune_locked(keys, now, window);
-            return Admit::limit;
+            // Only devices with an open connection hold a slot: the least
+            // recently seen idle key gives way (a switched device, or the
+            // previous temporary key of the same one).
+            if (idle == keys.end()) {
+                devices = prune_locked(keys, now, window);
+                return Admit::limit;
+            }
+            keys.erase(idle);
         }
     }
     keys.emplace(id, Entry{1, now});

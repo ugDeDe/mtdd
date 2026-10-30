@@ -395,10 +395,12 @@ inline constexpr std::uint8_t kDeviceScanFrames = 16;
 // Per-user device table for max_devices. A device is identified by the MTProto
 // auth_key_id its connections present, per signed DC (Android keeps a separate
 // temporary key for media DCs). One app installation keeps one current key per
-// signed DC, so the device count is the maximum over DCs. A key stays present
-// while it has an open connection and for `window` after the last one closed,
-// which bridges reconnects and temporary-key rotation. Touched once per
-// connection (admit/release) and by a periodic prune, never per packet.
+// signed DC, so the device count is the maximum over DCs. Only keys with an
+// open connection hold a slot against the limit: over the limit, the least
+// recently seen idle key is displaced, so a device that disconnected frees its
+// slot at once and a rotated temporary key does not lock its own device out.
+// Idle keys stay listed (and counted in the gauge) for `window`. Touched once
+// per connection (admit/release) and by a periodic prune, never per packet.
 
 class DeviceTable {
 public:

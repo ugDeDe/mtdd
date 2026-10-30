@@ -69,8 +69,8 @@ struct Config {
     // cap. 0 disables. Reloadable with SIGHUP.
     std::uint64_t media_user_rate_kbps{0};
     std::uint64_t media_total_rate_kbps{0};
-    // max_devices: a device's auth key stays counted this long after its last
-    // connection closed (bridges reconnects and temporary-key rotation).
+    // How long a device's auth key stays listed in the devices gauge after its
+    // last connection closed. An idle key never blocks a new device.
     std::chrono::seconds device_window{900};
     std::chrono::seconds metadata_refresh{3600};
     // Opt-in Direct Telegram DC fallback. Disabled by default; only the listed

@@ -398,7 +398,7 @@ TEST(RuntimePolicy, DeviceLimitAdmitsKnownKeyAndClosesNewKeyOverLimit) {
     EXPECT_FALSE(same.wait_closed_for(200));
 }
 
-TEST(RuntimePolicy, DeviceKeyStaysCountedWithinTheWindowAfterClose) {
+TEST(RuntimePolicy, DisconnectedDeviceFreesItsSlotForANewOne) {
     mtdd::test::FakeDirectDc dc(2);
     PolicyDirectEndpointScope endpoint(dc.port());
     Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
@@ -418,27 +418,35 @@ TEST(RuntimePolicy, DeviceKeyStaysCountedWithinTheWindowAfterClose) {
     ASSERT_TRUE(wait_for([&] {
         return daemon.services.stats.snapshot().users.at("alice").active_connections == 0U;
     }, 3s));
-    // The closed device still holds its slot (device_window, 900 s default).
-    TestClient other(daemon.port(), secret_bytes());
-    ASSERT_TRUE(other.valid());
-    ASSERT_TRUE(other.send_hello(0, 1));
-    ASSERT_TRUE(other.start_obfuscation(2));
-    ASSERT_TRUE(other.send_message(keyed_message(0x2222)));
-    EXPECT_TRUE(other.wait_closed_for(3000));
-    // Raising the limit admits the second device on a new connection.
+    // The first device is gone: a new one takes its slot immediately.
+    TestClient second(daemon.port(), secret_bytes());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(second.send_hello(0, 1));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(second.send_message(keyed_message(0x2222)));
+    EXPECT_FALSE(second.wait_closed_for(500));
+    EXPECT_EQ(device_limit_closes(daemon), 0U);
+    // The displaced first device is now the new one, and is held off.
+    TestClient back(daemon.port(), secret_bytes());
+    ASSERT_TRUE(back.valid());
+    ASSERT_TRUE(back.send_hello(0, 2));
+    ASSERT_TRUE(back.start_obfuscation(2));
+    ASSERT_TRUE(back.send_message(keyed_message(0x1111)));
+    EXPECT_TRUE(back.wait_closed_for(3000));
+    // Raising the limit admits it.
     mtdd::control::UserPolicyPatch patch;
     patch.max_devices = std::optional<std::uint32_t>(2);
     ASSERT_TRUE(patch_policy(daemon, patch));
     TestClient again(daemon.port(), secret_bytes());
     ASSERT_TRUE(again.valid());
-    ASSERT_TRUE(again.send_hello(0, 2));
+    ASSERT_TRUE(again.send_hello(0, 3));
     ASSERT_TRUE(again.start_obfuscation(2));
-    ASSERT_TRUE(again.send_message(keyed_message(0x2222)));
+    ASSERT_TRUE(again.send_message(keyed_message(0x1111)));
     EXPECT_FALSE(again.wait_closed_for(500));
     EXPECT_TRUE(wait_for([&] { return metrics->devices() == 2U; }, 3s));
 }
 
-TEST(DeviceTable, CountsPerSignedDcAndExpiresAfterWindow) {
+TEST(DeviceTable, CountsPerSignedDcAndDisplacesOnlyIdleKeys) {
     mtdd::detail::DeviceTable table;
     const auto t0 = std::chrono::steady_clock::now();
     std::uint64_t devices = 0;
@@ -447,14 +455,17 @@ TEST(DeviceTable, CountsPerSignedDcAndExpiresAfterWindow) {
     // A media DC key is counted on its own DC, not as a second device.
     EXPECT_EQ(table.admit("u", -2, 7, 1, t0, 60s, devices), Admit::ok);
     EXPECT_EQ(devices, 1U);
+    // Key 1 has an open connection: key 2 is held off.
     EXPECT_EQ(table.admit("u", 2, 2, 1, t0, 60s, devices), Admit::limit);
     table.release("u", 2, 1, t0, 60s, devices);
-    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 30s, 60s, devices), Admit::limit);
-    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 61s, 60s, devices), Admit::ok);
+    EXPECT_EQ(devices, 1U);  // still listed within the window
+    // Idle key 1 gives way at once.
+    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 1s, 60s, devices), Admit::ok);
     EXPECT_EQ(devices, 1U);
+    EXPECT_EQ(table.admit("u", 2, 1, 1, t0 + 2s, 60s, devices), Admit::limit);
     std::vector<std::pair<std::string, std::uint64_t>> counts;
-    table.release("u", 2, 2, t0 + 61s, 60s, devices);
-    table.release("u", -2, 7, t0 + 61s, 60s, devices);
+    table.release("u", 2, 2, t0 + 2s, 60s, devices);
+    table.release("u", -2, 7, t0 + 2s, 60s, devices);
     table.prune(t0 + 200s, 60s, counts);
     ASSERT_EQ(counts.size(), 1U);
     EXPECT_EQ(counts[0].second, 0U);
