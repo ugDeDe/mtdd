@@ -220,7 +220,7 @@ void Runtime::Impl::update_direct_interest(Client& client) {
         desired |= EPOLLOUT;
     } else {
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
-        if (!client.direct_eof && !client.direct_budget_paused) {
+        if (!client.direct_eof && !client.direct_budget_paused && !client.media_throttled) {
             // While paused, keep EPOLLIN out of the mask or a level-triggered
             // epoll wakes forever on the unread DC bytes. RDHUP is persistent
             // once seen, so it is also removed during pause and after latching
@@ -299,10 +299,21 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
         update_direct_interest(client);
         return;
     }
+    if (client.media && media_blocked(client, now)) {
+        // Leave the DC bytes in the kernel: TCP flow control slows the DC.
+        media_throttle(client);
+        update_direct_interest(client);
+        return;
+    }
     const std::uint64_t token = client.token;
     std::size_t total = 0;
+    bool eof = false;
     while (total < detail::kReadBatch) {
-        const std::size_t room = client.out->max_bytes() - client.out->bytes();
+        // Bytes already staged in this read's batch count against the client
+        // queue limit, so a slow client still pauses DC reads.
+        const std::size_t queued = client.out->bytes() + client.s2c_batch.size();
+        const std::size_t room =
+            queued >= client.out->max_bytes() ? 0 : client.out->max_bytes() - queued;
         if (room == 0) {
             stats_.add_backpressure(control::Direction::server_to_client);
             break;
@@ -315,43 +326,28 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
             total += bytes;
             direct_rx_bytes_[client.route_dc] += bytes;
             touch(client, now);
-            // Decrypt in the shared read buffer. The previous path allocated and
-            // copied a fresh vector for every recv chunk on the DC->client hot
-            // path; tls->send() only reads the span and appends to wire_buffer_.
+            // Decrypt in the shared read buffer, then re-encrypt straight into
+            // the client's open TLS record: every chunk of this read event ends
+            // up in as few records as possible and in one send below, instead
+            // of a queue copy plus an EPOLLOUT round trip per chunk.
             auto plain = std::span<std::uint8_t>(read_buffer_).first(bytes);
             client.direct_decrypt->apply(plain);
-            wire_buffer_.clear();
-            if (client.tls->send(std::span<const std::uint8_t>(plain), wire_buffer_) !=
-                protocol::Status::Ok) {
-                detail::trim_buffer(wire_buffer_);
-                reaccount_shared();
-                close_client(token);
-                return;
-            }
-            // Batch interest rearming across all chunks in this read event.
-            if (!push_client_wire(client, wire_buffer_, false)) {
-                detail::trim_buffer(wire_buffer_);
-                reaccount_shared();
+            if (client.tls->send(std::span<const std::uint8_t>(plain), client.s2c_batch,
+                                 &client.s2c_open_record) != protocol::Status::Ok) {
                 close_client(token);
                 return;
             }
             if (client.metrics) {
                 client.metrics->add_payload(control::Direction::server_to_client, bytes);
             }
+            media_account(client, bytes, now);
             client.awaiting_reply = false;
-            detail::trim_buffer(wire_buffer_);
-            if (clients_.find(token) == clients_.end()) return;
+            // Short read: the DC socket is drained; level-triggered EPOLLIN
+            // reports more data, so skip the EAGAIN-only recv.
+            if (bytes < limit) break;
         } else if (received == 0) {
-            client.direct_eof = true;
-            client.direct_fin_pending = false;
-            client.direct_eof_at = now;
-            client.awaiting_reply = false;
-            direct_eof_clients_.push_back(token);
-            update_direct_interest(client);
-            // push_client_wire(false) deliberately deferred rearming; EOF is
-            // another early return and must still publish pending client output.
-            update_client_interest(client);
-            return;
+            eof = true;
+            break;
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -361,9 +357,21 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
             return;
         }
     }
-    // push_client_wire() already reaccounts the client queue; the shared
-    // scratch buffers changed at most once for this read event.
-    reaccount_shared();
+    // One direct send for everything read in this event; EPOLLOUT is armed by
+    // pump_client_out() only if the client socket would block.
+    if (!client.s2c_batch.empty()) {
+        if (!finish_s2c_batch(client)) return;
+        if (clients_.find(token) == clients_.end()) return;
+    } else {
+        client.s2c_open_record = protocol::FakeTlsConnection::kNoOpenRecord;
+    }
+    if (eof) {
+        client.direct_eof = true;
+        client.direct_fin_pending = false;
+        client.direct_eof_at = now;
+        client.awaiting_reply = false;
+        direct_eof_clients_.push_back(token);
+    }
     reaccount(client);
     update_direct_interest(client);
     update_client_interest(client);

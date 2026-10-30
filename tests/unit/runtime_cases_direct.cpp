@@ -178,7 +178,10 @@ TEST(Runtime, DirectBudgetPauseStopsReactorSpinAndResumes) {
     DirectEndpointScope endpoint(dc.port());
     Daemon daemon(1, true, [](mtdd::Config& config) {
         enable_direct(2, config);
-        config.global_buffer_bytes = 400U * 1024U;
+        // DC reads stop once the 256 KiB client queue is full; the budget must
+        // be below queue + one read reservation (~96 KiB) so the budget gate,
+        // not only the queue limit, is what pauses the DC socket.
+        config.global_buffer_bytes = 300U * 1024U;
         config.connection_queue_bytes = 256U * 1024U;
         config.handshake_timeout = 10s;
     });

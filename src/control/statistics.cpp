@@ -381,6 +381,7 @@ struct Statistics::Impl {
   std::atomic<uint64_t> backpressure_c2s{0};
   std::atomic<uint64_t> backpressure_s2c{0};
   std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
+  std::atomic<uint64_t> media_throttled{0};
   std::array<std::atomic<uint64_t>, kApiRouteCount * kApiMethodCount * kApiStatusCount>
       api_cells;
   std::atomic<uint64_t> api_total{0};
@@ -551,6 +552,10 @@ void Statistics::set_client_pool(std::size_t worker, uint64_t pooled,
   impl_->client_allocations.store(allocations, std::memory_order_relaxed);
   impl_->client_reuses.store(reuses, std::memory_order_relaxed);
 }
+void Statistics::media_throttled() noexcept {
+  impl_->media_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Statistics::relay_closed(RelayCloseReason reason) noexcept {
   const auto index = static_cast<std::size_t>(reason);
   if (index < kRelayCloseReasons) impl_->relay_closes[index].fetch_add(1, std::memory_order_relaxed);
@@ -991,6 +996,7 @@ StatisticsSnapshot Statistics::snapshot() const {
   for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
     out.relay_closes_total[index] = impl_->relay_closes[index].load(std::memory_order_relaxed);
   }
+  out.media_throttled_total = impl_->media_throttled.load(std::memory_order_relaxed);
   out.replay_cache_entries = replay_entries;
   out.api_requests_total = impl_->api_total.load(std::memory_order_relaxed);
   out.me_pending_buffer_bytes = me_pending_bytes;
@@ -1192,6 +1198,7 @@ std::string Statistics::prometheus_text() const {
                     snapshot.relay_closes_total[index]);
     }
   }
+  append_metric(out, "mtdd_media_throttled_total", "", snapshot.media_throttled_total);
   if (snapshot.backpressure_c2s_total != 0) {
     append_metric(out, "mtdd_backpressure_events_total", "direction=\"c2s\"",
                   snapshot.backpressure_c2s_total);

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -51,11 +52,14 @@ void block_shutdown_signals() {
     ::sigemptyset(&signals);
     ::sigaddset(&signals, SIGINT);
     ::sigaddset(&signals, SIGTERM);
+    // SIGHUP is consumed by the runtime's signalfd as "reload", never as the
+    // default terminate action.
+    ::sigaddset(&signals, SIGHUP);
     if (::pthread_sigmask(SIG_BLOCK, &signals, nullptr) != 0)
         throw std::runtime_error("cannot configure shutdown signals");
 }
 
-int serve(const mtdd::Config& config) {
+int serve(const mtdd::Config& config, const std::filesystem::path& config_path) {
     const auto token = api_token(config);
     block_shutdown_signals(); // All background threads inherit this mask.
     mtdd::RevisionBarrier applied;
@@ -71,6 +75,22 @@ int serve(const mtdd::Config& config) {
     stats.enable_ip_history(config.unique_ip_stats_path.string());
     mtdd::MetadataProvider metadata{config};
     mtdd::Runtime runtime{config, users, stats, metadata, applied};
+    // systemctl reload mtdd (SIGHUP): re-read the file and apply the settings
+    // that can change without dropping clients. Others need a restart.
+    runtime.on_reload([&runtime, config_path] {
+        try {
+            const auto fresh = mtdd::Config::load(config_path);
+            runtime.set_tunables(fresh.me_clients_per_writer, fresh.me_connections_per_dc);
+            runtime.set_media_limits(fresh.media_user_rate_kbps, fresh.media_total_rate_kbps);
+            std::cerr << "mtdd: reloaded me_clients_per_writer=" << fresh.me_clients_per_writer
+                      << " me_connections_per_dc=" << fresh.me_connections_per_dc
+                      << " media_user_rate_kbps=" << fresh.media_user_rate_kbps
+                      << " media_total_rate_kbps=" << fresh.media_total_rate_kbps << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "mtdd: reload rejected, keeping current settings: " << error.what()
+                      << '\n';
+        }
+    });
     mtdd::control::HttpOptions http;
     http.bind_address = config.control_host;
     http.port = config.control_port;
@@ -110,7 +130,7 @@ int main(int argc, char** argv) {
             std::cout << "configuration valid (syntax and static limits only)\n";
             return 0;
         }
-        return serve(config);
+        return serve(config, args.path);
     } catch (const std::exception& error) {
         std::cerr << "mtdd: " << error.what() << '\n';
         return 1;

@@ -283,6 +283,13 @@ void Runtime::Impl::setup() {
     sigaddset(&all, SIGINT);
     sigaddset(&all, SIGTERM);
     sigset_t current{};
+    // SIGHUP (reload) is taken only when the embedder blocked it as well;
+    // otherwise its default action is left to the process.
+    sigset_t blocked{};
+    if (::pthread_sigmask(SIG_SETMASK, nullptr, &blocked) == 0 &&
+        sigismember(&blocked, SIGHUP) == 1) {
+        sigaddset(&all, SIGHUP);
+    }
     if (signal_owner_ && ::pthread_sigmask(SIG_SETMASK, nullptr, &current) == 0 &&
         (sigismember(&current, SIGINT) == 1 || sigismember(&current, SIGTERM) == 1)) {
         const int fd = ::signalfd(-1, &all, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -505,6 +512,7 @@ void Runtime::Impl::run() {
             // This makes a drained EOF close prompt instead of waiting for the
             // 150 ms housekeeping tick.
             const Time finished = Clock::now();
+            media_release(finished);
             finish_eof_clients(finished);
             // Fallback pairs are pumped by their own read/write events; the
             // sweep only closes finished or expired pairs, so it runs from the
@@ -573,8 +581,12 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // EPOLLIN stays armed until recv()==0. A pending FIN alone must NOT stop
     // reading: bytes may still be queued behind the FIN. Budget pause disables
     // it temporarily; the unpause path re-arms it so the tail is preserved.
+    // A throttled media client whose held requests reached the queue size is
+    // not read further, so shaping never turns into a queue-overflow close.
+    const bool media_hold = client.media_throttled &&
+                            client.c2s_capacity >= config_.connection_queue_bytes;
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested) {
+        !client.close_requested && !media_hold) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
@@ -630,6 +642,7 @@ int Runtime::Impl::wait_timeout_ms(Time now) const {
         const Time eof_wake = std::max(next_eof_deadline_, next_eof_sweep_);
         if (eof_wake < limit) limit = eof_wake;
     }
+    if (!media_throttled_.empty() && next_media_check_ < limit) limit = next_media_check_;
     if (stopping_ && shutdown_deadline_ < limit) limit = shutdown_deadline_;
     if (limit <= now) return 0;
     // Round a positive sub-millisecond delay up: truncating it to 0 would turn
@@ -663,7 +676,16 @@ void Runtime::Impl::handle_event(const Target& target, std::uint32_t events, Tim
         do {
             read = ::read(signal_.get(), &info, sizeof(info));
         } while (read < 0 && errno == EINTR);
-        (void)read;
+        if (read == static_cast<ssize_t>(sizeof(info)) && info.ssi_signo == SIGHUP) {
+            // Reload: apply live tunables, keep every connection.
+            if (shared_->reload_hook) {
+                try {
+                    shared_->reload_hook();
+                } catch (...) {
+                }
+            }
+            break;
+        }
         // A process signal is global: the signal-owning reactor must stop all
         // peers, not only itself.
         request_stop();

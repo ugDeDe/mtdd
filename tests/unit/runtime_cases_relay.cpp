@@ -1003,3 +1003,87 @@ TEST(Runtime, SeparateSignedDcQueuesAndAnswersStayIsolated) {
 }
 
 } // namespace
+
+namespace {
+// Fetches `count` 128 KiB answers from media DC -2, one request at a time, and
+// returns the elapsed time (or a negative duration on failure).
+std::chrono::milliseconds fetch_media(std::uint64_t user_kbps, std::size_t count,
+                                      std::uint64_t* throttled = nullptr) {
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    FakeMe me{me_secret(), 100000, 0ms, 1, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.media_user_rate_kbps = user_kbps;
+        config.idle_timeout = 60s;
+    });
+    if (!daemon.services.add_user("alice", std::string(kSecretHex))) return -1ms;
+    if (!wait_for([&] { return daemon.services.stats.ready(); }, 4s)) return -1ms;
+    TestClient client(daemon.port(), secret_bytes());
+    if (!client.valid() || !client.send_hello() || !client.start_obfuscation(-2)) return -1ms;
+    const auto started = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!client.send_message(burst_payload(index))) return -1ms;
+        Bytes response;
+        if (!client.read_message(response, 10000) || response.size() != kAnswer) return -1ms;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    if (throttled != nullptr) *throttled = daemon.services.stats.snapshot().media_throttled_total;
+    return elapsed;
+}
+} // namespace
+
+TEST(Runtime, MediaUserRateLimitSlowsDownloadsWithoutDroppingThem) {
+    // 12 x 128 KiB = 1.5 MiB. Unlimited this is a loopback copy.
+    const auto unlimited = fetch_media(0, 12);
+    ASSERT_GE(unlimited.count(), 0);
+    EXPECT_LT(unlimited, 1500ms);
+    // 4000 kbit/s = 500 KB/s with a one-second burst: >= ~2 s for the rest.
+    std::uint64_t throttled = 0;
+    const auto limited = fetch_media(4000, 12, &throttled);
+    ASSERT_GE(limited.count(), 0) << "a shaped download must complete, not be dropped";
+    EXPECT_GE(limited, 1800ms);
+    EXPECT_LT(limited, 8000ms);
+    EXPECT_GE(throttled, 1U);
+}
+
+TEST(RateBucket, LimitsAverageRateWithOneSecondBurstAndDebt) {
+    mtdd::detail::RateBucket bucket;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(bucket.blocked(start)) << "rate 0 is unlimited";
+    bucket.consume(10'000'000, start);
+    EXPECT_FALSE(bucket.blocked(start));
+    bucket.set_rate(1000);  // bytes per second
+    EXPECT_FALSE(bucket.blocked(start));  // starts with a full one-second burst
+    bucket.consume(1500, start);
+    EXPECT_TRUE(bucket.blocked(start)) << "debt of 500 bytes";
+    EXPECT_TRUE(bucket.blocked(start + 400ms));
+    EXPECT_FALSE(bucket.blocked(start + 600ms)) << "debt repaid after 0.5 s";
+    // The burst is capped at one second of rate.
+    EXPECT_FALSE(bucket.blocked(start + 60s));
+    bucket.consume(1001, start + 60s);
+    EXPECT_TRUE(bucket.blocked(start + 60s));
+}
+
+TEST(RateBucket, InterleavedStaleTimestampsDoNotInflateTheRate) {
+    // Two reactors feed the shared bucket with times that alternate between a
+    // fresh and a 2 ms stale stamp. Over 10 s at 1 MB/s at most 10 MB + the
+    // 1 s burst may pass, regardless of the interleaving.
+    mtdd::detail::RateBucket bucket;
+    bucket.set_rate(1'000'000);
+    const auto start = std::chrono::steady_clock::now();
+    std::uint64_t passed = 0;
+    for (int tick = 0; tick < 100'000; ++tick) {
+        const auto fresh = start + std::chrono::microseconds(tick * 100);
+        const auto stale = fresh - std::chrono::milliseconds(2);
+        for (const auto now : {fresh, stale}) {
+            if (!bucket.blocked(now)) {
+                bucket.consume(1000, now);
+                passed += 1000;
+            }
+        }
+    }
+    EXPECT_LE(passed, 11'100'000U) << "stale stamps re-credited elapsed time";
+    EXPECT_GE(passed, 10'000'000U);
+}

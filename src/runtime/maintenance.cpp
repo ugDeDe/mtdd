@@ -20,7 +20,50 @@
 
 namespace mtdd {
 
+void Runtime::Impl::apply_shared_tunables() {
+    const std::uint64_t generation =
+        shared_->tunables_generation.load(std::memory_order_acquire);
+    if (generation == tunables_seen_) return;
+    tunables_seen_ = generation;
+    config_.me_clients_per_writer =
+        shared_->me_clients_per_writer.load(std::memory_order_relaxed);
+    config_.me_connections_per_dc =
+        shared_->me_connections_per_dc.load(std::memory_order_relaxed);
+    // A lower cap applies now: clamp the target and scale-drain the excess
+    // writers (fewest bound clients first). Draining only stops new bindings;
+    // each writer closes after its own clients leave, so nobody is dropped.
+    const std::size_t cap = config_.me_connections_per_dc;
+    for (auto& [dc, pool] : me_pool_) {
+        if (pool.scale_target > cap) pool.scale_target = cap;
+        std::vector<MeConn*> active;
+        for (auto& connection : pool.conns) {
+            if (connection && !connection->draining &&
+                connection->generation == pool.desired_generation) {
+                active.push_back(connection.get());
+            }
+        }
+        if (active.size() <= cap) continue;
+        std::sort(active.begin(), active.end(), [](const MeConn* left, const MeConn* right) {
+            return left->clients < right->clients;
+        });
+        for (std::size_t index = 0; index < active.size() - cap; ++index) {
+            active[index]->draining = true;
+            active[index]->scale_draining = true;
+            active[index]->draining_deadline = Time::max();
+            ++pool.scale_down_total;
+        }
+        publish_me_pool(dc);
+    }
+    recompute_ready();
+}
+
 void Runtime::Impl::housekeeping(Time now) {
+    // A reload must never become a reactor failure; on allocation failure the
+    // generation is already consumed and the next reload retries.
+    try {
+        apply_shared_tunables();
+    } catch (...) {
+    }
     shared_->replay.evict(now);
     refresh_ip_history();
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());

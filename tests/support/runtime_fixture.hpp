@@ -446,6 +446,9 @@ public:
     std::uint16_t port() const { return runtime.port(); }
     pid_t worker_tid() const { return worker_tid_.load(); }
     std::size_t workers() const { return runtime.worker_count(); }
+    void set_tunables(std::uint32_t clients_per_writer, std::uint32_t connections_per_dc) {
+        runtime.set_tunables(clients_per_writer, connections_per_dc);
+    }
     std::vector<std::uint64_t> accepted_per_worker() const {
         return runtime.accepted_clients_per_worker();
     }

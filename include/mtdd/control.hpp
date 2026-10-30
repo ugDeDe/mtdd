@@ -419,6 +419,7 @@ struct StatisticsSnapshot {
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
+  uint64_t media_throttled_total{0};
   uint64_t replay_cache_entries{0};
   uint64_t api_requests_total{0};
   uint64_t me_pending_buffer_bytes{0};
@@ -513,6 +514,8 @@ class Statistics {
                        uint64_t reuses) noexcept;
   void add_backpressure(Direction direction) noexcept;
   void relay_closed(RelayCloseReason reason) noexcept;
+  // Media shaping held a client (one count per throttle episode).
+  void media_throttled() noexcept;
   void set_replay_cache_entries(uint64_t entries) noexcept;
   void set_replay_cache_entries(std::size_t worker, uint64_t entries) noexcept;
 

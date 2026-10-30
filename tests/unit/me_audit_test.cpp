@@ -1146,3 +1146,44 @@ TEST(MeAudit, FailedSuccessorRollsBackToTheDrainingGeneration) {
 }
 
 }  // namespace
+
+TEST(MeAudit, ReloadedPoolTunablesReachTheReactorAndClampTargets) {
+    AuditReactor test("live-tunables");
+    auto& reactor = *test.reactor;
+    reactor.config_.me_clients_per_writer = 400;
+    reactor.config_.me_connections_per_dc = 16;
+    auto& pool = reactor.me_pool_[2];
+    pool.scale_target = 12;
+    pool.desired_generation = pool.serving_generation = 1;
+    std::vector<mtdd::Runtime::Impl::MeConn*> writers;
+    for (std::size_t clients : {5U, 1U, 9U, 3U}) {
+        auto owned = std::make_unique<mtdd::Runtime::Impl::MeConn>();
+        owned->dc = 2;
+        owned->generation = 1;
+        owned->state = mtdd::Runtime::Impl::MeConn::State::ready;
+        owned->clients = clients;
+        writers.push_back(owned.get());
+        pool.conns.push_back(std::move(owned));
+    }
+    // No new generation: nothing changes (direct config edits stay intact).
+    reactor.apply_shared_tunables();
+    EXPECT_EQ(reactor.config_.me_clients_per_writer, 400U);
+    // A reload publishes new values and bumps the generation.
+    reactor.shared_->me_clients_per_writer.store(1500);
+    reactor.shared_->me_connections_per_dc.store(2);
+    reactor.shared_->tunables_generation.fetch_add(1);
+    reactor.apply_shared_tunables();
+    EXPECT_EQ(reactor.config_.me_clients_per_writer, 1500U);
+    EXPECT_EQ(reactor.config_.me_connections_per_dc, 2U);
+    EXPECT_EQ(pool.scale_target, 2U) << "target above the new cap is clamped";
+    // The two least-loaded writers are scale-drained; none is closed.
+    EXPECT_TRUE(writers[1]->draining && writers[1]->scale_draining);
+    EXPECT_TRUE(writers[3]->draining && writers[3]->scale_draining);
+    EXPECT_FALSE(writers[0]->draining);
+    EXPECT_FALSE(writers[2]->draining);
+    EXPECT_EQ(pool.conns.size(), 4U);
+    // Applied once per generation.
+    reactor.config_.me_clients_per_writer = 7;
+    reactor.apply_shared_tunables();
+    EXPECT_EQ(reactor.config_.me_clients_per_writer, 7U);
+}

@@ -13,12 +13,14 @@
 #include "mtdd/runtime.hpp"
 #include "mtdd/runtime_support.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -372,6 +374,60 @@ private:
         order_;
 };
 
+// Token bucket for media shaping, shared by the reactors that serve one user
+// (or the whole process). Rate 0 means unlimited. Debt is allowed: a large
+// answer is always delivered and then repaid, so shaping never drops data; it
+// only delays the client's next requests (ME) or DC reads (Direct).
+class RateBucket {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    void set_rate(std::uint64_t bytes_per_second) noexcept {
+        rate_.store(bytes_per_second, std::memory_order_relaxed);
+    }
+    std::uint64_t rate() const noexcept { return rate_.load(std::memory_order_relaxed); }
+
+    void consume(std::size_t bytes, Clock::time_point now) {
+        if (rate() == 0) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        refill_locked(now);
+        tokens_ -= static_cast<double>(bytes);
+    }
+    // True while the bucket is in debt (limited and below zero).
+    bool blocked(Clock::time_point now) {
+        if (rate() == 0) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        refill_locked(now);
+        return tokens_ < 0.0;
+    }
+
+private:
+    void refill_locked(Clock::time_point now) noexcept {
+        const double rate = static_cast<double>(rate_.load(std::memory_order_relaxed));
+        // Burst: one second of traffic, so short pauses do not starve a client.
+        if (last_ == Clock::time_point{}) {
+            last_ = now;
+            tokens_ = rate;
+            return;
+        }
+        // Reactors pass their own (possibly slightly stale) loop time. Never
+        // move the clock backwards: an older stamp followed by a newer one
+        // would credit the same interval twice and inflate the rate.
+        if (now <= last_) return;
+        const double elapsed = std::chrono::duration<double>(now - last_).count();
+        last_ = now;
+        tokens_ = std::min(rate, tokens_ + rate * elapsed);
+    }
+
+    std::atomic<std::uint64_t> rate_{0};
+    std::mutex mutex_;
+    double tokens_{0.0};
+    Clock::time_point last_{};
+};
+
+// How often throttled media clients are re-checked for released tokens.
+inline constexpr std::chrono::milliseconds kMediaRecheck{10};
+
 // State shared by all reactors. Hot-path relay traffic never touches this
 // object; only admission (connection/handshake reservation, replay cache,
 // unique-IP accounting) and shutdown coordination do.
@@ -381,6 +437,35 @@ struct SharedState {
           worker_budget(budget_per_worker) {}
 
     std::atomic<bool> stop{false};
+    // Live-reloadable ME pool tunables (Runtime::set_tunables). Reactors pick
+    // them up on their housekeeping tick when the generation changes.
+    std::atomic<std::uint32_t> me_clients_per_writer{0};
+    std::atomic<std::uint32_t> me_connections_per_dc{0};
+    std::atomic<std::uint64_t> tunables_generation{0};
+    // Media shaping (signed DC < 0, server-to-client bytes): one bucket per
+    // proxy user plus one process-wide cap. Rates in bytes per second.
+    std::atomic<std::uint64_t> media_user_rate{0};
+    RateBucket media_total;
+    std::mutex media_users_mutex;
+    std::unordered_map<std::string, std::shared_ptr<RateBucket>> media_users;
+    std::shared_ptr<RateBucket> media_user_bucket(const std::string& user) {
+        std::lock_guard<std::mutex> lock(media_users_mutex);
+        auto& slot = media_users[user];
+        if (!slot) slot = std::make_shared<RateBucket>();
+        slot->set_rate(media_user_rate.load(std::memory_order_relaxed));
+        return slot;
+    }
+    void set_media_rates(std::uint64_t user_rate, std::uint64_t total_rate) {
+        media_user_rate.store(user_rate, std::memory_order_relaxed);
+        media_total.set_rate(total_rate);
+        std::lock_guard<std::mutex> lock(media_users_mutex);
+        for (auto& [name, bucket] : media_users) {
+            (void)name;
+            bucket->set_rate(user_rate);
+        }
+    }
+    // SIGHUP handler installed before run(); invoked on the signal reactor.
+    std::function<void()> reload_hook;
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
@@ -606,6 +691,11 @@ struct Runtime::Impl {
         // published once by close_client() for authenticated sessions.
         control::RelayCloseReason close_reason{control::RelayCloseReason::other};
         bool close_reason_set{false};
+        // Media shaping: set for signed DC < 0. While throttled the client's
+        // requests stay queued (ME) or the DC socket is not read (Direct).
+        bool media{false};
+        bool media_throttled{false};
+        std::shared_ptr<detail::RateBucket> media_bucket;
     };
 
     struct StagedFrame {
@@ -860,6 +950,12 @@ struct Runtime::Impl {
     void schedule_client_deadline(Client& client, Time now);
     void on_client_deadline(Client& client, Time now);
     void touch(Client& client, Time now) { client.last_activity = now; }
+    void apply_shared_tunables();
+    // Media shaping helpers (see detail::RateBucket).
+    bool media_blocked(Client& client, Time now);
+    void media_account(Client& client, std::size_t bytes, Time now);
+    void media_throttle(Client& client);
+    void media_release(Time now);
     void reject_close(Client& client, control::RejectReason reason,
                       std::optional<control::HandshakeResult> handshake);
     void close_client(std::uint64_t token, bool record_pending_handshake = true);
@@ -1024,6 +1120,11 @@ struct Runtime::Impl {
     std::shared_ptr<const control::UserSnapshot> users_snapshot_;
     std::vector<std::uint64_t> s2c_batch_tokens_;
     std::size_t accept_burst_{1};
+    std::vector<std::uint64_t> media_throttled_;
+    std::vector<std::uint64_t> media_scratch_;
+    std::vector<std::pair<detail::RateBucket*, bool>> media_bucket_state_;
+    Time next_media_check_{};
+    std::uint64_t tunables_seen_{0};
     // Pre-keyed ClientHello HMAC per enabled user of hello_keys_snapshot_
     // (held so the UserRecord pointers stay valid). Rebuilt on snapshot change.
     std::shared_ptr<const control::UserSnapshot> hello_keys_snapshot_;
@@ -1111,6 +1212,9 @@ struct Runtime::RuntimeState {
     void finish_run() noexcept;
     std::vector<std::uint64_t> accepted_clients_per_worker() const;
     std::vector<std::uint64_t> replay_rejections_per_worker() const;
+    void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
+    void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+    void on_reload(std::function<void()> hook);
 
 private:
     void run_impl();

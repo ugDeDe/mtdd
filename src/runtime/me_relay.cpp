@@ -425,6 +425,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         return;
     }
     client.metrics->add_payload(control::Direction::server_to_client, payload.size());
+    media_account(client, payload.size(), now);
     client.awaiting_reply = false;
     ++me.ans_delivered;
     stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::delivered);

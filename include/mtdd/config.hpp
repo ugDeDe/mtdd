@@ -49,6 +49,11 @@ struct Config {
     // them a vanished mobile client holds its slot until idle_timeout.
     std::chrono::seconds client_keepalive{60};
     std::chrono::seconds client_ack_timeout{90};
+    // Media shaping for signed DC < 0 (file/photo/video downloads), kbit/s.
+    // Per proxy user across all of its media connections, and a process-wide
+    // cap. 0 disables. Reloadable with SIGHUP.
+    std::uint64_t media_user_rate_kbps{0};
+    std::uint64_t media_total_rate_kbps{0};
     std::chrono::seconds metadata_refresh{3600};
     // Opt-in Direct Telegram DC fallback. Disabled by default; only the listed
     // signed DCs use the trusted official direct address table.

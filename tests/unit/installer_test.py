@@ -248,6 +248,11 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
                          "an operator's explicit value must survive the update")
         unit = (sandbox / "etc/systemd/system/mtdd.service").read_text()
         self.assertIn("LimitNOFILE=1048576", unit)
+        self.assertIn("ExecReload=/bin/kill -HUP $MAINPID", unit)
+        nettune_unit = (sandbox / "etc/systemd/system/mtdd-nettune.service").read_text()
+        self.assertIn("ExecStart=/usr/local/bin/mtdd-nettune start", nettune_unit)
+        self.assertIn("ExecStop=/usr/local/bin/mtdd-nettune stop", nettune_unit)
+        self.assertTrue(os.access(sandbox / "bin/mtdd-nettune", os.X_OK))
         sysctl = (sandbox / "etc/sysctl.d/99-mtdd-load.conf").read_text()
         self.assertIn("net.core.somaxconn = ", sysctl)
         self.assertIn("net.ipv4.tcp_orphan_retries = ", sysctl)
@@ -373,3 +378,79 @@ printf '0\n' | script -q -e -c 'bash "$MTDD_TEST_INSTALLER" menu' /dev/null
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NetTuneScriptTest(unittest.TestCase):
+    """The mtdd-nettune script embedded in install.sh, run on a fake sysfs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        text = INSTALLER.read_text()
+        start = text.index("<<'NETTUNE'\n") + len("<<'NETTUNE'\n")
+        end = text.index("\nNETTUNE\n", start)
+        self.script = self.root / "mtdd-nettune"
+        self.script.write_text(text[start:end] + "\n")
+        self.script.chmod(0o755)
+        self.sysfs = self.root / "sys"
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        # Fake `ip`: two default routes (v4 on eth0, v6 on eth1) plus a
+        # non-default route on eth2 that must be ignored.
+        ip = bindir / "ip"
+        ip.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  -4) echo 'default via 10.0.0.1 dev eth0 proto dhcp' ;;\n"
+            "  -6) echo 'default via fe80::1 dev eth1 metric 1024' ;;\n"
+            "esac\n")
+        ip.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin",
+                        MTDD_NETTUNE_SYSFS=str(self.sysfs),
+                        MTDD_NETTUNE_STATE=str(self.root / "state"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def knob(self, dev, name, value=None):
+        path = self.sysfs / "class/net" / dev / name
+        if value is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n")
+        return path.read_text().strip()
+
+    def run_script(self, action):
+        result = subprocess.run([str(self.script), action], env=self.env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_applies_defaults_only_and_restores_its_own_changes(self):
+        self.knob("eth0", "napi_defer_hard_irqs", "0")
+        self.knob("eth0", "gro_flush_timeout", "0")
+        # Operator-tuned interface: left untouched.
+        self.knob("eth1", "napi_defer_hard_irqs", "5")
+        self.knob("eth1", "gro_flush_timeout", "0")
+        # Not a default-route interface.
+        self.knob("eth2", "napi_defer_hard_irqs", "0")
+        self.run_script("start")
+        self.assertEqual(self.knob("eth0", "napi_defer_hard_irqs"), "2")
+        self.assertEqual(self.knob("eth0", "gro_flush_timeout"), "1000000")
+        self.assertEqual(self.knob("eth1", "napi_defer_hard_irqs"), "5")
+        self.assertEqual(self.knob("eth1", "gro_flush_timeout"), "1000000")
+        self.assertEqual(self.knob("eth2", "napi_defer_hard_irqs"), "0")
+        # A later operator change survives stop; our own values are reverted.
+        self.knob("eth0", "gro_flush_timeout", "50000")
+        self.run_script("stop")
+        self.assertEqual(self.knob("eth0", "napi_defer_hard_irqs"), "0")
+        self.assertEqual(self.knob("eth1", "napi_defer_hard_irqs"), "5")
+        self.assertEqual(self.knob("eth1", "gro_flush_timeout"), "0")
+        self.assertEqual(self.knob("eth0", "gro_flush_timeout"), "50000")
+        # A second stop is a no-op.
+        self.run_script("stop")
+
+    def test_missing_knobs_and_interfaces_are_skipped(self):
+        # Old kernel: the interface exists but has no NAPI deferral files.
+        (self.sysfs / "class/net/eth0").mkdir(parents=True)
+        self.run_script("start")
+        self.assertFalse((self.sysfs / "class/net/eth0/napi_defer_hard_irqs").exists())
+        self.run_script("stop")

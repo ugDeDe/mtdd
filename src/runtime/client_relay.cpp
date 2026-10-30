@@ -217,12 +217,82 @@ void Runtime::Impl::flush_s2c_batches() {
     reaccount_shared();
 }
 
+bool Runtime::Impl::media_blocked(Client& client, Time now) {
+    // Shaping never delays a graceful shutdown drain.
+    if (!client.media || stopping_) return false;
+    if (!client.media_bucket && !client.user_name.empty() &&
+        shared_->media_user_rate.load(std::memory_order_relaxed) != 0) {
+        client.media_bucket = shared_->media_user_bucket(client.user_name);
+    }
+    return (client.media_bucket && client.media_bucket->blocked(now)) ||
+           shared_->media_total.blocked(now);
+}
+
+void Runtime::Impl::media_account(Client& client, std::size_t bytes, Time now) {
+    if (!client.media) return;
+    if (!client.media_bucket && !client.user_name.empty() &&
+        shared_->media_user_rate.load(std::memory_order_relaxed) != 0) {
+        client.media_bucket = shared_->media_user_bucket(client.user_name);
+    }
+    if (client.media_bucket) client.media_bucket->consume(bytes, now);
+    shared_->media_total.consume(bytes, now);
+}
+
+void Runtime::Impl::media_throttle(Client& client) {
+    if (client.media_throttled) return;
+    client.media_throttled = true;
+    media_throttled_.push_back(client.token);
+    stats_.media_throttled();
+}
+
+void Runtime::Impl::media_release(Time now) {
+    if (media_throttled_.empty() || now < next_media_check_) return;
+    next_media_check_ = now + detail::kMediaRecheck;
+    // Thousands of held clients usually share one or a few buckets: evaluate
+    // each bucket (and the process cap) once per pass instead of taking its
+    // mutex per client.
+    if (!stopping_ && shared_->media_total.blocked(now)) return;
+    media_bucket_state_.clear();
+    const auto bucket_blocked = [&](detail::RateBucket* bucket) {
+        for (const auto& [seen, blocked] : media_bucket_state_) {
+            if (seen == bucket) return blocked;
+        }
+        const bool blocked = !stopping_ && bucket->blocked(now);
+        media_bucket_state_.emplace_back(bucket, blocked);
+        return blocked;
+    };
+    media_scratch_.clear();
+    media_scratch_.swap(media_throttled_);
+    for (const std::uint64_t token : media_scratch_) {
+        const auto found = clients_.find(token);
+        if (found == clients_.end()) continue;
+        Client& client = *found->second;
+        if (!client.media_throttled) continue;
+        if (client.media_bucket && bucket_blocked(client.media_bucket.get())) {
+            media_throttled_.push_back(token);
+            continue;
+        }
+        client.media_throttled = false;
+        if (client.route == Client::Route::direct) {
+            // The DC socket was left unread; re-arming EPOLLIN resumes it.
+            update_direct_interest(client);
+        } else {
+            pump_c2s(client, now);
+            if (clients_.find(token) == clients_.end()) continue;
+            enqueue_ready(client);
+        }
+        if (clients_.find(token) == clients_.end()) continue;
+        update_client_interest(client);
+    }
+    media_scratch_.clear();
+}
+
 void Runtime::Impl::enqueue_ready(Client& client) {
     // Single owner of queue membership: flag, unique counter and push happen
     // together and only here. A client may therefore appear at most once in its
     // own signed-DC ready queue.
     if (client.me == nullptr || client.c2s.empty() || client.in_me_queue ||
-        client.close_requested) {
+        client.close_requested || client.media_throttled) {
         return;
     }
     MeConn& me = *client.me;
@@ -245,6 +315,13 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
         return;
     }
     if (client.c2s.empty() || client.me == nullptr) return;
+    // Media shaping: hold the client's next requests while its bucket is in
+    // debt. Downloads are request-driven, so the answers slow down without any
+    // data being buffered here.
+    if (client.media && media_blocked(client, now)) {
+        media_throttle(client);
+        return;
+    }
     MeConn& me = *client.me;
     if (me.state != MeConn::State::ready || me.session == nullptr) return;
     const std::uint64_t token = client.token;

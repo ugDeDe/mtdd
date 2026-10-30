@@ -32,6 +32,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -75,6 +76,20 @@ public:
 
     /// Bound listener port (the actual port when config.proxy_port was 0).
     std::uint16_t port() const noexcept;
+
+    /// Thread-safe. Changes the ME pool scaling limits of every reactor without
+    /// touching live connections; reactors apply them within one housekeeping
+    /// tick and existing pools converge through normal scaling. Values must be
+    /// in the ranges accepted by Config (1..1000000 and 1..24).
+    void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
+
+    /// Thread-safe. Media shaping limits in kbit/s (0 = unlimited): per proxy
+    /// user across its media (signed DC < 0) connections, and process-wide.
+    void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+
+    /// Installs a SIGHUP handler (call before run()). It runs on the reactor
+    /// that owns the process signals; a throwing hook is ignored.
+    void on_reload(std::function<void()> hook);
 
     /// Number of reactors created from `workers` (auto-detection included).
     std::size_t worker_count() const noexcept;

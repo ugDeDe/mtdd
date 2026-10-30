@@ -697,6 +697,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
 void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     const auto tag = client.tls->proto_tag();
     const std::int16_t dc = client.tls->dc_id();
+    client.media = dc < 0;
     if (tag != protocol::ProtoTag::Secure || dc == 0) {
         reject_close(client, control::RejectReason::auth_failed,
                      client.handshake_pending ? std::optional{control::HandshakeResult::failure}

@@ -406,6 +406,7 @@ sudo bash install.sh     # то же меню через сам установщ
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
 | `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 16 |
 | `me_clients_per_writer` | Целевой порог клиентов для роста пула, по умолчанию 400 |
+| | `me_clients_per_writer` и `me_connections_per_dc` применяются без обрыва клиентов командой `systemctl reload mtdd`; остальные параметры требуют перезапуска |
 | `metadata_refresh_seconds` | Интервал обновления метаданных |
 | `direct_fallback_enabled`, `direct_fallback_dcs` | Явно включаемый Direct fallback для перечисленных signed DC |
 | `masking` | `true` по умолчанию: ClientHello, не прошедший аутентификацию, релеится на реальный сервер запрошенного SNI, если имя принадлежит `tls_domain` (сам домен или поддомен) — активная проба получает настоящий сертификат. При заданном `fallback_host`/`fallback_port` цель фиксирована; иначе при чужом/отсутствующем SNI, ошибке маршрутизации или выключенном `masking` соединение закрывается. Повторные (replay) и перегруженные рукопожатия не релеятся |

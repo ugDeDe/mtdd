@@ -1211,3 +1211,11 @@ TEST(Runtime, FallbackStalledDrainClosesWithinIdleDeadline) {
 
 
 } // namespace
+
+TEST(Runtime, SetTunablesValidatesRanges) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    EXPECT_NO_THROW(daemon.set_tunables(1500, 6));
+    EXPECT_THROW(daemon.set_tunables(0, 6), std::invalid_argument);
+    EXPECT_THROW(daemon.set_tunables(400, 25), std::invalid_argument);
+}

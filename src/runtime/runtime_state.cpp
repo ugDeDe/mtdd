@@ -57,6 +57,9 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     workers = requested;
     const std::size_t per_worker_budget = available / requested;
     shared = std::make_shared<detail::SharedState>(workers, per_worker_budget);
+    shared->me_clients_per_writer.store(config.me_clients_per_writer, std::memory_order_relaxed);
+    shared->me_connections_per_dc.store(config.me_connections_per_dc, std::memory_order_relaxed);
+    set_media_limits(config.media_user_rate_kbps, config.media_total_rate_kbps);
 
     // Prime the process CSPRNG on the constructing thread before any reactor
     // thread exists. OpenSSL 3 performs a one-time DRBG setup on the first
@@ -198,6 +201,30 @@ std::vector<std::uint64_t> Runtime::RuntimeState::replay_rejections_per_worker()
     return counts;
 }
 
+void Runtime::RuntimeState::set_tunables(std::uint32_t me_clients_per_writer,
+                                         std::uint32_t me_connections_per_dc) {
+    if (me_clients_per_writer < 1 || me_clients_per_writer > 1000000) {
+        throw std::invalid_argument("me_clients_per_writer must be in 1..1000000");
+    }
+    if (me_connections_per_dc < 1 || me_connections_per_dc > 24) {
+        throw std::invalid_argument("me_connections_per_dc must be in 1..24");
+    }
+    shared->me_clients_per_writer.store(me_clients_per_writer, std::memory_order_relaxed);
+    shared->me_connections_per_dc.store(me_connections_per_dc, std::memory_order_relaxed);
+    // Release pairs with the reactors' acquire load of the generation.
+    shared->tunables_generation.fetch_add(1, std::memory_order_release);
+}
+
+void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
+                                             std::uint64_t total_kbps) noexcept {
+    // kbit/s -> bytes/s.
+    shared->set_media_rates(user_kbps * 125U, total_kbps * 125U);
+}
+
+void Runtime::RuntimeState::on_reload(std::function<void()> hook) {
+    shared->reload_hook = std::move(hook);
+}
+
 Runtime::Runtime(const Config& config, control::UserStore& users,
                  control::Statistics& statistics, MetadataProvider& metadata,
                  RevisionBarrier& barrier)
@@ -209,6 +236,17 @@ Runtime::~Runtime() = default;
 void Runtime::run() { state_->run(); }
 
 void Runtime::request_stop() noexcept { state_->request_stop(); }
+
+void Runtime::set_tunables(std::uint32_t me_clients_per_writer,
+                           std::uint32_t me_connections_per_dc) {
+    state_->set_tunables(me_clients_per_writer, me_connections_per_dc);
+}
+
+void Runtime::on_reload(std::function<void()> hook) { state_->on_reload(std::move(hook)); }
+
+void Runtime::set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept {
+    state_->set_media_limits(user_kbps, total_kbps);
+}
 
 std::uint16_t Runtime::port() const noexcept { return state_->port(); }
 
