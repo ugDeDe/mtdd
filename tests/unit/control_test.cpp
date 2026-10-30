@@ -509,7 +509,7 @@ TEST(UserStorePersistenceTest, RejectsMalformedOrInvalidFile) {
   EXPECT_EQ(malformed.error().code, ErrorCode::invalid_json);
 
   write_text_file(dir.file("version.json"),
-                  R"({"version":2,"revision":0,"users":[]})");
+                  R"({"version":3,"revision":0,"users":[]})");
   auto version = UserStore::open(dir.file("version.json"));
   ASSERT_FALSE(version.ok());
   EXPECT_EQ(version.error().code, ErrorCode::unsupported_version);

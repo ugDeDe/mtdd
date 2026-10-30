@@ -20,7 +20,10 @@ TEST(StatisticsTest, CountersAndSnapshot) {
   alice->add_payload(Direction::client_to_server, 123);
   alice->add_payload(Direction::server_to_client, 456);
   alice->set_active_unique_ips(3);
+  alice->set_qualified_unique_ips(1);
   stats.set_active_unique_ips(7);
+  stats.set_qualified_unique_ips(4);
+  stats.set_unique_ip_min_bytes(2048);
 
   stats.set_buffer_bytes(BufferState::queued, 10);
   stats.set_buffer_bytes(BufferState::pending_write, 20);
@@ -41,6 +44,8 @@ TEST(StatisticsTest, CountersAndSnapshot) {
   EXPECT_EQ(snapshot.connections_accepted_total, 2u);
   EXPECT_EQ(snapshot.connections_active, 1u);
   EXPECT_EQ(snapshot.active_unique_ips, 7u);
+  EXPECT_EQ(snapshot.qualified_unique_ips, 4u);
+  EXPECT_EQ(snapshot.unique_ip_min_bytes, 2048u);
   EXPECT_EQ(snapshot.connections_rejected_total, 2u);
   EXPECT_EQ(snapshot.rejected_by_reason["overload"], 1u);
   EXPECT_EQ(snapshot.rejected_by_reason["auth_failed"], 1u);
@@ -49,6 +54,7 @@ TEST(StatisticsTest, CountersAndSnapshot) {
   ASSERT_EQ(snapshot.users.count("alice"), 1u);
   EXPECT_EQ(snapshot.users["alice"].active_connections, 1u);
   EXPECT_EQ(snapshot.users["alice"].unique_ips_active, 3u);
+  EXPECT_EQ(snapshot.users["alice"].unique_ips_qualified, 1u);
   EXPECT_EQ(snapshot.users["alice"].payload_c2s_bytes, 123u);
   EXPECT_EQ(snapshot.users["alice"].payload_s2c_bytes, 456u);
   EXPECT_EQ(snapshot.buffer_bytes[static_cast<size_t>(BufferState::queued)], 10u);
@@ -71,9 +77,19 @@ TEST(StatisticsTest, UniqueIpGaugesAreRenderedWithoutIpLabels) {
   ASSERT_NE(alice, nullptr);
   alice->set_active_unique_ips(2);
   EXPECT_EQ(alice->active_unique_ips(), 2u);
+  stats.set_qualified_unique_ips(5);
+  alice->set_qualified_unique_ips(1);
+  EXPECT_EQ(alice->qualified_unique_ips(), 1u);
+  stats.set_unique_ip_min_bytes(4096);
   const std::string text = stats.prometheus_text();
-  EXPECT_NE(text.find("mtdd_unique_ips_active 9"), std::string::npos);
-  EXPECT_NE(text.find("mtdd_user_unique_ips_active{user=\"alice\"} 2"),
+  // "active" is the byte-threshold count; "seen" is the handshake count.
+  EXPECT_NE(text.find("mtdd_unique_ips_active 5"), std::string::npos);
+  EXPECT_NE(text.find("mtdd_unique_ips_seen 9"), std::string::npos);
+  EXPECT_NE(text.find("mtdd_unique_ips_min_bytes 4096"), std::string::npos);
+  EXPECT_NE(text.find("# HELP mtdd_unique_ips_seen "), std::string::npos);
+  EXPECT_NE(text.find("mtdd_user_unique_ips_active{user=\"alice\"} 1"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_user_unique_ips_seen{user=\"alice\"} 2"),
             std::string::npos);
   EXPECT_EQ(text.find("127.0.0.1"), std::string::npos);
 }
@@ -140,6 +156,22 @@ TEST(StatisticsTest, IpHistoryMetricsUseFixedPeriodsAndNoIpLabels) {
             std::string::npos);
   EXPECT_EQ(text.find("127.0.0.1"), std::string::npos);
   EXPECT_EQ(text.find("ip=\""), std::string::npos);
+}
+
+TEST(StatisticsTest, ActiveIpHistoryIsSeparateFromSeenHistory) {
+  Statistics stats;
+  stats.enable_ip_history();
+  ASSERT_TRUE(stats.rotate_ip_history(kHistoryTue1030));
+  ASSERT_TRUE(stats.observe_ip_history({7}));
+  ASSERT_TRUE(stats.observe_ip_history({8}));
+  ASSERT_TRUE(stats.observe_ip_history_active({7}));
+  const std::string text = stats.prometheus_text();
+  EXPECT_NE(text.find("mtdd_unique_ips_estimate{period=\"hour\"} 2"), std::string::npos);
+  EXPECT_NE(text.find("mtdd_unique_ips_active_estimate{period=\"hour\"} 1"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_unique_ips_active_estimate{period=\"week\"} 1"),
+            std::string::npos);
+  EXPECT_NE(text.find("# HELP mtdd_unique_ips_active_estimate "), std::string::npos);
 }
 
 TEST(StatisticsTest, UnknownApiStatusIsBucketedAs500Not429) {

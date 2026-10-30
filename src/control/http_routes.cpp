@@ -1,11 +1,14 @@
 #include "http_internal.hpp"
 
+#include <cstdio>
+
 #include <event2/buffer.h>
 #include <event2/http.h>
 #include <event2/keyvalq_struct.h>
 #include <openssl/crypto.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -86,34 +89,43 @@ RouteInfo classify_route(evhttp_request* request) {
     info.route = ApiRoute::metrics;
     return info;
   }
+  static constexpr std::pair<std::string_view, ApiRoute> kFixed[] = {
+      {"/v1/system/info", ApiRoute::system_info},
+      {"/v1/config", ApiRoute::config},
+      {"/v1/stats/summary", ApiRoute::stats_summary},
+      {"/v1/stats/me", ApiRoute::stats_me},
+      {"/v1/stats/users", ApiRoute::stats_users},
+      {"/v1/events", ApiRoute::events}};
+  for (const auto& [fixed, route] : kFixed) {
+    if (path == fixed) {
+      info.route = route;
+      return info;
+    }
+  }
 
+  // /v1/users/{name}[/action]; names never contain '/'.
   constexpr std::string_view kUsersPrefix = "/v1/users/";
-  constexpr std::string_view kRotateSuffix = "/rotate-secret";
-  constexpr std::string_view kLinksSuffix = "/links";
-  if (path.rfind(kUsersPrefix, 0) == 0) {
-    std::string rest = path.substr(kUsersPrefix.size());
-    if (rest.size() > kLinksSuffix.size() &&
-        rest.compare(rest.size() - kLinksSuffix.size(), kLinksSuffix.size(), kLinksSuffix) == 0) {
-      rest.resize(rest.size() - kLinksSuffix.size());
-      if (!rest.empty() && rest.find('/') == std::string::npos) {
-        info.route = ApiRoute::user_links;
-        info.name = std::move(rest);
-      }
-      return info;
-    }
-    if (rest.size() > kRotateSuffix.size() &&
-        rest.compare(rest.size() - kRotateSuffix.size(), kRotateSuffix.size(),
-                     kRotateSuffix) == 0) {
-      rest.resize(rest.size() - kRotateSuffix.size());
-      if (!rest.empty() && rest.find('/') == std::string::npos) {
-        info.route = ApiRoute::rotate_secret;
-        info.name = std::move(rest);
-      }
-      return info;
-    }
-    if (!rest.empty() && rest.find('/') == std::string::npos) {
-      info.route = ApiRoute::user;
+  if (path.rfind(kUsersPrefix, 0) != 0) return info;
+  std::string rest = path.substr(kUsersPrefix.size());
+  const size_t slash = rest.find('/');
+  std::string action;
+  if (slash != std::string::npos) {
+    action = rest.substr(slash + 1);
+    rest.resize(slash);
+  }
+  if (rest.empty()) return info;
+  static constexpr std::pair<std::string_view, ApiRoute> kActions[] = {
+      {"", ApiRoute::user},
+      {"links", ApiRoute::user_links},
+      {"rotate-secret", ApiRoute::rotate_secret},
+      {"enable", ApiRoute::user_enable},
+      {"disable", ApiRoute::user_disable},
+      {"reset-quota", ApiRoute::user_reset_quota}};
+  for (const auto& [suffix, route] : kActions) {
+    if (action == suffix && (slash == std::string::npos) == suffix.empty()) {
+      info.route = route;
       info.name = std::move(rest);
+      return info;
     }
   }
   return info;
@@ -126,6 +138,12 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
     case ApiRoute::status:
     case ApiRoute::metrics:
     case ApiRoute::user_links:
+    case ApiRoute::system_info:
+    case ApiRoute::config:
+    case ApiRoute::stats_summary:
+    case ApiRoute::stats_me:
+    case ApiRoute::stats_users:
+    case ApiRoute::events:
       return method == ApiMethod::get;
     case ApiRoute::users:
       return method == ApiMethod::get || method == ApiMethod::post;
@@ -133,6 +151,9 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
       return method == ApiMethod::get || method == ApiMethod::patch ||
              method == ApiMethod::delete_;
     case ApiRoute::rotate_secret:
+    case ApiRoute::user_enable:
+    case ApiRoute::user_disable:
+    case ApiRoute::user_reset_quota:
       return method == ApiMethod::post;
     case ApiRoute::unknown:
       return false;
@@ -255,6 +276,182 @@ HttpError map_store_error(const Error& error) {
   return HttpError{status, to_string(error.code), error.message};
 }
 
+namespace {
+
+// Howard Hinnant's days_from_civil: proleptic Gregorian date to Unix days.
+int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+  y -= m <= 2 ? 1 : 0;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const auto yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+bool digits(std::string_view text, size_t at, size_t count, unsigned& out) {
+  if (at + count > text.size()) return false;
+  out = 0;
+  for (size_t i = at; i < at + count; ++i) {
+    if (text[i] < '0' || text[i] > '9') return false;
+    out = out * 10 + static_cast<unsigned>(text[i] - '0');
+  }
+  return true;
+}
+
+std::optional<HttpError> parse_nullable_u64(const json& body, const char* key,
+                                            uint64_t limit,
+                                            Patch<uint64_t>& out) {
+  if (!body.contains(key)) return std::nullopt;
+  const json& value = body[key];
+  if (value.is_null()) {
+    out = std::optional<uint64_t>{};
+    return std::nullopt;
+  }
+  if (!value.is_number_unsigned() || value.get<uint64_t>() > limit) {
+    return HttpError{400, "invalid_field",
+                     std::string(key) + " must be null or an unsigned integer"};
+  }
+  out = std::optional<uint64_t>(value.get<uint64_t>());
+  return std::nullopt;
+}
+
+}  // namespace
+
+std::optional<int64_t> parse_rfc3339(std::string_view text) {
+  // YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM|-HH:MM); fraction is dropped.
+  unsigned year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  if (text.size() < 20 || text.size() > 40 || !digits(text, 0, 4, year) ||
+      text[4] != '-' || !digits(text, 5, 2, month) || text[7] != '-' ||
+      !digits(text, 8, 2, day) || (text[10] != 'T' && text[10] != 't') ||
+      !digits(text, 11, 2, hour) || text[13] != ':' ||
+      !digits(text, 14, 2, minute) || text[16] != ':' ||
+      !digits(text, 17, 2, second)) {
+    return std::nullopt;
+  }
+  size_t at = 19;
+  if (text[at] == '.') {
+    ++at;
+    const size_t start = at;
+    while (at < text.size() && text[at] >= '0' && text[at] <= '9') ++at;
+    if (at == start) return std::nullopt;
+  }
+  int64_t offset = 0;
+  if (at < text.size() && (text[at] == 'Z' || text[at] == 'z')) {
+    ++at;
+  } else if (at < text.size() && (text[at] == '+' || text[at] == '-')) {
+    unsigned oh = 0, om = 0;
+    if (!digits(text, at + 1, 2, oh) || at + 3 >= text.size() ||
+        text[at + 3] != ':' || !digits(text, at + 4, 2, om) || oh > 23 || om > 59) {
+      return std::nullopt;
+    }
+    offset = (text[at] == '+' ? 1 : -1) * static_cast<int64_t>(oh * 3600 + om * 60);
+    at += 6;
+  } else {
+    return std::nullopt;
+  }
+  if (at != text.size()) return std::nullopt;
+  static constexpr unsigned kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+  if (month < 1 || month > 12 || day < 1 ||
+      day > kDays[month - 1] + ((month == 2 && leap) ? 1u : 0u) || hour > 23 ||
+      minute > 59 || second > 59) {
+    return std::nullopt;
+  }
+  return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 +
+         second - offset;
+}
+
+std::string format_rfc3339(int64_t unix_seconds) {
+  const int64_t days = unix_seconds >= 0 ? unix_seconds / 86400
+                                         : (unix_seconds - 86399) / 86400;
+  const int64_t rest = unix_seconds - days * 86400;
+  // Inverse of days_from_civil (civil_from_days).
+  const int64_t z = days + 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const auto doe = static_cast<unsigned>(z - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  const unsigned m = mp < 10 ? mp + 3 : mp - 9;
+  const int64_t y = static_cast<int64_t>(yoe) + era * 400 + (m <= 2 ? 1 : 0);
+  char buffer[64];
+  std::snprintf(buffer, sizeof(buffer), "%04lld-%02u-%02uT%02lld:%02lld:%02lldZ",
+                static_cast<long long>(y), m, d, static_cast<long long>(rest / 3600),
+                static_cast<long long>(rest / 60 % 60), static_cast<long long>(rest % 60));
+  return buffer;
+}
+
+std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& out) {
+  if (body.contains("expires_at")) {
+    const json& value = body["expires_at"];
+    if (value.is_null()) {
+      out.expires_at = std::optional<int64_t>{};
+    } else {
+      const auto parsed =
+          value.is_string() ? parse_rfc3339(value.get<std::string>()) : std::nullopt;
+      if (!parsed) {
+        return HttpError{400, "invalid_field",
+                         "expires_at must be null or an RFC 3339 timestamp, "
+                         "e.g. 2030-01-01T00:00:00Z"};
+      }
+      out.expires_at = std::optional<int64_t>(*parsed);
+    }
+  }
+  Patch<uint64_t> unique_ips;
+  if (auto error = parse_nullable_u64(body, "max_unique_ips", kMaxUniqueIpsLimit,
+                                      unique_ips)) {
+    return error;
+  }
+  if (unique_ips) {
+    out.max_unique_ips = *unique_ips ? std::optional<uint32_t>(static_cast<uint32_t>(**unique_ips))
+                                     : std::optional<uint32_t>{};
+  }
+  for (const auto& [key, target] :
+       {std::pair{"data_quota_bytes", &out.data_quota_bytes},
+        std::pair{"rate_limit_up_bytes_per_sec", &out.rate_limit_up_bytes_per_sec},
+        std::pair{"rate_limit_down_bytes_per_sec", &out.rate_limit_down_bytes_per_sec}}) {
+    if (auto error = parse_nullable_u64(body, key, UINT64_MAX, *target)) return error;
+  }
+  if (body.contains("note")) {
+    if (!body["note"].is_string()) {
+      return HttpError{400, "invalid_field", "note must be a string"};
+    }
+    out.note = body["note"].get<std::string>();
+  }
+  return std::nullopt;
+}
+
+UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
+  UserPolicy policy;
+  if (patch.expires_at) policy.expires_at = *patch.expires_at;
+  if (patch.data_quota_bytes) policy.data_quota_bytes = *patch.data_quota_bytes;
+  if (patch.max_unique_ips) policy.max_unique_ips = *patch.max_unique_ips;
+  if (patch.rate_limit_up_bytes_per_sec) {
+    policy.rate_limit_up_bytes_per_sec = *patch.rate_limit_up_bytes_per_sec;
+  }
+  if (patch.rate_limit_down_bytes_per_sec) {
+    policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
+  }
+  if (patch.note) policy.note = *patch.note;
+  return policy;
+}
+
+json policy_json(const UserPolicy& policy) {
+  const auto nullable = [](const auto& value) {
+    return value ? json(*value) : json(nullptr);
+  };
+  json out;
+  out["expires_at"] =
+      policy.expires_at ? json(format_rfc3339(*policy.expires_at)) : json(nullptr);
+  out["data_quota_bytes"] = nullable(policy.data_quota_bytes);
+  out["max_unique_ips"] = nullable(policy.max_unique_ips);
+  out["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
+  out["rate_limit_down_bytes_per_sec"] = nullable(policy.rate_limit_down_bytes_per_sec);
+  out["note"] = policy.note;
+  return out;
+}
+
 json user_json(const UserRecord& user, const StatisticsSnapshot& stats) {
   json entry;
   entry["name"] = user.name;
@@ -265,13 +462,21 @@ json user_json(const UserRecord& user, const StatisticsSnapshot& stats) {
     entry["max_connections"] = nullptr;
   }
   entry["generation"] = user.generation;
+  entry.update(policy_json(user.policy));
   UserMetricsSnapshot metrics;
   const auto found = stats.users.find(user.name);
   if (found != stats.users.end()) metrics = found->second;
   entry["stats"] = {{"active_connections", metrics.active_connections},
-                    {"unique_ips_active", metrics.unique_ips_active},
+                    {"unique_ips_active", metrics.unique_ips_qualified},
+                    {"unique_ips_seen", metrics.unique_ips_active},
                     {"payload_bytes_c2s", metrics.payload_c2s_bytes},
-                    {"payload_bytes_s2c", metrics.payload_s2c_bytes}};
+                    {"payload_bytes_s2c", metrics.payload_s2c_bytes},
+                    {"quota_used_bytes", metrics.quota_used_bytes}};
+  if (metrics.quota_reset_at > 0) {
+    entry["stats"]["quota_reset_at"] = format_rfc3339(metrics.quota_reset_at);
+  } else {
+    entry["stats"]["quota_reset_at"] = nullptr;
+  }
   return entry;
 }
 
@@ -329,9 +534,89 @@ BodyRead read_body(evhttp_request* request, size_t max_body_bytes,
   return result;
 }
 
+namespace {
+thread_local uint64_t t_request_id = 0;
+std::atomic<uint64_t> g_request_ids{0};
+}  // namespace
+
+void set_request_id(uint64_t id) noexcept { t_request_id = id; }
+uint64_t current_request_id() noexcept { return t_request_id; }
+uint64_t next_request_id() noexcept {
+  return g_request_ids.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+std::optional<HttpError> parse_query(evhttp_request* request,
+                                     std::initializer_list<std::string_view> allowed,
+                                     Query& out) {
+  out.clear();
+  const evhttp_uri* uri = evhttp_request_get_evhttp_uri(request);
+  const char* raw = uri != nullptr ? evhttp_uri_get_query(uri) : nullptr;
+  if (raw == nullptr || *raw == '\0') return std::nullopt;
+  evkeyvalq pairs;
+  pairs.tqh_first = nullptr;
+  pairs.tqh_last = &pairs.tqh_first;
+  if (evhttp_parse_query_str(raw, &pairs) != 0) {
+    evhttp_clear_headers(&pairs);
+    return HttpError{400, "invalid_query", "malformed query string"};
+  }
+  std::optional<HttpError> error;
+  for (evkeyval* pair = pairs.tqh_first; pair != nullptr && !error;
+       pair = pair->next.tqe_next) {
+    const std::string_view key = pair->key;
+    if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+      error = HttpError{400, "invalid_query",
+                        "unknown query parameter '" + std::string(key) + "'"};
+    } else if (query_value(out, key) != nullptr) {
+      error = HttpError{400, "invalid_query",
+                        "duplicate query parameter '" + std::string(key) + "'"};
+    } else {
+      out.emplace_back(pair->key, pair->value);
+    }
+  }
+  evhttp_clear_headers(&pairs);
+  return error;
+}
+
+const std::string* query_value(const Query& query, std::string_view key) {
+  for (const auto& [name, value] : query) {
+    if (name == key) return &value;
+  }
+  return nullptr;
+}
+
+std::optional<HttpError> query_uint(const Query& query, std::string_view key,
+                                    uint64_t min, uint64_t max, uint64_t& out) {
+  const std::string* text = query_value(query, key);
+  if (text == nullptr) return std::nullopt;
+  uint64_t value = 0;
+  bool ok = !text->empty() && text->size() <= 19;
+  for (char c : *text) {
+    if (c < '0' || c > '9') {
+      ok = false;
+      break;
+    }
+    value = value * 10 + static_cast<uint64_t>(c - '0');
+  }
+  if (!ok || value < min || value > max) {
+    return HttpError{400, "invalid_query",
+                     std::string(key) + " must be an integer within " +
+                         std::to_string(min) + ".." + std::to_string(max)};
+  }
+  out = value;
+  return std::nullopt;
+}
+
 void send_json(evhttp_request* request, int status, const json& body,
                std::optional<uint64_t> revision) {
-  const std::string text = body.dump();
+  // Query keys and values are echoed in errors and may be invalid UTF-8.
+  std::string text = body.dump(-1, ' ', false, json::error_handler_t::replace);
+  // Envelope: {"ok":bool,"request_id":N, ...body}. Spliced into the dumped text
+  // so large listings are not copied once more.
+  if (body.is_object()) {
+    std::string prefix = std::string("{\"ok\":") + (status < 400 ? "true" : "false");
+    if (t_request_id != 0) prefix += ",\"request_id\":" + std::to_string(t_request_id);
+    text = prefix + (text.size() > 2 ? "," : "") + text.substr(1);
+  }
   evbuffer* buffer = evbuffer_new();
   if (buffer == nullptr) {
     evhttp_send_reply(request, 500, nullptr, nullptr);
@@ -342,6 +627,9 @@ void send_json(evhttp_request* request, int status, const json& body,
   evhttp_add_header(headers, "Content-Type", "application/json");
   evhttp_add_header(headers, "Cache-Control", "no-store");
   evhttp_add_header(headers, "X-Content-Type-Options", "nosniff");
+  if (t_request_id != 0) {
+    evhttp_add_header(headers, "X-Request-Id", std::to_string(t_request_id).c_str());
+  }
   if (revision) {
     const std::string etag = "\"" + std::to_string(*revision) + "\"";
     evhttp_add_header(headers, "ETag", etag.c_str());
@@ -363,6 +651,9 @@ void send_text(evhttp_request* request, int status, const std::string& body,
   const std::string type(content_type);
   evhttp_add_header(headers, "Content-Type", type.c_str());
   evhttp_add_header(headers, "Cache-Control", "no-store");
+  if (t_request_id != 0) {
+    evhttp_add_header(headers, "X-Request-Id", std::to_string(t_request_id).c_str());
+  }
   if (revision) {
     const std::string etag = "\"" + std::to_string(*revision) + "\"";
     evhttp_add_header(headers, "ETag", etag.c_str());

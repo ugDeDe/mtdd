@@ -55,6 +55,11 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
         }
     }
     workers = requested;
+    // A corrupt usage file throws here (fail closed): silently starting from
+    // zero would hand every user a fresh quota.
+    usage_keeper = std::make_unique<control::UsageStateKeeper>(
+        config.usage_state_path, statistics, users);
+    usage_keeper->load();
     const std::size_t per_worker_budget = available / requested;
     shared = std::make_shared<detail::SharedState>(workers, per_worker_budget);
     shared->me_clients_per_writer.store(config.me_clients_per_writer, std::memory_order_relaxed);
@@ -104,6 +109,12 @@ Runtime::RuntimeState::~RuntimeState() {
     }
     threads.clear();
     reactors.clear();
+    if (usage_keeper) {
+        usage_keeper->stop();
+        // run() already flushed, but the management API outlives it and may
+        // have reset a quota since; main() stops the API before this runs.
+        usage_keeper->flush();
+    }
 }
 
 void Runtime::RuntimeState::finish_run() noexcept {
@@ -136,6 +147,7 @@ void Runtime::RuntimeState::run_impl() {
         const std::lock_guard lock{failure_mutex};
         if (!failure) failure = std::move(error);
     };
+    if (usage_keeper) usage_keeper->start();
     try {
         threads.reserve(workers > 0 ? workers - 1 : 0);
         for (std::size_t index = 1; index < workers; ++index) {
@@ -166,6 +178,9 @@ void Runtime::RuntimeState::run_impl() {
         if (thread.joinable()) thread.join();
     }
     threads.clear();
+    // Final flush on clean shutdown (also on a reactor failure: counters are
+    // still the best known values).
+    if (usage_keeper) usage_keeper->stop();
     std::exception_ptr result;
     {
         const std::lock_guard lock{failure_mutex};

@@ -14,6 +14,7 @@
 #include "mtdd/runtime_support.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +25,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <mtdd/usage_state.hpp>
+
 #include <optional>
 #include <span>
 #include <string>
@@ -316,6 +319,17 @@ using ConnId = protocol::MiddleEndSession::ConnId;
 // are ignored. Native IPv6 stays distinct.
 using IpKey = std::array<std::uint8_t, 16>;
 
+// Unique-IP counting key: IPv4 and IPv4-mapped addresses stay as they are; any
+// other IPv6 address collapses to its /64, because privacy-address rotation
+// hands one device many interface identifiers inside one prefix. Applied only
+// at the counting boundary (make_ip_key), never to the stored peer address.
+inline IpKey collapse_ip_key(IpKey key) noexcept {
+    constexpr std::array<std::uint8_t, 12> mapped_prefix{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::equal(mapped_prefix.begin(), mapped_prefix.end(), key.begin())) return key;
+    std::fill(key.begin() + 8, key.end(), std::uint8_t{0});
+    return key;
+}
+
 struct IpKeyHash {
     std::size_t operator()(const IpKey& key) const noexcept {
         std::uint64_t hash = 0xcbf29ce484222325ULL;
@@ -487,6 +501,13 @@ struct SharedState {
     std::unordered_map<std::string,
                        std::unordered_map<IpKey, std::uint32_t, IpKeyHash>>
         user_unique_ip_counts;
+    // Same maps restricted to connections that moved >= unique_ip_min_bytes
+    // ("active"). Written only when a connection first crosses the threshold
+    // and on close, under ip_mutex.
+    std::unordered_map<IpKey, std::uint32_t, IpKeyHash> active_ip_counts;
+    std::unordered_map<std::string,
+                       std::unordered_map<IpKey, std::uint32_t, IpKeyHash>>
+        user_active_ip_counts;
 
     // Number of reactors that have finished finalization. The last one clears
     // shared gauges (unique IPs, replay entries) before the process reports
@@ -632,6 +653,15 @@ struct Runtime::Impl {
         bool conn_registered{false};
         bool deferred{false};
         bool close_requested{false};
+        // Per-user rate limit (UserPolicy::rate_limit_*). Cached from the
+        // latest users snapshot (0 = unlimited) so the hot path is one branch.
+        std::uint64_t rate_up{0};    // client->server bytes/s
+        std::uint64_t rate_down{0};  // server->client bytes/s
+        // While set, reading from the source of that direction is disabled
+        // (EPOLLIN removed); process_rate_resumes() re-arms it.
+        bool rate_pause_c2s{false};
+        bool rate_pause_s2c{false};
+        bool rate_listed{false};
         // Raw-TLS fallback pair state (phase == fallback). `out` is the
         // backend->client queue; c2b is client->backend.
         io::UniqueFd backend;
@@ -677,6 +707,10 @@ struct Runtime::Impl {
 
         bool ip_counted{false};
         detail::IpKey ip_key{};
+        // Per-connection payload bytes (c2s+s2c) until the IP qualifies as
+        // active; plain reactor-local fields, no lock or lookup per packet.
+        bool ip_qualified{false};
+        std::uint64_t ip_bytes{0};
 
         bool read_eof{false};   // recv()==0: socket read side is truly empty
         Time read_eof_at{};
@@ -900,6 +934,12 @@ struct Runtime::Impl {
     void poll_users(Time now);
     void poll_metadata(Time now);
     void apply_user_snapshot(bool initial);
+    // Per-user policy runtime (src/runtime/policy.cpp).
+    void load_client_rates(Client& client, const control::UserRecord& user);
+    void charge_rate(Client& client, control::Direction direction, std::uint64_t bytes,
+                     Time now);
+    void process_rate_resumes(Time now);
+    void sweep_user_policy(Time now);
     void recompute_ready();
     void start_warming(Time now);
     void advance_warming(Time now);
@@ -972,8 +1012,17 @@ struct Runtime::Impl {
     }
     void close_client(std::uint64_t token, control::RelayCloseReason reason);
     void close_fallback_backend(Client& client);
-    bool count_client_unique_ip(Client& client);
+    enum class IpCountResult { ok, failure, limit };
+    IpCountResult count_client_unique_ip(Client& client,
+                                         std::optional<std::uint32_t> max_unique_ips);
     void decrement_client_unique_ip(Client& client) noexcept;
+    // Hot path: a bool test once qualified, otherwise one add and compare.
+    void note_ip_payload(Client& client, std::uint64_t bytes) {
+        if (client.ip_qualified || !client.ip_counted) return;
+        client.ip_bytes += bytes;
+        if (client.ip_bytes >= config_.unique_ip_min_bytes) qualify_client_unique_ip(client);
+    }
+    void qualify_client_unique_ip(Client& client);
     void refresh_ip_history();
     void defer_close(std::uint64_t token);
     void defer_close_conn(const detail::ConnId& id);
@@ -1150,6 +1199,9 @@ struct Runtime::Impl {
     std::vector<std::uint64_t> deferred_closes_;
     std::vector<std::uint64_t> deferred_me_failures_;
     std::vector<std::uint64_t> paused_clients_;
+    std::vector<std::uint64_t> rate_clients_;  // tokens with a rate pause flag set
+    std::vector<std::uint64_t> rate_remaining_;
+    Time next_rate_resume_{Time::max()};
     std::vector<std::uint64_t> eof_clients_;
     // Scratch storage for the sweep's survivor list: swapped with eof_clients_
     // so a steady-state sweep allocates nothing.
@@ -1224,6 +1276,8 @@ public:
     std::shared_ptr<detail::SharedState> shared;
     std::vector<std::unique_ptr<Impl>> reactors;
     std::vector<std::thread> threads;
+    // Quota counter persistence (no-op without Config::usage_state_path).
+    std::unique_ptr<control::UsageStateKeeper> usage_keeper;
     // A concurrent destructor must not clear reactors/threads while run() is
     // still starting or joining workers. The destructor requests stop first,
     // then waits here for run() to publish its terminal state.

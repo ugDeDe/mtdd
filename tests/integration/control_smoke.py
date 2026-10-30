@@ -25,8 +25,10 @@ def unused_port():
 def run(binary, parse_metrics=False):
     with tempfile.TemporaryDirectory(prefix="mtdd-control-") as directory:
         root = Path(directory)
-        api_port, proxy_port, unavailable_me_port = (unused_port() for _ in range(3))
+        api_port, proxy_port, unavailable_me_port, metrics_port = (unused_port() for _ in range(4))
         token = secrets.token_hex(32)
+        read_token = secrets.token_hex(32)
+        metrics_token = secrets.token_hex(32)
         (root / "me.conf").write_text(
             f"default 2;\nproxy_for 2 127.0.0.1:{unavailable_me_port};\n"
         )
@@ -36,6 +38,9 @@ def run(binary, parse_metrics=False):
             "ad_tag": secrets.token_hex(16),
             "proxy_port": proxy_port,
             "control_port": api_port,
+            "metrics_port": metrics_port,
+            "api_read_token_env": "MTDD_API_READ_TOKEN",
+            "metrics_token_env": "MTDD_METRICS_TOKEN",
             "users_path": "users.json",
             "me_config_path": "me.conf",
             "me_secret_path": "me.secret",
@@ -45,17 +50,24 @@ def run(binary, parse_metrics=False):
         }
         config_path = root / "config.json"
         config_path.write_text(json.dumps(config))
-        environment = {**os.environ, "MTDD_API_TOKEN": token}
+        environment = {
+            **os.environ,
+            "MTDD_API_TOKEN": token,
+            "MTDD_API_READ_TOKEN": read_token,
+            "MTDD_METRICS_TOKEN": metrics_token,
+        }
         base = f"http://127.0.0.1:{api_port}"
+        metrics_base = f"http://127.0.0.1:{metrics_port}"
 
-        def request(path, method="GET", body=None, authenticated=True, headers=None):
+        def request(path, method="GET", body=None, authenticated=True, headers=None,
+                    bearer=None, origin=None):
             request_headers = dict(headers or {})
             if authenticated:
-                request_headers["Authorization"] = f"Bearer {token}"
+                request_headers["Authorization"] = f"Bearer {bearer or token}"
             data = None if body is None else json.dumps(body).encode()
             if data is not None:
                 request_headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(base + path, data, request_headers, method=method)
+            req = urllib.request.Request((origin or base) + path, data, request_headers, method=method)
             try:
                 response = urllib.request.urlopen(req, timeout=3)
             except urllib.error.HTTPError as error:
@@ -110,12 +122,23 @@ def run(binary, parse_metrics=False):
 
                 assert request("/v1/users/alice", "PATCH", {"enabled": False})[0] == 200
                 assert request("/v1/users/alice", "PATCH", {"enabled": True})[0] == 200
+                assert request("/v1/users/alice", bearer=read_token)[0] == 200
+                assert request("/v1/users/alice/links", bearer=read_token)[0] == 403
+                assert request("/v1/users/alice", "DELETE", bearer=read_token)[0] == 403
+                assert request("/v1/users", bearer=metrics_token)[0] == 401
+                status, headers, scraped = request("/metrics", bearer=metrics_token, origin=metrics_base)
+                assert status == 200 and b"mtdd_uptime_seconds" in scraped
+                assert headers.get("Deprecation") is None
+                assert request("/metrics", authenticated=False, origin=metrics_base)[0] == 401
+                assert request("/metrics", origin=metrics_base)[0] == 401, "admin token must not scrape"
+                assert request("/v1/users", bearer=metrics_token, origin=metrics_base)[0] == 404
                 status, _, rotated = request("/v1/users/alice/rotate-secret", "POST", {})
                 assert status == 200
                 assert json.loads(rotated)["data"]["secret"] != secret
                 assert request("/v1/ready")[0] == 503, "unavailable ME must not report ready"
-                status, _, metrics = request("/metrics")
+                status, headers, metrics = request("/metrics")
                 assert status == 200
+                assert headers.get("Deprecation") == "true"
                 assert b"mtdd_uptime_seconds" in metrics
                 assert token.encode() not in metrics and secret.encode() not in metrics
                 if parse_metrics:
@@ -127,9 +150,33 @@ def run(binary, parse_metrics=False):
                     identities = {(sample.name, tuple(sorted(sample.labels.items()))) for sample in samples}
                     assert len(identities) == len(samples), "duplicate Prometheus sample"
                     print(f"HTTP Prometheus parser: {len(families)} families, {len(samples)} unique samples")
+                # v2 surface against the real binary: envelope, views, stats, actions, audit.
+                status, headers, payload = request("/v1/system/info", bearer=read_token)
+                info = json.loads(payload)
+                assert status == 200 and info["ok"] is True
+                assert headers.get("X-Request-Id") == str(info["request_id"])
+                assert info["data"]["security"]["api"]["read_token"] is True
+                status, _, payload = request("/v1/config", bearer=read_token)
+                assert status == 200
+                for credential in (token, read_token, metrics_token):
+                    assert credential.encode() not in payload, "config view leaked a credential"
+                status, _, payload = request("/v1/stats/summary", bearer=read_token)
+                assert status == 200 and "seen" in json.loads(payload)["data"]["unique_ips"]["day"]
+                assert request("/v1/stats/users?sort=traffic&limit=5", bearer=read_token)[0] == 200
+                assert request("/v1/stats/users?bogus=1", bearer=read_token)[0] == 400
+                assert request("/v1/users/alice", "PATCH", {"note": "smoke", "max_unique_ips": 2})[0] == 200
+                status, _, payload = request("/v1/users/alice/disable", "POST")
+                assert status == 200 and json.loads(payload)["data"]["user"]["enabled"] is False
+                assert request("/v1/users/alice/enable", "POST", bearer=read_token)[0] == 403
+                assert request("/v1/users/alice/enable", "POST")[0] == 200
+                status, _, payload = request("/v1/events", bearer=read_token)
+                assert status == 200
+                actions = [event["action"] for event in json.loads(payload)["data"]["events"]]
+                assert actions[-3:] == ["user.update", "user.disable", "user.enable"], actions
+                assert secret.encode() not in payload
                 assert request("/v1/users/alice", "DELETE")[0] == 200
                 assert request("/v1/users/alice")[0] == 404
-                print("control smoke: passed; authentication, CRUD, ETag, redaction, metrics, ME readiness")
+                print("control smoke: passed; token scopes, metrics listener, authentication, CRUD, ETag, redaction, metrics, ME readiness, v2 views/stats/actions/audit")
             finally:
                 child.send_signal(signal.SIGTERM) if child.poll() is None else None
                 try:
@@ -141,7 +188,8 @@ def run(binary, parse_metrics=False):
                 # Never print logs verbatim: an implementation under test may leak credentials.
                 with contextlib.suppress(OSError):
                     log_bytes = (root / "process.log").read_bytes()
-                    assert token.encode() not in log_bytes, "API credential leaked to logs"
+                    for credential in (token, read_token, metrics_token):
+                        assert credential.encode() not in log_bytes, "API credential leaked to logs"
 
 
 if __name__ == "__main__":

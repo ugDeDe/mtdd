@@ -72,6 +72,50 @@ bool loopback(const std::string& host) {
     return host == "::1";
 }
 
+bool env_name(const std::string& name) {
+    return !name.empty() && std::all_of(name.begin(), name.end(), [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    });
+}
+
+// Same grammar as the control server's allowlist parser: address[/prefix].
+bool network(const std::string& entry) {
+    const auto slash = entry.find('/');
+    const auto address = entry.substr(0, slash);
+    std::array<unsigned char, 16> bytes{};
+    unsigned limit = 0;
+    if (inet_pton(AF_INET, address.c_str(), bytes.data()) == 1) limit = 32;
+    else if (inet_pton(AF_INET6, address.c_str(), bytes.data()) == 1) limit = 128;
+    else return false;
+    if (slash == std::string::npos) return true;
+    const auto digits = entry.substr(slash + 1);
+    if (digits.empty() || digits.size() > 3 ||
+        !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    return std::stoul(digits) <= limit;
+}
+
+std::vector<std::string> networks(const nlohmann::json& value, const char* key,
+                                  std::vector<std::string> fallback) {
+    if (!value.contains(key)) return fallback;
+    const auto& field = value.at(key);
+    if (!field.is_array() || field.size() > 64)
+        throw std::invalid_argument(std::string(key) + " must be an array of at most 64 CIDR strings");
+    std::vector<std::string> result;
+    for (const auto& entry : field) {
+        if (!entry.is_string() || !network(entry.get<std::string>()))
+            throw std::invalid_argument(std::string(key) + " entries must be IP addresses or CIDR networks");
+        result.push_back(entry.get<std::string>());
+    }
+    return result;
+}
+
+bool wildcard(const std::string& host) { return host == "0.0.0.0" || host == "::"; }
+
+bool overlaps(const std::string& a_host, std::uint16_t a_port, const std::string& b_host, std::uint16_t b_port) {
+    return a_port == b_port && (a_host == b_host || wildcard(a_host) || wildcard(b_host));
+}
+
 unsigned hex_digit(char c) {
     if (c >= '0' && c <= '9') return static_cast<unsigned>(c - '0');
     if (c >= 'a' && c <= 'f') return static_cast<unsigned>(c - 'a' + 10);
@@ -92,10 +136,11 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "api_token_env", "tls_domain", "ad_tag", "users_path", "me_config_path", "me_secret_path",
         "workers", "max_connections", "max_handshakes", "max_frame_bytes", "connection_queue_bytes",
         "global_buffer_bytes", "handshake_timeout_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
-        "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path",
+        "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
-        "media_user_rate_kbps", "media_total_rate_kbps"};
+        "media_user_rate_kbps", "media_total_rate_kbps", "api_read_token_env", "control_allow",
+        "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -136,6 +181,28 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     for (const auto c : config.api_token_env)
         if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '_')
             throw std::invalid_argument("api_token_env must be an environment variable name");
+    config.api_read_token_env = value.contains("api_read_token_env") ? text(value, "api_read_token_env", "") : "";
+    config.metrics_token_env = value.contains("metrics_token_env") ? text(value, "metrics_token_env", "") : "";
+    for (const auto* name : {&config.api_read_token_env, &config.metrics_token_env})
+        if (!name->empty() && (!env_name(*name) || *name == config.api_token_env))
+            throw std::invalid_argument("token variables must be distinct environment variable names");
+    if (!config.api_read_token_env.empty() && config.api_read_token_env == config.metrics_token_env)
+        throw std::invalid_argument("token variables must be distinct environment variable names");
+    config.control_allow = networks(value, "control_allow", {});
+    config.metrics_host = text(value, "metrics_host", config.metrics_host);
+    if (!numeric_ip(config.metrics_host)) throw std::invalid_argument("metrics_host must be a numeric IP address");
+    config.metrics_port = static_cast<std::uint16_t>(number(value, "metrics_port", config.metrics_port, 0, 65535));
+    config.metrics_allow = networks(value, "metrics_allow", config.metrics_allow);
+    if (config.metrics_port != 0) {
+        if (config.metrics_token_env.empty() && config.metrics_allow.empty())
+            throw std::invalid_argument("metrics listener needs metrics_token_env or a non-empty metrics_allow");
+        if (!loopback(config.metrics_host) && config.metrics_token_env.empty() && !value.contains("metrics_allow"))
+            throw std::invalid_argument("non-loopback metrics_host requires metrics_token_env or an explicit metrics_allow");
+        if (overlaps(config.metrics_host, config.metrics_port, config.proxy_host, config.proxy_port) ||
+            overlaps(config.metrics_host, config.metrics_port, config.control_host, config.control_port) ||
+            config.metrics_port == config.fallback_port)
+            throw std::invalid_argument("metrics listener endpoint overlaps another listener");
+    }
     config.tls_domain = text(value, "tls_domain", "");
     if (!valid_domain(config.tls_domain)) throw std::invalid_argument("tls_domain must be a DNS hostname");
     const auto tag = text(value, "ad_tag", "");
@@ -149,12 +216,21 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     if (value.contains("me_secret_path")) config.me_secret_path = resolve(base, text(value, "me_secret_path", ""));
     if (config.me_config_path.empty() != config.me_secret_path.empty())
         throw std::invalid_argument("me_config_path and me_secret_path must be provided together");
+    config.unique_ip_min_bytes = number(value, "unique_ip_min_bytes", config.unique_ip_min_bytes, 0, 1ULL << 40);
     if (value.contains("unique_ip_stats_path")) {
         config.unique_ip_stats_path = resolve(base, text(value, "unique_ip_stats_path", ""));
         if (config.unique_ip_stats_path == config.users_path ||
             config.unique_ip_stats_path == config.me_config_path ||
             config.unique_ip_stats_path == config.me_secret_path)
             throw std::invalid_argument("unique IP statistics must use a separate file");
+    }
+    if (value.contains("usage_state_path")) {
+        config.usage_state_path = resolve(base, text(value, "usage_state_path", ""));
+        if (config.usage_state_path == config.users_path ||
+            config.usage_state_path == config.me_config_path ||
+            config.usage_state_path == config.me_secret_path ||
+            (!config.usage_state_path.empty() && config.usage_state_path == config.unique_ip_stats_path))
+            throw std::invalid_argument("usage state must use a separate file");
     }
     config.workers = static_cast<std::uint32_t>(number(value, "workers", 0, 0, 256));
     config.me_connections_per_dc = static_cast<std::uint32_t>(
@@ -232,4 +308,67 @@ Config Config::load(const std::filesystem::path& path) {
         throw std::invalid_argument("invalid JSON configuration");
     }
 }
+nlohmann::json Config::public_view() const {
+    nlohmann::json dcs = nlohmann::json::array();
+    for (const auto dc : direct_fallback_dcs) dcs.push_back(dc);
+    return {
+        {"proxy_host", proxy_host},
+        {"proxy_port", proxy_port},
+        {"public_host", public_host},
+        {"public_port", public_port},
+        {"control_host", control_host},
+        {"control_port", control_port},
+        {"allow_remote_control", allow_remote_control},
+        {"control_allow", control_allow},
+        {"metrics_host", metrics_host},
+        {"metrics_port", metrics_port},
+        {"metrics_allow", metrics_allow},
+        {"api_token_env", api_token_env},
+        {"api_read_token_env", api_read_token_env},
+        {"metrics_token_env", metrics_token_env},
+        {"fallback_host", fallback_host},
+        {"fallback_port", fallback_port},
+        {"masking", masking},
+        {"tls_domain", tls_domain},
+        {"ad_tag_set", std::any_of(ad_tag.begin(), ad_tag.end(), [](auto b) { return b != 0; })},
+        {"users_path", users_path.string()},
+        {"unique_ip_stats_path", unique_ip_stats_path.string()},
+        {"usage_state_path", usage_state_path.string()},
+        {"unique_ip_min_bytes", unique_ip_min_bytes},
+        {"me_config_path", me_config_path.string()},
+        {"me_secret_path", me_secret_path.string()},
+        {"workers", workers},
+        {"max_connections", max_connections},
+        {"me_connections_per_dc", me_connections_per_dc},
+        {"me_clients_per_writer", me_clients_per_writer},
+        {"max_handshakes", max_handshakes},
+        {"max_frame_bytes", max_frame_bytes},
+        {"connection_queue_bytes", connection_queue_bytes},
+        {"global_buffer_bytes", global_buffer_bytes},
+        {"handshake_timeout_seconds", handshake_timeout.count()},
+        {"idle_timeout_seconds", idle_timeout.count()},
+        {"shutdown_timeout_seconds", shutdown_timeout.count()},
+        {"metadata_refresh_seconds", metadata_refresh.count()},
+        {"direct_fallback_enabled", direct_fallback_enabled},
+        {"direct_fallback_dcs", std::move(dcs)}};
+}
+
+nlohmann::json Config::security_posture() const {
+    const bool metrics_on = metrics_port != 0;
+    return {
+        {"api", {{"host", control_host},
+                 {"loopback_only", loopback(control_host)},
+                 {"read_token", !api_read_token_env.empty()},
+                 {"allowlist_entries", control_allow.size()}}},
+        {"metrics", {{"enabled", metrics_on},
+                     {"host", metrics_on ? nlohmann::json(metrics_host) : nlohmann::json(nullptr)},
+                     {"loopback_only", metrics_on && loopback(metrics_host)},
+                     {"token", metrics_on && !metrics_token_env.empty()},
+                     {"allowlist_entries", metrics_allow.size()}}},
+        {"masking", masking},
+        {"tls_domain_set", !tls_domain.empty()},
+        {"global_connection_cap", max_connections != 0},
+        {"handshake_cap", max_handshakes != 0}};
+}
+
 } // namespace mtdd

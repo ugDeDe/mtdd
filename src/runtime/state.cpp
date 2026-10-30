@@ -54,6 +54,12 @@ void Runtime::Impl::apply_user_snapshot(bool initial) {
             const auto* user = users_snapshot_->find(client->user_name);
             if (user == nullptr || !user->enabled || user->generation != client->generation) {
                 obsolete.push_back(token);
+                continue;
+            }
+            // A live PATCH of the rate limits applies to open sessions too.
+            load_client_rates(*client, *user);
+            if (client->rate_pause_c2s || client->rate_pause_s2c) {
+                next_rate_resume_ = Clock::now();  // re-evaluate against the new rate
             }
         }
         for (const std::uint64_t token : obsolete) {

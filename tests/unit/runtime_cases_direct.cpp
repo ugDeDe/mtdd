@@ -866,7 +866,8 @@ TEST(Runtime, PerUserConnectionCapIsGlobalAcrossReactors) {
     }
     EXPECT_EQ(established, 1U) << "per-user cap admitted more than one session";
     EXPECT_EQ(daemon.services.stats.snapshot().users.at("alice").active_connections, 1U);
-    EXPECT_GE(stat_counter(daemon.services.stats, "rejected", "overload"), kAttempts - 1);
+    EXPECT_GE(stat_counter(daemon.services.stats, "rejected", "user_connection_limit"),
+              kAttempts - 1);
 
     const auto counts = daemon.accepted_per_worker();
     EXPECT_EQ(std::accumulate(counts.begin(), counts.end(), std::uint64_t{0}), kAttempts);

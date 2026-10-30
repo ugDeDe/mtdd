@@ -200,6 +200,7 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
                              ? pool_budget
                              : std::min<std::size_t>(config_.max_connections,
                                                      pool_budget);
+    stats_.set_unique_ip_min_bytes(config_.unique_ip_min_bytes);
     setup();
 }
 
@@ -461,6 +462,8 @@ void Runtime::Impl::run() {
                     lifecycle.allocations.load(std::memory_order_relaxed),
                     lifecycle.reuses.load(std::memory_order_relaxed));
                 next_gauge_ = now + std::chrono::seconds(1);
+                // Expiry and quota are time/traffic driven, not snapshot driven.
+                sweep_user_policy(now);
             }
 
             const int timeout = wait_timeout_ms(now);
@@ -508,6 +511,7 @@ void Runtime::Impl::run() {
             }
             process_deferred();
             process_deadlines(Clock::now());
+            if (!rate_clients_.empty()) process_rate_resumes(Clock::now());
             // O(eof/fin clients) work after the batch, not a full client scan.
             // This makes a drained EOF close prompt instead of waiting for the
             // 150 ms housekeeping tick.
@@ -585,8 +589,14 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // not read further, so shaping never turns into a queue-overflow close.
     const bool media_hold = client.media_throttled &&
                             client.c2s_capacity >= config_.connection_queue_bytes;
+    // A rate-limited direction stops reading its source. On the ME route the
+    // shared ME socket cannot be paused per user, so a drained s2c bucket
+    // throttles the requests that drive downloads (c2s) instead.
+    const bool rate_paused =
+        client.rate_pause_c2s ||
+        (client.rate_pause_s2c && client.route != Client::Route::direct);
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested && !media_hold) {
+        !client.close_requested && !media_hold && !rate_paused) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
@@ -643,6 +653,7 @@ int Runtime::Impl::wait_timeout_ms(Time now) const {
         if (eof_wake < limit) limit = eof_wake;
     }
     if (!media_throttled_.empty() && next_media_check_ < limit) limit = next_media_check_;
+    if (next_rate_resume_ < limit) limit = next_rate_resume_;
     if (stopping_ && shutdown_deadline_ < limit) limit = shutdown_deadline_;
     if (limit <= now) return 0;
     // Round a positive sub-millisecond delay up: truncating it to 0 would turn

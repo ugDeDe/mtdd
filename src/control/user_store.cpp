@@ -188,6 +188,73 @@ bool UserStore::is_valid_secret_hex(std::string_view secret) noexcept {
   return true;
 }
 
+namespace {
+
+// Printable UTF-8 only: no C0/C1 controls, no overlongs or surrogates. JSON
+// serialization would throw on invalid UTF-8, and controls would let a note
+// rewrite the operator's terminal in the launcher.
+bool printable_utf8(std::string_view text) {
+  size_t i = 0;
+  while (i < text.size()) {
+    const auto lead = static_cast<unsigned char>(text[i]);
+    if (lead < 0x80) {
+      if (lead < 0x20 || lead == 0x7f) return false;
+      ++i;
+      continue;
+    }
+    size_t extra = 0;
+    uint32_t code = 0;
+    if ((lead & 0xe0) == 0xc0) { extra = 1; code = lead & 0x1fu; }
+    else if ((lead & 0xf0) == 0xe0) { extra = 2; code = lead & 0x0fu; }
+    else if ((lead & 0xf8) == 0xf0) { extra = 3; code = lead & 0x07u; }
+    else return false;
+    if (text.size() - i <= extra) return false;
+    for (size_t k = 1; k <= extra; ++k) {
+      const auto next = static_cast<unsigned char>(text[i + k]);
+      if ((next & 0xc0) != 0x80) return false;
+      code = (code << 6) | (next & 0x3fu);
+    }
+    static constexpr uint32_t kMinimum[] = {0, 0x80, 0x800, 0x10000};
+    if (code < kMinimum[extra] || code > 0x10ffff ||
+        (code >= 0xd800 && code <= 0xdfff) || (code >= 0x80 && code < 0xa0)) {
+      return false;
+    }
+    i += extra + 1;
+  }
+  return true;
+}
+
+}  // namespace
+
+std::optional<std::string> UserStore::validate_policy(const UserPolicy& policy) {
+  if (policy.expires_at &&
+      (*policy.expires_at < 0 || *policy.expires_at > kMaxExpiresAt)) {
+    return "expires_at must be between 1970-01-01 and 9999-12-31";
+  }
+  if (policy.data_quota_bytes &&
+      (*policy.data_quota_bytes == 0 || *policy.data_quota_bytes > kMaxQuotaBytes)) {
+    return "data_quota_bytes must be null or 1.." + std::to_string(kMaxQuotaBytes);
+  }
+  if (policy.max_unique_ips &&
+      (*policy.max_unique_ips == 0 || *policy.max_unique_ips > kMaxUniqueIpsLimit)) {
+    return "max_unique_ips must be null or 1.." + std::to_string(kMaxUniqueIpsLimit);
+  }
+  for (const auto& rate : {policy.rate_limit_up_bytes_per_sec,
+                           policy.rate_limit_down_bytes_per_sec}) {
+    if (rate && (*rate < kMinRateLimitBytesPerSecond ||
+                 *rate > kMaxRateLimitBytesPerSecond)) {
+      return "rate limits must be null or " +
+             std::to_string(kMinRateLimitBytesPerSecond) + ".." +
+             std::to_string(kMaxRateLimitBytesPerSecond) + " bytes per second";
+    }
+  }
+  if (policy.note.size() > kMaxNoteBytes || !printable_utf8(policy.note)) {
+    return "note must be at most " + std::to_string(kMaxNoteBytes) +
+           " bytes of printable UTF-8";
+  }
+  return std::nullopt;
+}
+
 Result<UserStore> UserStore::open(std::string path, StoreOptions options) {
   if (path.empty()) {
     return Error{ErrorCode::invalid_config, "users path must not be empty"};
@@ -327,6 +394,9 @@ Result<MutationOutcome> UserStore::create_user(const CreateUserRequest& request)
                  "max_connections must be within 1.." +
                      std::to_string(kMaxConnectionsLimit)};
   }
+  if (auto reason = validate_policy(request.policy)) {
+    return Error{ErrorCode::invalid_field, *reason};
+  }
 
   std::unique_lock<std::mutex> lock(impl_->mutex);
   if (impl_->uncertain) {
@@ -369,6 +439,7 @@ Result<MutationOutcome> UserStore::create_user(const CreateUserRequest& request)
   record.secret_hex = secret;
   record.enabled = request.enabled;
   record.max_connections = request.max_connections;
+  record.policy = request.policy;
   record.generation = 1;
 
   std::vector<UserRecord> users = current->users;
@@ -389,9 +460,10 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
     return Error{ErrorCode::invalid_name,
                  "name must match [A-Za-z0-9_.-]{1,64}"};
   }
-  if (!request.enabled && !request.set_max_connections) {
+  if (!request.enabled && !request.set_max_connections &&
+      request.policy.empty()) {
     return Error{ErrorCode::invalid_request,
-                 "update requires enabled or max_connections"};
+                 "update requires at least one field"};
   }
   if (request.set_max_connections && request.max_connections &&
       (*request.max_connections == 0 ||
@@ -426,12 +498,28 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
   if (request.set_max_connections) {
     updated.max_connections = request.max_connections;
   }
+  const UserPolicyPatch& patch = request.policy;
+  UserPolicy& policy = updated.policy;
+  if (patch.expires_at) policy.expires_at = *patch.expires_at;
+  if (patch.data_quota_bytes) policy.data_quota_bytes = *patch.data_quota_bytes;
+  if (patch.max_unique_ips) policy.max_unique_ips = *patch.max_unique_ips;
+  if (patch.rate_limit_up_bytes_per_sec) {
+    policy.rate_limit_up_bytes_per_sec = *patch.rate_limit_up_bytes_per_sec;
+  }
+  if (patch.rate_limit_down_bytes_per_sec) {
+    policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
+  }
+  if (patch.note) policy.note = *patch.note;
+  if (auto reason = validate_policy(policy)) {
+    return Error{ErrorCode::invalid_field, *reason};
+  }
 
   MutationOutcome outcome;
   outcome.user = updated;
   if (!auth_change &&
       updated.enabled == existing->enabled &&
-      updated.max_connections == existing->max_connections) {
+      updated.max_connections == existing->max_connections &&
+      updated.policy == existing->policy) {
     // No-op update: do not advance the revision or rewrite the file.
     outcome.revision = current->revision;
     outcome.applied = true;

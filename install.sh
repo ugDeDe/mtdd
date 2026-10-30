@@ -192,6 +192,10 @@ mtdd — установка и управление MTProto-прокси
   users enable|disable ИМЯ        Включить или отключить пользователя
   users remove ИМЯ [--yes]        Удалить пользователя (без подтверждения с --yes)
   users rotate ИМЯ                Заменить секрет и показать новую ссылку
+  users show ИМЯ                  Политики и статистика пользователя
+  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости, заметка (none — снять)
+  users reset-quota ИМЯ           Сбросить использованную квоту
+  users audit [N]                 Последние N событий журнала аудита
   links [ИМЯ]                     Ссылки подключения (все или одного)
   rotate ИМЯ                      То же, что users rotate
   metrics [--watch]               Дашборд: соединения, буферы, ME/DC, RTT, IP, графики
@@ -362,17 +366,30 @@ token_read() {
     printf '%s' "$token"
 }
 
-api() { # api МЕТОД ПУТЬ [JSON-ТЕЛО] — печатает тело ответа или завершается ошибкой
-    local method=$1 path=$2 body=${3-} token host port
+api_request() { # api_request ФЛАГ_CURL|'' МЕТОД ПУТЬ [JSON-ТЕЛО]
+    local flag=$1 method=$2 path=$3 body=${4-} token host port
     token=$(token_read) || return 1
     host=$(cfg_get control_host 127.0.0.1)
     port=$(cfg_get control_port 9090)
     [[ $host == 0.0.0.0 || $host == '::' || $host == '*' ]] && host=127.0.0.1
     [[ $host == *:* ]] && host="[$host]"
     local -a extra=()
-    [[ -n $body ]] && extra+=(-H 'Content-Type: application/json' -d "$body")
-    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer $token" \
+    [[ -n $flag ]] && extra+=("$flag")
+    if [[ -n $body ]]; then
+        extra+=(-H 'Content-Type: application/json' -d "$body")
+    elif [[ -z $flag && $method == POST ]]; then
+        extra+=(-d '') # пустое тело действия: Content-Length: 0
+    fi
+    curl -sS --max-time 10 -X "$method" -H "Authorization: Bearer $token" \
         "${extra[@]}" "http://${host}:${port}${path}"
+}
+
+api() { # api МЕТОД ПУТЬ [JSON-ТЕЛО] — печатает тело ответа или завершается ошибкой
+    api_request -f "$@"
+}
+
+api_try() { # как api, но без -f: тело ошибки сервера доступно вызывающему
+    api_request '' "$@"
 }
 
 api_fields() { # api_fields JSON — краткая сводка ключевых полей data
@@ -568,6 +585,250 @@ cmd_users_rotate() {
     warn 'Передайте пользователю новую ссылку.'
 }
 
+# ---------------------------------------------------------------------------
+# Политики пользователей: срок, квота, лимиты, заметка, журнал аудита
+# ---------------------------------------------------------------------------
+policy_body() { # policy_body ПОЛЕ ЗНАЧЕНИЕ — печатает JSON-тело PATCH или причину отказа (код 1)
+    python3 - "${1-}" "${2-}" <<'PY'
+import datetime
+import json
+import re
+import sys
+from decimal import Decimal
+
+field, raw = sys.argv[1], sys.argv[2].strip()
+CLEAR = ("", "none", "null", "off", "-", "нет")
+UNITS = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+INT63 = 2 ** 63 - 1
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_size(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:([kmgt])(?:i?b)?|b)?", text, re.I)
+    if not m:
+        fail("Неверный размер «{}»: примеры 500M, 10G, 1T или число байт".format(text))
+    number = Decimal(m.group(1)) * UNITS[(m.group(2) or "").lower()]
+    if number != number.to_integral_value():
+        fail("Размер должен быть целым числом байт")
+    value = int(number)
+    if value > INT63:
+        fail("Слишком большой размер")
+    return value
+
+
+def parse_expiry(text):
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            datetime.date.fromisoformat(text)
+        except ValueError:
+            fail("Нет такой даты: " + text)
+        return text + "T23:59:59Z"
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})", text)
+    if not m:
+        fail("Дата: ГГГГ-ММ-ДД, RFC 3339 (2030-01-01T00:00:00Z) или none для снятия срока")
+    try:
+        datetime.date.fromisoformat(m.group(1))
+        ok = int(m.group(2)) < 24 and int(m.group(3)) < 60 and int(m.group(4)) < 60
+        zone = m.group(6)
+        if zone[0] in "+-":
+            ok = ok and int(zone[1:3]) < 24 and int(zone[4:6]) < 60
+    except ValueError:
+        ok = False
+    if not ok:
+        fail("Некорректная дата или время: " + text)
+    return text.upper()
+
+
+if field == "expires_at":
+    value = None if raw.lower() in CLEAR else parse_expiry(raw)
+elif field == "data_quota_bytes":
+    value = None if raw.lower() in CLEAR else parse_size(raw)
+    if value is not None and value < 1:
+        fail("Квота должна быть не меньше 1 байта")
+elif field in ("rate_limit_up_bytes_per_sec", "rate_limit_down_bytes_per_sec"):
+    value = None if raw.lower() in CLEAR else parse_size(raw)
+    if value is not None and value < 1024:
+        fail("Лимит скорости должен быть не меньше 1K (1024 байт/с)")
+elif field == "max_unique_ips":
+    if raw.lower() in CLEAR:
+        value = None
+    else:
+        if not re.fullmatch(r"\d{1,10}", raw) or not 1 <= int(raw) <= 2 ** 32 - 1:
+            fail("Лимит IP: целое число от 1 до 4294967295 или none")
+        value = int(raw)
+elif field == "note":
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError:
+        fail("Заметка содержит некорректные символы")
+    if len(raw) > 256:
+        fail("Заметка: не более 256 символов")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        fail("Заметка не должна содержать управляющие символы")
+    value = raw
+else:
+    fail("Неизвестное поле: " + field)
+print(json.dumps({field: value}, ensure_ascii=True, separators=(",", ":")))
+PY
+}
+
+api_check() { # api_check ОТВЕТ — 0 если {"ok":true}; иначе печатает сообщение сервера и возвращает 1
+    printf '%s' "${1-}" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except Exception:
+    print("  ответ сервера не разобран" if raw.strip() else "  пустой ответ сервера", file=sys.stderr)
+    sys.exit(1)
+if doc.get("ok") is True:
+    sys.exit(0)
+error = doc.get("error") or {}
+print("  {}: {}".format(error.get("type", "error"), error.get("message", "неизвестная ошибка")), file=sys.stderr)
+sys.exit(1)
+'
+}
+
+cmd_users_set() { # cmd_users_set ИМЯ ПОЛЕ ЗНАЧЕНИЕ — изменить одно поле политики
+    local name=${1-} field=${2-} value=${3-} body response msg
+    valid_user_name "$name" || { err 'Неверное имя пользователя'; return 1; }
+    body=$(policy_body "$field" "$value" 2>&1) || { err "$body"; return 1; }
+    response=$(api_try PATCH "/v1/users/$name" "$body" 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    msg=$(api_check "$response" 2>&1) || { err "Не удалось изменить $name:${msg}"; return 1; }
+    ok "Пользователь $name: $field обновлён"
+}
+
+cmd_users_action() { # cmd_users_action ИМЯ enable|disable|reset-quota
+    local name=${1-} action=${2-} response msg
+    valid_user_name "$name" || { err 'Неверное имя пользователя'; return 1; }
+    response=$(api_try POST "/v1/users/$name/$action" 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    msg=$(api_check "$response" 2>&1) || { err "Не удалось выполнить $action для $name:${msg}"; return 1; }
+    case $action in
+        enable) ok "Пользователь $name включён" ;;
+        disable) ok "Пользователь $name отключён · активные сессии отозваны" ;;
+        reset-quota) ok "Использованная квота $name сброшена" ;;
+        *) ok "Пользователь $name: $action выполнен" ;;
+    esac
+}
+
+cmd_users_show() { # cmd_users_show ИМЯ — подробности и политики
+    local name=${1-} response rows label value
+    valid_user_name "$name" || { err 'Неверное имя пользователя'; return 1; }
+    response=$(api_try GET "/v1/users/$name" 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    api_check "$response" 2>/dev/null || { err "Не удалось получить $name:$(api_check "$response" 2>&1 || true)"; return 1; }
+    rows=$(printf '%s' "$response" | python3 -c '
+import datetime
+import json
+import sys
+
+doc = json.load(sys.stdin)
+data = doc.get("data") or {}
+user = data.get("user") or {}
+stats = user.get("stats") or data.get("stats") or {}
+
+
+def size(n):
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return "{} B".format(int(value)) if unit == "B" else "{:.1f} {}".format(value, unit)
+        value /= 1024
+
+
+def expiry(v):
+    if v is None:
+        return "бессрочно"
+    text = str(v)
+    try:
+        when = datetime.datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        mark = " · истёк" if when < datetime.datetime.now(datetime.timezone.utc) else ""
+        return "{}{}".format(text.replace("T", " ").replace("Z", " UTC"), mark)
+    except ValueError:
+        return text
+
+
+def quota(limit, used):
+    if limit is None:
+        return "без лимита" + (" · использовано {}".format(size(used)) if used is not None else "")
+    if used is None:
+        return size(limit)
+    return "{} / {} ({:.0f}%)".format(size(used), size(limit), 100.0 * used / limit if limit else 0)
+
+
+def rate(v):
+    return "без лимита" if v is None else size(v) + "/s"
+
+
+used = user.get("quota_used_bytes", data.get("quota_used_bytes", stats.get("quota_used_bytes")))
+rows = [
+    ("Имя", user.get("name", "?")),
+    ("Состояние", "включён" if user.get("enabled") else "отключён"),
+    ("Срок действия", expiry(user.get("expires_at"))),
+    ("Квота трафика", quota(user.get("data_quota_bytes"), used)),
+    ("Лимит IP", "без лимита" if user.get("max_unique_ips") is None else str(user["max_unique_ips"])),
+    ("Скорость ↑", rate(user.get("rate_limit_up_bytes_per_sec"))),
+    ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
+    ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
+    ("Заметка", user.get("note") or "—"),
+    ("Соединений", str(stats.get("active_connections", 0))),
+    ("Уникальных IP", str(stats.get("unique_ips_active", 0))),
+]
+for label, value in rows:
+    print("{}\t{}".format(label, str(value).replace("\n", " ")))
+') || { err "Не удалось разобрать данные $name"; return 1; }
+    section "Пользователь · $name"
+    while IFS=$'\t' read -r label value; do
+        kv "$label" "$value"
+    done <<<"$rows"
+}
+
+cmd_audit() { # cmd_audit [ЧИСЛО] — последние события журнала аудита
+    local limit=${1:-20} response
+    [[ $limit =~ ^[0-9]{1,3}$ ]] && ((10#$limit >= 1 && 10#$limit <= 256)) || { err 'Использование: users audit [1–256]'; return 1; }
+    response=$(api_try GET "/v1/events?limit=$((10#$limit))" 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    api_check "$response" 2>/dev/null || { err "Не удалось получить журнал:$(api_check "$response" 2>&1 || true)"; return 1; }
+    printf '%s' "$response" | python3 -c '
+import datetime
+import json
+import sys
+
+events = (json.load(sys.stdin).get("data") or {}).get("events") or []
+if not events:
+    print("  Событий нет")
+    sys.exit(0)
+
+
+def when(v):
+    if isinstance(v, (int, float)):
+        v = v / 1000.0 if v > 1e11 else v
+        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+    return str(v).replace("T", " ").rstrip("Zz")[:19]
+
+
+print("  {:<19}  {:<18} {:<16} {}".format("Время (UTC)", "Действие", "Пользователь", "Поля"))
+for e in events:
+    fields = e.get("fields") or []
+    if isinstance(fields, dict):
+        text = ", ".join("{}={}".format(k, fields[k]) for k in sorted(fields))
+    elif isinstance(fields, list):
+        text = ", ".join(str(f) for f in fields)
+    else:
+        text = str(fields)
+    print("  {:<19}  {:<18} {:<16} {}".format(
+        when(e.get("at", "")), str(e.get("action", "?")), str(e.get("user") or "—"), text.replace("\n", " ")))
+' || { err 'Не удалось разобрать журнал'; return 1; }
+}
+
 cmd_users() {
     local action=${1-list}
     case $action in
@@ -588,8 +849,19 @@ cmd_users() {
         rotate)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users rotate ИМЯ'; return 1; }
             cmd_users_rotate "${cargs[1]}" ;;
+        show)
+            ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users show ИМЯ'; return 1; }
+            cmd_users_show "${cargs[1]}" ;;
+        set)
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
+            cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
+        reset-quota)
+            ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
+            cmd_users_action "${cargs[1]}" reset-quota ;;
+        audit)
+            cmd_audit "${cargs[1]-}" ;;
         *)
-            err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate)"
+            err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate|show|set|reset-quota|audit)"
             return 1 ;;
     esac
 }
@@ -621,13 +893,20 @@ metrics_python() {
     cat <<'PY'
 import json
 import os
+import re
+import shutil
 import sys
+import textwrap
 import time
 import unicodedata
 
+# Цвета приходят из bash; без MTDD_COLOR=1 (NO_COLOR, не TTY) они пустые,
+# и статус передаётся только символами и текстом.
+COLOR = os.environ.get("MTDD_COLOR") == "1"
+
 
 def c(name):
-    return os.environ.get("MTDD_C_" + name, "")
+    return os.environ.get("MTDD_C_" + name, "") if COLOR else ""
 
 
 RESET = c("RESET")
@@ -639,43 +918,83 @@ VIOLET = c("VIOLET")
 GREEN = c("GREEN")
 YELLOW = c("YELLOW")
 RED = c("RED")
-COLOR = os.environ.get("MTDD_COLOR") == "1"
-WIDTH = 72
-GRAPH_WIDTH = 34
+
+# 8 уровней в одной строке; 3 строки дают 24
 BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+GRAPH_ROWS = 3
+LEVELS = GRAPH_ROWS * len(BLOCKS)
+# минимальная ширина карточки KPI
+CARD_MIN = 28
+HISTORY_POINTS = 120
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+# Статус: (символ, цвет). Символ есть всегда — цвет его только усиливает.
+STATUS = {
+    "ok": ("\u2713", GREEN),
+    "warn": ("!", YELLOW),
+    "bad": ("\u2717", RED),
+    "na": ("\u00b7", GRAY),
+}
+
+
+def term_width():
+    # Ширина области вывода: на колонку уже терминала, чтобы не переносилось.
+    cols = shutil.get_terminal_size((80, 24)).columns
+    return max(38, min(119, cols - 1))
+
+
+WIDTH = term_width()
+# ширина содержимого после отступа в 2 пробела
+AVAIL = WIDTH - 2
+
+
+# --- Текст и ширина -------------------------------------------------------
+
+def char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def width(text):
-    total = 0
-    for ch in text:
-        if unicodedata.combining(ch):
-            continue
-        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-    return total
+    return sum(char_width(ch) for ch in ANSI.sub("", text))
 
 
 def pad(text, size):
     return text + " " * max(0, size - width(text))
 
 
+def rpad(text, size):
+    return " " * max(0, size - width(text)) + text
+
+
+def clip(text, size):
+    # Обрезает по отображаемой ширине, не ломая ANSI-последовательности.
+    if width(text) <= size:
+        return text
+    out, used = [], 0
+    for part in re.split(r"(\033\[[0-9;]*m)", text):
+        if ANSI.fullmatch(part):
+            out.append(part)
+            continue
+        for ch in part:
+            if used + char_width(ch) > size - 1:
+                return "".join(out) + "\u2026" + RESET
+            out.append(ch)
+            used += char_width(ch)
+    return "".join(out)
+
+
 def cell(text, size, color=""):
-    body = pad(text, size)
+    body = pad(clip(text, size), size)
     return (color + body + RESET) if color else body
 
 
-def rule():
-    return GRAY + "\u2500" * WIDTH + RESET
-
-
-def section(title):
-    return "\n  " + VIOLET + "\u258c" + RESET + " " + BOLD + title + RESET + "\n  " + rule()
-
-
-def row2(l1, v1, l2="", v2=""):
-    out = "  " + GRAY + pad(l1, 19) + RESET + pad(str(v1), 11)
-    if l2:
-        out += GRAY + pad(l2, 19) + RESET + pad(str(v2), 11)
-    return out.rstrip()
+def spread(left, right, size):
+    # left у левого края, right у правого, в одну строку шириной size.
+    right_w = width(right)
+    left = clip(left, max(1, size - right_w - 1))
+    return left + " " * max(1, size - width(left) - right_w) + right
 
 
 def plural(count, one, few, many):
@@ -685,10 +1004,6 @@ def plural(count, one, few, many):
     if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
         return few
     return many
-
-
-def note(text):
-    return "  " + DIM + text + RESET
 
 
 def num(value):
@@ -713,6 +1028,14 @@ def human(size):
     return "{:.0f} B".format(size)
 
 
+def human_rate(value):
+    return human(value) + "/\u0441"
+
+
+def ms(value):
+    return "{:.0f} ms".format(value)
+
+
 def human_duration(seconds):
     try:
         seconds = int(seconds)
@@ -730,6 +1053,75 @@ def human_duration(seconds):
     return "{} \u0441".format(secs)
 
 
+# --- Оформление: статусы, секции, заметки ----------------------------------
+
+def badge(status):
+    symbol, color = STATUS[status]
+    return color + BOLD + symbol + RESET
+
+
+def status_text(status, text):
+    return badge(status) + " " + STATUS[status][1] + text + RESET
+
+
+def rtt_status(value):
+    if value is None:
+        return "na"
+    return "ok" if value < 80 else ("warn" if value < 150 else "bad")
+
+
+def rtt_color(value):
+    return STATUS[rtt_status(value)][1]
+
+
+def section(title):
+    return (
+        "\n  " + VIOLET + "\u258c" + RESET + " " + BOLD + clip(title, AVAIL - 2) + RESET
+        + "\n  " + GRAY + "\u2500" * AVAIL + RESET
+    )
+
+
+def note(text):
+    return "  " + DIM + clip(text, AVAIL) + RESET
+
+
+def wrap_note(text):
+    # Длинную заметку переносит по словам на несколько строк.
+    return [note(line) for line in textwrap.wrap(text, AVAIL)]
+
+
+def wrap_items(items):
+    # Элементы через « · » с переносом по ширине (для сводок в одну-две строки).
+    lines, current = [], ""
+    for item in items:
+        candidate = (current + " \u00b7 " + item) if current else item
+        if current and width(candidate) > AVAIL:
+            lines.append(current)
+            current = item
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return [note(line) for line in lines]
+
+
+def pairs(items):
+    # Пары «подпись — значение»: две колонки на широком экране, одна на узком.
+    cols = 3 if AVAIL >= 100 else (2 if AVAIL >= 60 else 1)
+    col_w = AVAIL // cols
+    label_w = 18
+    out = []
+    for start in range(0, len(items), cols):
+        line = "  "
+        for label, value in items[start:start + cols]:
+            line += GRAY + pad(clip(label, label_w), label_w) + RESET
+            line += cell(str(value), col_w - label_w)
+        out.append(line.rstrip())
+    return out
+
+
+# --- Разбор данных -----------------------------------------------------------
+
 def load_prom(path):
     series = {}
     if not path:
@@ -738,9 +1130,7 @@ def load_prom(path):
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if " " not in line:
+                if not line or line.startswith("#") or " " not in line:
                     continue
                 key, rest = line.split(" ", 1)
                 labels = {}
@@ -778,6 +1168,7 @@ def history_path():
 
 
 def history_load(path):
+    # TSV из 8 колонок; строки другого вида (старые/битые) пропускаются.
     rows = []
     if not path:
         return rows
@@ -819,10 +1210,9 @@ def sample(data, force=False):
     if not force and rows and now - rows[-1][0] < interval:
         return
     me = data.get("me") or {}
-    dcs = me.get("dcs") or []
     traffic = 0.0
     rtts = []
-    for dc in dcs:
+    for dc in me.get("dcs") or []:
         traffic += float(dc.get("rx_bytes_total", 0)) + float(dc.get("tx_bytes_total", 0))
         if dc.get("connected") and dc.get("ping_rtt_us"):
             rtts.append(float(dc["ping_rtt_us"]) / 1000.0)
@@ -848,41 +1238,6 @@ def sample(data, force=False):
         pass
 
 
-def spark(values, size=GRAPH_WIDTH, zero=True):
-    vals = values[-size:]
-    if not vals:
-        return DIM + "\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445" + RESET
-    low = 0.0 if zero else min(vals)
-    high = max(vals)
-    if high <= low:
-        high = low + 1.0
-    out = []
-    last = max(1, len(vals) - 1)
-    for index, value in enumerate(vals):
-        ratio = (value - low) / (high - low)
-        block = BLOCKS[max(0, min(7, int(ratio * 7.999)))]
-        if COLOR:
-            shade = 45 + int(index * 96 / last)
-            out.append("\033[38;5;{}m{}".format(shade, block))
-        else:
-            out.append(block)
-    return "".join(out) + (RESET if COLOR else "")
-
-
-def graph(label, values, summary, zero=True):
-    return (
-        "  "
-        + GRAY
-        + pad(label, 14)
-        + RESET
-        + spark(values, GRAPH_WIDTH, zero)
-        + "  "
-        + DIM
-        + summary
-        + RESET
-    )
-
-
 def rate_series(points):
     rates = []
     for prev, cur in zip(points, points[1:]):
@@ -893,358 +1248,516 @@ def rate_series(points):
     return rates
 
 
-def render(data, prom):
-    live = os.environ.get("MTDD_LIVE") == "1"
-    me = data.get("me") or {}
-    dcs = me.get("dcs") or []
-    out = []
+def estimate(node):
+    # Оценка из {"estimate": N} или голого числа; None, если поля нет.
+    if isinstance(node, dict):
+        node = node.get("estimate")
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        return int(node)
+    return None
 
-    clock = time.strftime("%H:%M:%S")
-    if live:
-        right_plain = "\u25cf live \u00b7 2 \u0441  " + clock
-        right = GREEN + "\u25cf live \u00b7 2 \u0441" + RESET + "  " + GRAY + clock + RESET
+
+def period_active(history, key):
+    # «Активные» IP за период: имена полей у разных версий сервера могут отличаться.
+    own = history.get(key)
+    candidates = [history.get(key + "_active")]
+    if isinstance(own, dict):
+        candidates += [own.get("active"), own.get("active_estimate")]
+    for node in candidates:
+        value = estimate(node)
+        if value is not None:
+            return value
+    return None
+
+
+def ip_rows(data, history):
+    # [(подпись, замеченные, активные)] — активные None у старых серверов.
+    now_active = estimate(data.get("unique_ips_active"))
+    now_seen = estimate(data.get("unique_ips_seen"))
+    has_active = now_seen is not None or any(
+        period_active(history, key) is not None for key in ("hour", "day", "week")
+    )
+    if has_active:
+        rows = [("\u0441\u0435\u0439\u0447\u0430\u0441", now_seen, now_active)]
     else:
-        state_plain = "ready" if data.get("ready") else "\u043d\u0435 \u0433\u043e\u0442\u043e\u0432"
-        state_color = GREEN if data.get("ready") else YELLOW
-        right_plain = state_plain + " \u00b7 " + clock
-        right = state_color + state_plain + RESET + " \u00b7 " + GRAY + clock + RESET
-    left_plain = "  \u258c \u041c\u0435\u0442\u0440\u0438\u043a\u0438"
-    gap = max(1, WIDTH - width(left_plain) - width(right_plain))
-    out.append(
-        "\n  "
-        + VIOLET
-        + "\u258c"
-        + RESET
-        + " "
-        + BOLD
-        + "\u041c\u0435\u0442\u0440\u0438\u043a\u0438"
-        + RESET
-        + " " * gap
-        + right
+        rows = [("\u0441\u0435\u0439\u0447\u0430\u0441", now_active, None)]
+    for key, label in (("hour", "\u0447\u0430\u0441"), ("day", "\u0434\u0435\u043d\u044c"), ("week", "\u043d\u0435\u0434\u0435\u043b\u044f")):
+        rows.append((label, estimate(history.get(key)), period_active(history, key)))
+    return rows, has_active
+
+
+def fmt_ip(value, approx):
+    if value is None:
+        return "\u2014"
+    return ("\u2248" if approx else "") + num(value)
+
+
+# --- Карточки KPI ------------------------------------------------------------
+
+def card(title, big, lines, size, body_height):
+    # Рамка ╭─ Заголовок ─╮ с body_height строками внутри.
+    inner = size - 4
+    title = clip(title, size - 6)
+    top = (
+        GRAY + "\u256d\u2500" + RESET + " " + BOLD + title + RESET + " "
+        + GRAY + "\u2500" * (size - width(title) - 5) + "\u256e" + RESET
     )
+    body = [big] + lines
+    body += [""] * (body_height - len(body))
+    out = [top]
+    for text in body:
+        out.append(
+            GRAY + "\u2502" + RESET + " " + pad(clip(text, inner), inner) + " " + GRAY + "\u2502" + RESET
+        )
+    out.append(GRAY + "\u2570" + "\u2500" * (size - 2) + "\u256f" + RESET)
+    return out
+
+
+def card_columns():
+    # Сколько карточек в ряд: 4 на широком терминале, 2 на среднем, 1 на узком.
+    if AVAIL >= 4 * CARD_MIN + 3:
+        return 4
+    if AVAIL >= 2 * CARD_MIN + 1:
+        return 2
+    return 1
+
+
+def render_cards(cards):
+    per_row = card_columns()
+    size = (AVAIL - (per_row - 1)) // per_row
+    out = []
+    for start in range(0, len(cards), per_row):
+        group = cards[start:start + per_row]
+        height = max(1 + len(item[2]) for item in group)
+        boxes = [card(t, big, lines, size, height) for t, big, lines in group]
+        for parts in zip(*boxes):
+            out.append("  " + " ".join(parts))
+    return out
+
+
+def with_status(status, value, unit=""):
+    text = BOLD + value + RESET
+    if unit:
+        text += " " + DIM + unit + RESET
+    if status:
+        text = badge(status) + " " + text
+    return text
+
+
+def connections_card(data):
+    accepted = int(data.get("connections_accepted_total") or 0)
+    rejected = int(data.get("connections_rejected_total") or 0)
+    # Много отказов относительно принятых — повод заглянуть в причины.
+    share = rejected / float(accepted + rejected) if accepted + rejected else 0.0
+    status = "warn" if accepted + rejected >= 20 and share > 0.2 else "ok"
+    return (
+        "\u0421\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f",
+        with_status(status, num(data.get("connections_active")), "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445"),
+        [
+            GRAY + "\u043f\u0440\u0438\u043d\u044f\u0442\u043e " + RESET + num(accepted),
+            GRAY + "\u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u043e " + RESET + num(rejected),
+            GRAY + "\u0440\u0443\u043a\u043e\u043f\u043e\u0436\u0430\u0442\u0438\u0439 " + RESET + num(data.get("handshakes_total")),
+        ],
+    )
+
+
+def ips_card(data, history):
+    rows, has_active = ip_rows(data, history)
+    now = rows[0]
+    if has_active:
+        head = BOLD + fmt_ip(now[2], False) + RESET + " / " + fmt_ip(now[1], False)
+        head += " " + DIM + "\u0430\u043a\u0442. / \u0432\u0438\u0434." + RESET
+    else:
+        head = BOLD + fmt_ip(now[1], False) + RESET + " " + DIM + "\u0441\u0435\u0439\u0447\u0430\u0441" + RESET
+    lines = []
+    for label, seen, active in rows[1:]:
+        if has_active:
+            value = fmt_ip(active, True) + " / " + fmt_ip(seen, True)
+        else:
+            value = fmt_ip(seen, True)
+        lines.append(GRAY + pad(label, 7) + RESET + value)
+    return "\u0423\u043d\u0438\u043a\u0430\u043b\u044c\u043d\u044b\u0435 IP", head, lines
+
+
+def traffic_card(dcs, rates):
+    rx = sum(float(dc.get("rx_bytes_total", 0)) for dc in dcs)
+    tx = sum(float(dc.get("tx_bytes_total", 0)) for dc in dcs)
+    if rates:
+        head = with_status(None, human_rate(rates[-1]))
+        peak = GRAY + "\u043f\u0438\u043a " + RESET + human_rate(max(rates))
+    else:
+        head = DIM + "\u0441\u043e\u0431\u0438\u0440\u0430\u044e \u0438\u0441\u0442\u043e\u0440\u0438\u044e\u2026" + RESET
+        peak = GRAY + "\u043f\u0438\u043a " + RESET + "\u2014"
+    return (
+        "\u0422\u0440\u0430\u0444\u0438\u043a \u0432 \u0441\u0435\u043a\u0443\u043d\u0434\u0443",
+        head,
+        [GRAY + "\u2193 \u043f\u0440\u0438\u043d\u044f\u0442\u043e " + RESET + human(rx), GRAY + "\u2191 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e " + RESET + human(tx), peak],
+    )
+
+
+def rtt_card(dcs):
+    live = [float(dc["ping_rtt_us"]) / 1000.0 for dc in dcs if dc.get("connected") and dc.get("ping_rtt_us")]
+    up = sum(1 for dc in dcs if dc.get("connected"))
+    if live:
+        avg = sum(live) / len(live)
+        head = with_status(rtt_status(avg), ms(avg))
+        spread_text = "{:.0f}\u2013{:.0f} ms".format(min(live), max(live))
+    else:
+        head = with_status("na", "\u2014")
+        spread_text = "\u2014"
+    return (
+        "ME RTT",
+        head,
+        [GRAY + "\u043f\u043e DC " + RESET + spread_text, GRAY + "DC \u0432 \u0441\u0435\u0442\u0438 " + RESET + "{} \u0438\u0437 {}".format(up, len(dcs))],
+    )
+
+
+# --- Графики ------------------------------------------------------------------
+
+def resample(values, size):
+    # Подгоняет ряд под size колонок: растягивает или усредняет по корзинам.
+    count = len(values)
+    if count == size:
+        return list(values)
+    if count < size:
+        return [values[min(count - 1, int(i * count / size))] for i in range(size)]
+    out = []
+    for i in range(size):
+        first = int(i * count / size)
+        last = max(first + 1, int((i + 1) * count / size))
+        chunk = values[first:last]
+        out.append(sum(chunk) / len(chunk))
+    return out
+
+
+def level_of(value, low, high):
+    # Уровень 1..24: минимум 1, чтобы нулевая линия всегда была видна.
+    if high <= low:
+        return LEVELS // 2 if low > 0 else 1
+    ratio = (value - low) / (high - low)
+    return 1 + max(0, min(LEVELS - 1, int(ratio * (LEVELS - 0.001))))
+
+
+def block_for(level, row):
+    # Символ ячейки: row=0 — нижняя строка графика, 2 — верхняя.
+    fill = max(0, min(len(BLOCKS), level - row * len(BLOCKS)))
+    return BLOCKS[fill - 1] if fill else " "
+
+
+def paint_columns(levels, colors, row):
+    out, current = [], None
+    for level, color in zip(levels, colors):
+        if color != current:
+            out.append(RESET + color if current is not None else color)
+            current = color
+        out.append(block_for(level, row))
+    return "".join(out) + (RESET if current else "")
+
+
+def bounds(values, ranged=False):
+    # Границы оси: от нуля, если разброс большой, иначе от минимума ряда.
+    #
+    # ranged=True — всегда от минимума (RTT: ноль на оси ничего не говорит).
+    high = max(values)
+    low = min(values) if ranged or min(values) >= 0.5 * high else 0.0
+    return low, high
+
+
+def graph(title, values, fmt, axis, color_of=None, status_of=None, ranged=False):
+    # Трёхстрочный график: заголовок и текущее значение, ось min/max слева.
+    if len(values) < 2:
+        return [
+            "  " + BOLD + title + RESET,
+            "  " + DIM + "\u0441\u043e\u0431\u0438\u0440\u0430\u044e \u0438\u0441\u0442\u043e\u0440\u0438\u044e\u2026" + RESET,
+            "",
+        ]
+    low, high = bounds(values, ranged)
+    columns = AVAIL - axis - 2
+    series = resample(values, columns)
+    levels = [level_of(v, low, high) for v in series]
+    colors = [color_of(v) if color_of else ACCENT for v in series]
+
+    current = fmt(values[-1])
+    if status_of:
+        current = badge(status_of(values[-1])) + " " + current
+    head = spread(
+        "  " + BOLD + title + RESET,
+        GRAY + "\u0441\u0435\u0439\u0447\u0430\u0441 " + RESET + BOLD + current + RESET,
+        AVAIL + 2,
+    )
+    labels = {2: fmt(high), 1: "", 0: fmt(low)}
+    out = [head]
+    for row in (2, 1, 0):
+        mark = "\u2502" if row == 1 else "\u2524"
+        out.append(
+            "  " + GRAY + rpad(labels[row], axis) + " " + mark + RESET
+            + paint_columns(levels, colors, row)
+        )
+    out.append("")
+    return out
+
+
+def axis_width(specs):
+    # Общая ширина подписей оси, чтобы все графики начинались с одной колонки.
+    size = 0
+    for _, values, fmt, extra in specs:
+        if len(values) >= 2:
+            low, high = bounds(values, extra.get("ranged", False))
+            size = max(size, width(fmt(low)), width(fmt(high)))
+    return size
+
+
+def dynamics(rows, live):
+    # Секция графиков по истории измерений.
+    if len(rows) < 2:
+        return [section("\u0414\u0438\u043d\u0430\u043c\u0438\u043a\u0430")] + [
+            note("\u0441\u043e\u0431\u0438\u0440\u0430\u044e \u0438\u0441\u0442\u043e\u0440\u0438\u044e\u2026 \u0442\u043e\u0447\u043a\u0430 \u0434\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 status/metrics (\u043d\u0435 \u0447\u0430\u0449\u0435 \u0440\u0430\u0437\u0430 \u0432 25 \u0441)"),
+            note("\u0436\u0438\u0432\u043e\u0439 \u0440\u0435\u0436\u0438\u043c \u0441 \u0433\u0440\u0430\u0444\u0438\u043a\u0430\u043c\u0438: sudo mtdd-ctl metrics --watch"),
+        ]
+    points = rows[-HISTORY_POINTS:]
+    span = points[-1][0] - points[0][0]
+    out = [section("\u0414\u0438\u043d\u0430\u043c\u0438\u043a\u0430 \u00b7 {} {} \u0437\u0430 {}".format(
+        num(len(points)), plural(len(points), "\u0442\u043e\u0447\u043a\u0430", "\u0442\u043e\u0447\u043a\u0438", "\u0442\u043e\u0447\u0435\u043a"), human_duration(span)))]
+    out.append("")
+    rtts = [row[4] for row in points if row[4] > 0]
+    # (заголовок, ряд, формат, расширенные параметры)
+    specs = [
+        ("\u0410\u043a\u0442\u0438\u0432\u043d\u044b\u0435 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f", [row[1] for row in points], num, {}),
+        ("\u0423\u043d\u0438\u043a\u0430\u043b\u044c\u043d\u044b\u0435 IP", [row[2] for row in points], num, {}),
+        ("\u0422\u0440\u0430\u0444\u0438\u043a \u0432 \u0441\u0435\u043a\u0443\u043d\u0434\u0443", rate_series(points), human_rate, {}),
+        ("ME RTT", rtts, ms, {"color_of": rtt_color, "status_of": rtt_status, "ranged": True}),
+    ]
+    axis = axis_width(specs)
+    for title, values, fmt, extra in specs:
+        out += graph(title, values, fmt, axis, **extra)
+    out.append(note("\u0441\u043b\u0435\u0432\u0430 \u2014 {} \u043d\u0430\u0437\u0430\u0434, \u0441\u043f\u0440\u0430\u0432\u0430 \u2014 \u0441\u0435\u0439\u0447\u0430\u0441".format(human_duration(span))))
+    out += wrap_note(
+        "q \u2014 \u0432\u044b\u0445\u043e\u0434 \u0438\u0437 \u0436\u0438\u0432\u043e\u0433\u043e \u0440\u0435\u0436\u0438\u043c\u0430" if live
+        else "\u0442\u043e\u0447\u043a\u0430 \u043a\u0430\u0436\u0434\u044b\u0435 ~25 \u0441 \u00b7 \u0436\u0438\u0432\u043e\u0439 \u0440\u0435\u0436\u0438\u043c: sudo mtdd-ctl metrics --watch"
+    )
+    return out
+
+
+# --- Заголовок и общее состояние ----------------------------------------------
+
+def overall(data, dcs):
+    if not data.get("ready"):
+        return "bad", "\u043d\u0435 \u0433\u043e\u0442\u043e\u0432"
+    if dcs:
+        up = sum(1 for dc in dcs if dc.get("connected"))
+        if up == 0:
+            return "bad", "\u043d\u0435\u0442 \u0441\u0432\u044f\u0437\u0438 \u0441 ME"
+        if up < len(dcs):
+            return "warn", "ME: {} \u0438\u0437 {} DC".format(up, len(dcs))
+    return "ok", "\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442"
+
+
+def header(data, dcs, live):
+    status, text = overall(data, dcs)
+    right = status_text(status, text)
+    if live:
+        right += "  " + GREEN + "\u25cf live" + RESET
+    right += "  " + GRAY + time.strftime("%H:%M:%S") + RESET
+    out = ["\n" + spread("  " + VIOLET + "\u258c" + RESET + " " + BOLD + "\u041c\u0435\u0442\u0440\u0438\u043a\u0438" + RESET, right, WIDTH)]
     build = data.get("build") or {}
-    out.append(
-        note(
-            "\u0430\u043f\u0442\u0430\u0439\u043c {} \u00b7 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u0435\u0439 {} (\u0432\u043a\u043b. {}) \u00b7 \u0432\u0435\u0440\u0441\u0438\u044f {} \u00b7 \u0440\u0435\u0432\u0438\u0437\u0438\u044f {}".format(
-                human_duration(data.get("uptime_seconds")),
-                num(data.get("users_total")),
-                num(data.get("users_enabled")),
-                build.get("version", "?"),
-                num(data.get("revision")),
-            )
-        )
-    )
-    out.append("  " + rule())
+    out += wrap_items([
+        "\u0430\u043f\u0442\u0430\u0439\u043c {}".format(human_duration(data.get("uptime_seconds"))),
+        "\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u0435\u0439 {} (\u0432\u043a\u043b. {})".format(num(data.get("users_total")), num(data.get("users_enabled"))),
+        "\u0432\u0435\u0440\u0441\u0438\u044f {}".format(build.get("version", "?")),
+        "\u0440\u0435\u0432\u0438\u0437\u0438\u044f {}".format(num(data.get("revision"))),
+    ])
+    return out
 
-    out.append(section("\u0421\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f"))
-    out.append(
-        row2(
-            "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0435",
-            num(data.get("connections_active")),
-            "\u043f\u0440\u0438\u043d\u044f\u0442\u043e \u0432\u0441\u0435\u0433\u043e",
-            num(data.get("connections_accepted_total")),
-        )
-    )
-    out.append(
-        row2(
-            "\u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u043e",
-            num(data.get("connections_rejected_total")),
-            "\u0440\u0443\u043a\u043e\u043f\u043e\u0436\u0430\u0442\u0438\u0439",
-            num(data.get("handshakes_total")),
-        )
-    )
 
+def ip_notes(data, history, prom):
+    # Пояснения к карточке IP: что значит «активные» и откуда оценка.
+    _, has_active = ip_rows(data, history)
+    out = []
+    if has_active:
+        min_bytes = history.get("min_bytes", data.get("unique_ip_min_bytes"))
+        if min_bytes is None:
+            min_bytes = prom_scalar(prom, "mtdd_unique_ips_min_bytes")
+        limit = " \u2265 " + human(min_bytes) if min_bytes else ""
+        out += wrap_note("\u0430\u043a\u0442. \u2014 IP, \u043f\u0435\u0440\u0435\u0434\u0430\u0432\u0448\u0438\u0435{}; \u0432\u0438\u0434. \u2014 \u0432\u0441\u0435 \u0437\u0430\u043c\u0435\u0447\u0435\u043d\u043d\u044b\u0435 \u043f\u0440\u0438 \u0440\u0443\u043a\u043e\u043f\u043e\u0436\u0430\u0442\u0438\u0438".format(limit))
+    period = ""
+    started = (history.get("hour") or {}).get("started_at")
+    if started:
+        period = " \u00b7 \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u0447\u0430\u0441 \u0441 " + time.strftime("%H:%M UTC", time.gmtime(started))
+    out += wrap_note("\u0447\u0430\u0441/\u0434\u0435\u043d\u044c/\u043d\u0435\u0434\u0435\u043b\u044f \u2014 \u043e\u0446\u0435\u043d\u043a\u0430 HyperLogLog, \u043e\u0448\u0438\u0431\u043a\u0430 \u00b1{:.1f}%{}".format(
+        100.0 * float(history.get("relative_standard_error", 0.0325)), period))
+    return out
+
+
+# --- Таблицы и подробные секции -----------------------------------------------
+
+# (ключ, заголовок, ширина, приоритет): при нехватке места уходят колонки
+# с большим приоритетом; DC и состояние остаются всегда.
+DC_COLUMNS = [
+    ("dc", "DC", 5, 0),
+    ("state", "\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435", 10, 0),
+    ("rtt", "RTT", 8, 1),
+    ("ready", "ready/conn", 12, 2),
+    ("clients", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b", 9, 3),
+    ("traffic", "\u0442\u0440\u0430\u0444\u0438\u043a", 11, 4),
+    ("queue", "\u043e\u0447\u0435\u0440\u0435\u0434\u044c", 9, 5),
+    ("target", "target", 8, 6),
+]
+
+
+def pick_columns():
+    chosen, used = [], 0
+    for column in sorted(DC_COLUMNS, key=lambda item: item[3]):
+        if column[3] and used + column[2] > AVAIL:
+            continue
+        chosen.append(column)
+        used += column[2]
+    return [col for col in DC_COLUMNS if col in chosen]
+
+
+def dc_values(dc):
+    up = bool(dc.get("connected"))
+    rtt = float(dc.get("ping_rtt_us", 0)) / 1000.0
+    has_rtt = up and rtt > 0
+    return {
+        "dc": (str(dc.get("dc", "?")), GRAY),
+        "state": (("\u2713 up" if up else "\u2717 down"), GREEN if up else RED),
+        "rtt": ((ms(rtt) if has_rtt else "\u2014"), rtt_color(rtt) if has_rtt else ""),
+        "ready": ("{}/{}".format(num(dc.get("ready_connections", 0)), num(dc.get("connections", 0))), ""),
+        "clients": (num(dc.get("bound_clients", 0)), ""),
+        "traffic": (human(float(dc.get("rx_bytes_total", 0)) + float(dc.get("tx_bytes_total", 0))), ""),
+        "queue": ("{}/{}".format(num(dc.get("ready_queue_depth", 0)), num(dc.get("ready_queue_clients", 0))), ""),
+        "target": (num(dc.get("pool_target", 0)), ""),
+    }
+
+
+def dc_order(dc):
+    try:
+        return (0, int(str(dc.get("dc", "other"))))
+    except ValueError:
+        return (1, 0)
+
+
+def me_section(me, dcs):
+    out = [section("ME / DC")]
+    if not dcs:
+        return out + [note("\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445: ME \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u043b\u0441\u044f")]
+    visible = [dc for dc in dcs if dc.get("connected") or dc.get("connections") or dc.get("pool_target")]
+    visible = sorted(visible or dcs, key=dc_order)
+    columns = pick_columns()
+    out.append("  " + GRAY + "".join(cell(col[1], col[2]) for col in columns).rstrip() + RESET)
+    for dc in visible:
+        values = dc_values(dc)
+        out.append("  " + "".join(cell(values[col[0]][0], col[2], values[col[0]][1]) for col in columns).rstrip())
+    connected = sum(1 for dc in dcs if dc.get("connected"))
+    out += wrap_items([
+        "DC \u0432 \u0441\u0435\u0442\u0438: {} \u0438\u0437 {}".format(connected, len(dcs)),
+        "\u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432 ME {}".format(num(me.get("requests_total"))),
+        "\u043f\u0435\u0440\u0435\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0439 {}".format(num(me.get("reconnects_total"))),
+        "\u043e\u0448\u0438\u0431\u043e\u043a \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f {}".format(num(sum(int(dc.get("creation_failures_total", 0)) for dc in dcs))),
+    ])
+    answers = sum(int(dc.get("proxy_ans_received_total", 0)) for dc in dcs)
+    if answers:
+        delivered = sum(int(dc.get("proxy_ans_delivered_total", 0)) for dc in dcs)
+        dropped = sum(
+            int(dc.get("proxy_ans_dropped_unknown_total", 0)) + int(dc.get("proxy_ans_dropped_other_total", 0))
+            for dc in dcs
+        )
+        age = max((int(dc.get("last_proxy_ans_age_seconds", 0)) for dc in dcs), default=0)
+        out += wrap_items([
+            "proxy-answer: \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e {}".format(num(answers)),
+            "\u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e {}".format(num(delivered)),
+            "\u043f\u043e\u0442\u0435\u0440\u044f\u043d\u043e {}".format(num(dropped)),
+            "\u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u043e\u0442\u0432\u0435\u0442 {} \u043d\u0430\u0437\u0430\u0434".format(human_duration(age)),
+        ])
+    return out
+
+
+def connections_section(data, prom):
+    out = [section("\u0421\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f")]
+    backpressure = data.get("backpressure_events_total") or {}
+    out += pairs([
+        ("\u0432 \u0440\u0430\u0431\u043e\u0442\u0435", pnum(prom, "mtdd_handshakes_pending")),
+        ("replay-\u043a\u044d\u0448", num(data.get("replay_cache_entries"))),
+        ("backpressure c2s", num(backpressure.get("c2s"))),
+        ("backpressure s2c", num(backpressure.get("s2c"))),
+    ])
     handshakes = {}
     for labels, value in prom.get("mtdd_handshakes_total", []):
         handshakes[labels.get("result", "")] = int(value)
-    if handshakes:
-        parts = []
-        for key, label in (
-            ("success", "\u0443\u0441\u043f\u0435\u0448\u043d\u043e"),
-            ("failure", "\u043e\u0448\u0438\u0431\u043a\u0430"),
-            ("timeout", "\u0442\u0430\u0439\u043c\u0430\u0443\u0442"),
-            ("replay", "replay"),
-        ):
-            if key in handshakes:
-                parts.append(ACCENT + num(handshakes[key]) + RESET + " " + label)
-        out.append("  " + DIM + "\u0440\u0443\u043a\u043e\u043f\u043e\u0436\u0430\u0442\u0438\u044f: " + RESET + " \u00b7 ".join(parts))
-
+    parts = []
+    for key, label in (("success", "\u0443\u0441\u043f\u0435\u0448\u043d\u043e"), ("failure", "\u043e\u0448\u0438\u0431\u043a\u0430"), ("timeout", "\u0442\u0430\u0439\u043c\u0430\u0443\u0442"), ("replay", "replay")):
+        if key in handshakes:
+            parts.append(num(handshakes[key]) + " " + label)
+    if parts:
+        out += wrap_items(["\u0440\u0443\u043a\u043e\u043f\u043e\u0436\u0430\u0442\u0438\u044f: " + parts[0]] + parts[1:])
     reasons = {}
     for labels, value in prom.get("mtdd_connections_rejected_total", []):
         if int(value):
             reasons[labels.get("reason", "other")] = int(value)
     if reasons:
-        out.append(
-            "  "
-            + DIM
-            + "\u043f\u0440\u0438\u0447\u0438\u043d\u044b \u043e\u0442\u043a\u0430\u0437\u0430: "
-            + RESET
-            + " \u00b7 ".join("{} {}".format(name, num(value)) for name, value in sorted(reasons.items()))
-        )
+        out += wrap_items(["\u043f\u0440\u0438\u0447\u0438\u043d\u044b \u043e\u0442\u043a\u0430\u0437\u0430: " + ", ".join(
+            "{} {}".format(name, num(value)) for name, value in sorted(reasons.items()))])
+    return out
 
-    out.append(
-        row2(
-            "\u0432 \u0440\u0430\u0431\u043e\u0442\u0435",
-            pnum(prom, "mtdd_handshakes_pending"),
-            "replay-\u043a\u044d\u0448",
-            num(data.get("replay_cache_entries")),
-        )
-    )
-    backpressure = data.get("backpressure_events_total") or {}
-    out.append(
-        row2(
-            "backpressure c2s",
-            num(backpressure.get("c2s")),
-            "s2c",
-            num(backpressure.get("s2c")),
-        )
-    )
 
-    out.append(section("\u0411\u0443\u0444\u0435\u0440\u044b \u0438 \u043e\u0447\u0435\u0440\u0435\u0434\u0438"))
+def buffers_section(data, me, dcs, prom):
     buffers = data.get("buffer_bytes") or {}
-    out.append(
-        row2(
-            "relay",
-            human(buffers.get("relay")),
-            "pending write",
-            human(buffers.get("pending_write")),
-        )
-    )
-    out.append(
-        row2(
-            "queued",
-            human(buffers.get("queued")),
-            "ME pending",
-            human(me.get("pending_buffer_bytes")),
-        )
-    )
     depth = sum(int(dc.get("ready_queue_depth", 0)) for dc in dcs)
     clients = sum(int(dc.get("ready_queue_clients", 0)) for dc in dcs)
     frames = sum(int(dc.get("frames_queued_bytes", 0)) for dc in dcs)
     outgoing = sum(int(dc.get("out_queued_bytes", 0)) for dc in dcs)
-    out.append(
-        row2(
-            "ready queue",
-            "{} ({})".format(num(depth), num(clients) + " \u043a\u043b."),
-            "frames / out",
-            "{} / {}".format(human(frames), human(outgoing)),
-        )
-    )
-    out.append(
-        row2(
-            "\u0431\u044e\u0434\u0436\u0435\u0442 \u0431\u0443\u0444\u0435\u0440\u043e\u0432",
-            human(prom_scalar(prom, "mtdd_buffer_budget_bytes")),
-            "\u043f\u0443\u043b \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432",
-            pnum(prom, "mtdd_client_pool_objects"),
-        )
-    )
+    return [section("\u0411\u0443\u0444\u0435\u0440\u044b \u0438 \u043e\u0447\u0435\u0440\u0435\u0434\u0438")] + pairs([
+        ("relay", human(buffers.get("relay"))),
+        ("pending write", human(buffers.get("pending_write"))),
+        ("queued", human(buffers.get("queued"))),
+        ("ME pending", human(me.get("pending_buffer_bytes"))),
+        ("ready queue", "{} ({} \u043a\u043b.)".format(num(depth), num(clients))),
+        ("frames / out", "{} / {}".format(human(frames), human(outgoing))),
+        ("\u0431\u044e\u0434\u0436\u0435\u0442 \u0431\u0443\u0444\u0435\u0440\u043e\u0432", human(prom_scalar(prom, "mtdd_buffer_budget_bytes"))),
+        ("\u043f\u0443\u043b \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432", pnum(prom, "mtdd_client_pool_objects")),
+    ])
 
-    out.append(section("ME / DC"))
-    visible = [dc for dc in dcs if dc.get("connected") or dc.get("connections") or dc.get("pool_target")]
-    if not visible:
-        visible = dcs
 
-    def dc_order(dc):
-        label = str(dc.get("dc", "other"))
-        try:
-            return (0, int(label))
-        except ValueError:
-            return (1, 0)
-
-    visible.sort(key=dc_order)
-    if dcs:
-        out.append(
-            "  "
-            + GRAY
-            + cell("DC", 6)
-            + cell("\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435", 11)
-            + cell("ready/conn", 12)
-            + cell("target", 8)
-            + cell("\u043a\u043b\u0438\u0435\u043d\u0442\u044b", 9)
-            + cell("RTT", 9)
-            + cell("\u043e\u0447\u0435\u0440\u0435\u0434\u044c", 10)
-            + "\u0442\u0440\u0430\u0444\u0438\u043a"
-            + RESET
-        )
-        for dc in visible:
-            up = bool(dc.get("connected"))
-            state = (
-                GREEN + cell("\u25cf up", 11) + RESET
-                if up
-                else RED + cell("\u25cb down", 11) + RESET
-            )
-            rtt = float(dc.get("ping_rtt_us", 0)) / 1000.0
-            if up and rtt > 0:
-                rtt_text = "{:.0f} ms".format(rtt)
-                rtt_color = GREEN if rtt < 80 else (YELLOW if rtt < 150 else RED)
-            else:
-                rtt_text = "\u2014"
-                rtt_color = ""
-            queue = "{}/{}".format(
-                num(dc.get("ready_queue_depth", 0)), num(dc.get("ready_queue_clients", 0))
-            )
-            traffic = human(
-                float(dc.get("rx_bytes_total", 0)) + float(dc.get("tx_bytes_total", 0))
-            )
-            out.append(
-                "  "
-                + GRAY
-                + cell(str(dc.get("dc", "?")), 6)
-                + RESET
-                + state
-                + cell(
-                    "{}/{}".format(
-                        num(dc.get("ready_connections", 0)), num(dc.get("connections", 0))
-                    ),
-                    12,
-                )
-                + cell(num(dc.get("pool_target", 0)), 8)
-                + cell(num(dc.get("bound_clients", 0)), 9)
-                + cell(rtt_text, 9, rtt_color)
-                + cell(queue, 10)
-                + traffic
-            )
-        connected = sum(1 for dc in dcs if dc.get("connected"))
-        out.append(
-            note(
-                "DC \u0432 \u0441\u0435\u0442\u0438: {} \u0438\u0437 {} \u00b7 \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432 ME {} \u00b7 \u043f\u0435\u0440\u0435\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0439 {} \u00b7 \u043e\u0448\u0438\u0431\u043e\u043a \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f {}".format(
-                    connected,
-                    len(dcs),
-                    num(me.get("requests_total")),
-                    num(me.get("reconnects_total")),
-                    num(sum(int(dc.get("creation_failures_total", 0)) for dc in dcs)),
-                )
-            )
-        )
-        answers = sum(int(dc.get("proxy_ans_received_total", 0)) for dc in dcs)
-        if answers:
-            delivered = sum(int(dc.get("proxy_ans_delivered_total", 0)) for dc in dcs)
-            dropped = sum(
-                int(dc.get("proxy_ans_dropped_unknown_total", 0))
-                + int(dc.get("proxy_ans_dropped_other_total", 0))
-                for dc in dcs
-            )
-            age = max((int(dc.get("last_proxy_ans_age_seconds", 0)) for dc in dcs), default=0)
-            out.append(
-                note(
-                    "proxy-answer: \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e {} \u00b7 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e {} \u00b7 \u043f\u043e\u0442\u0435\u0440\u044f\u043d\u043e {} \u00b7 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u043e\u0442\u0432\u0435\u0442 {} \u043d\u0430\u0437\u0430\u0434".format(
-                        num(answers), num(delivered), num(dropped), human_duration(age)
-                    )
-                )
-            )
-    else:
-        out.append(note("\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445: ME \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u043b\u0441\u044f"))
-
-    out.append(section("\u0422\u0440\u0430\u0444\u0438\u043a"))
+def traffic_section(dcs):
     rx = sum(float(dc.get("rx_bytes_total", 0)) for dc in dcs)
     tx = sum(float(dc.get("tx_bytes_total", 0)) for dc in dcs)
-    out.append(row2("\u043f\u0440\u0438\u043d\u044f\u0442\u043e", human(rx), "\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e", human(tx)))
+    out = [section("\u0422\u0440\u0430\u0444\u0438\u043a")] + pairs([("\u043f\u0440\u0438\u043d\u044f\u0442\u043e", human(rx)), ("\u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e", human(tx))])
     direct_active = sum(int(dc.get("direct_active", 0)) for dc in dcs)
     direct_accepted = sum(int(dc.get("direct_accepted_total", 0)) for dc in dcs)
     if direct_active or direct_accepted:
-        out.append(
-            note(
-                "\u043f\u0440\u044f\u043c\u044b\u0435 DC: {} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u00b7 {} \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e \u00b7 {} \u043e\u0448\u0438\u0431\u043e\u043a \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f".format(
-                    num(direct_active),
-                    num(direct_accepted),
-                    num(sum(int(dc.get("direct_connect_fail_total", 0)) for dc in dcs)),
-                )
-            )
-        )
+        out += wrap_items([
+            "\u043f\u0440\u044f\u043c\u044b\u0435 DC: {} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445".format(num(direct_active)),
+            "{} \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e".format(num(direct_accepted)),
+            "{} \u043e\u0448\u0438\u0431\u043e\u043a \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f".format(num(sum(int(dc.get("direct_connect_fail_total", 0)) for dc in dcs))),
+        ])
+    return out
 
-    out.append(section("\u0423\u043d\u0438\u043a\u0430\u043b\u044c\u043d\u044b\u0435 IP"))
+
+def render(data, prom):
+    live = os.environ.get("MTDD_LIVE") == "1"
+    me = data.get("me") or {}
+    dcs = me.get("dcs") or []
     history = data.get("unique_ip_history") or {}
-    hour = (history.get("hour") or {}).get("estimate", 0)
-    day = (history.get("day") or {}).get("estimate", 0)
-    week = (history.get("week") or {}).get("estimate", 0)
-    out.append(
-        row2(
-            "\u0441\u0435\u0439\u0447\u0430\u0441",
-            num(data.get("unique_ips_active")),
-            "\u0447\u0430\u0441",
-            "\u2248 " + num(hour),
-        )
-    )
-    out.append(row2("\u0434\u0435\u043d\u044c", "\u2248 " + num(day), "\u043d\u0435\u0434\u0435\u043b\u044f", "\u2248 " + num(week)))
-    period = ""
-    started = (history.get("hour") or {}).get("started_at")
-    if started:
-        period = " \u00b7 \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u0447\u0430\u0441 \u0441 " + time.strftime(
-            "%H:%M UTC", time.gmtime(started)
-        )
-    out.append(
-        note(
-            "\u043e\u0446\u0435\u043d\u043a\u0430 HyperLogLog, \u043e\u0448\u0438\u0431\u043a\u0430 \u00b1{:.1f}%{}".format(
-                100.0 * float(history.get("relative_standard_error", 0.0325)), period
-            )
-        )
-    )
-
     rows = history_load(history_path())
-    if len(rows) < 2:
-        out.append(section("\u0414\u0438\u043d\u0430\u043c\u0438\u043a\u0430"))
-        out.append(
-            note(
-                "\u0438\u0441\u0442\u043e\u0440\u0438\u044f \u043a\u043e\u043f\u0438\u0442\u0441\u044f: \u0442\u043e\u0447\u043a\u0430 \u0434\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 status/metrics (\u043d\u0435 \u0447\u0430\u0449\u0435 \u0440\u0430\u0437\u0430 \u0432 25 \u0441)"
-            )
-        )
-        out.append(note("\u0436\u0438\u0432\u043e\u0439 \u0440\u0435\u0436\u0438\u043c \u0441 \u0433\u0440\u0430\u0444\u0438\u043a\u0430\u043c\u0438: sudo mtdd-ctl metrics --watch"))
-    else:
-        points = rows[-90:]
-        span = points[-1][0] - points[0][0]
-        out.append(
-            section(
-                "\u0414\u0438\u043d\u0430\u043c\u0438\u043a\u0430 \u00b7 {} {} \u0437\u0430 {}".format(
-                    num(len(points)),
-                    plural(len(points), "\u0442\u043e\u0447\u043a\u0430", "\u0442\u043e\u0447\u043a\u0438", "\u0442\u043e\u0447\u0435\u043a"),
-                    human_duration(span),
-                )
-            )
-        )
-        active = [row[1] for row in points]
-        ips = [row[2] for row in points]
-        rtts = [row[4] for row in points if row[4] > 0]
-        out.append(
-            graph(
-                "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0435",
-                active,
-                "{} \u2192 {} \u00b7 max {}".format(num(active[0]), num(active[-1]), num(max(active))),
-            )
-        )
-        out.append(
-            graph(
-                "\u0443\u043d\u0438\u043a\u0430\u043b\u044c\u043d\u044b\u0435 IP",
-                ips,
-                "{} \u2192 {} \u00b7 max {}".format(num(ips[0]), num(ips[-1]), num(max(ips))),
-            )
-        )
-        rates = rate_series(points)
-        if rates:
-            out.append(
-                graph(
-                    "\u0442\u0440\u0430\u0444\u0438\u043a/\u0441",
-                    rates,
-                    "\u043f\u0438\u043a {}/s".format(human(max(rates))),
-                )
-            )
-        if rtts:
-            out.append(
-                graph(
-                    "ME RTT",
-                    rtts,
-                    "{:.0f} ms \u00b7 {:.0f}\u2013{:.0f}".format(rtts[-1], min(rtts), max(rtts)),
-                    zero=False,
-                )
-            )
-        out.append(
-            note(
-                "q \u2014 \u0432\u044b\u0445\u043e\u0434 \u0438\u0437 \u0436\u0438\u0432\u043e\u0433\u043e \u0440\u0435\u0436\u0438\u043c\u0430"
-                if live
-                else "\u0442\u043e\u0447\u043a\u0430 \u043a\u0430\u0436\u0434\u044b\u0435 ~25 \u0441 \u00b7 \u0436\u0438\u0432\u043e\u0439 \u0440\u0435\u0436\u0438\u043c: sudo mtdd-ctl metrics --watch"
-            )
-        )
+    rates = rate_series(rows[-HISTORY_POINTS:])
 
-    return "\n".join(out)
+    out = header(data, dcs, live)
+    out.append("")
+    out += render_cards([
+        connections_card(data),
+        ips_card(data, history),
+        traffic_card(dcs, rates),
+        rtt_card(dcs),
+    ])
+    out += ip_notes(data, history, prom)
+    out += dynamics(rows, live)
+    out += connections_section(data, prom)
+    out += buffers_section(data, me, dcs, prom)
+    out += me_section(me, dcs)
+    out += traffic_section(dcs)
+
+    # Страховка: ни одна строка не должна переноситься терминалом.
+    return "\n".join(clip(line, WIDTH) for line in "\n".join(out).split("\n"))
 
 
 def main():
@@ -1256,11 +1769,10 @@ def main():
         print("  \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0440\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c \u043e\u0442\u0432\u0435\u0442 API")
         return 1
 
+    force = os.environ.get("MTDD_METRICS_FORCE") == "1"
+    sample(data, force=force)
     if os.environ.get("MTDD_RECORD_ONLY") == "1":
-        sample(data, force=os.environ.get("MTDD_METRICS_FORCE") == "1")
         return 0
-
-    sample(data, force=os.environ.get("MTDD_METRICS_FORCE") == "1")
     prom = load_prom(os.environ.get("MTDD_METRICS_TXT", ""))
     print(render(data, prom))
     return 0
@@ -1269,6 +1781,46 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 PY
+}
+
+url_host() { # url_host ХОСТ — хост для URL: wildcard -> loopback, IPv6 в скобках
+    local host=$1
+    [[ $host == 0.0.0.0 || $host == '::' || $host == '*' ]] && host=127.0.0.1
+    [[ $host == *:* ]] && host="[$host]"
+    printf '%s' "$host"
+}
+
+metrics_token_read() { # metrics_token_read ИМЯ-ПЕРЕМЕННОЙ — значение из credentials.env
+    local name=$1
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    sed -n "s|^\(export \)\{0,1\}${name}=\([A-Za-z0-9._~+=/-]\{16,\}\)\$|\2|p" "$MTDD_CREDS" 2>/dev/null | head -1
+}
+
+# Метрики Prometheus: сначала отдельный listener (metrics_host:metrics_port),
+# затем устаревший GET /metrics на порту API с админским токеном.
+metrics_fetch() { # metrics_fetch — печатает текст Prometheus или завершается ошибкой
+    local port host token_env token= out
+    # Ключа нет — у бинарника тот же дефолт 9091; старый бинарник даст fallback.
+    port=$(cfg_get metrics_port 9091 2>/dev/null) || port=
+    if [[ $port =~ ^[0-9]+$ ]] && ((port > 0)); then
+        host=$(url_host "$(cfg_get metrics_host 127.0.0.1)")
+        token_env=$(cfg_get metrics_token_env '' 2>/dev/null) || token_env=
+        if [[ -n $token_env ]]; then
+            token=$(metrics_token_read "$token_env") || token=
+        fi
+        # Токен передаётся через stdin (-K -), чтобы не светиться в списке процессов.
+        if [[ -n $token ]]; then
+            out=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+                curl -fsS --max-time 5 -K - "http://${host}:${port}/metrics" 2>/dev/null) || out=
+        else
+            out=$(curl -fsS --max-time 5 "http://${host}:${port}/metrics" 2>/dev/null) || out=
+        fi
+        if [[ -n $out ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    api GET /metrics 2>/dev/null
 }
 
 metrics_render() { # metrics_render JSON-ФАЙЛ [ФАЙЛ-МЕТРИК] — печатает дашборд
@@ -1307,7 +1859,7 @@ metrics_watch_loop() { # metrics_watch_loop РАБОЧАЯ-ПАПКА — жив
     while :; do
         if ((ui_color)); then printf '\033[H\033[2J'; fi
         api GET /v1/status 2>/dev/null >"$work/status.json" || true
-        api GET /metrics 2>/dev/null >"$work/metrics.txt" || true
+        metrics_fetch 2>/dev/null >"$work/metrics.txt" || true
         if [[ -s $work/status.json ]]; then
             MTDD_LIVE=1 MTDD_METRICS_FORCE=1 MTDD_HISTORY_FILE=$work/live.tsv \
                 metrics_render "$work/status.json" "$work/metrics.txt" || true
@@ -1331,12 +1883,12 @@ cmd_metrics() {
         esac
     done
     if [[ $filter == all ]]; then
-        api GET /metrics 2>/dev/null || { err 'Не удалось получить метрики'; return 1; }
+        metrics_fetch 2>/dev/null || { err 'Не удалось получить метрики'; return 1; }
         return 0
     fi
     if [[ -n $filter ]]; then
         local out lines
-        out=$(api GET /metrics 2>/dev/null) || { err 'Не удалось получить метрики'; return 1; }
+        out=$(metrics_fetch 2>/dev/null) || { err 'Не удалось получить метрики'; return 1; }
         lines=$(printf '%s\n' "$out" | grep -E '^mtdd_' | grep -F -- "$filter" || true)
         [[ -n $lines ]] || { warn 'Метрики mtdd_ не найдены'; return 0; }
         printf '%s\n' "$lines"
@@ -1348,7 +1900,7 @@ cmd_metrics() {
         err "API ($(api_endpoint)) не отвечает; метрики недоступны"
         return 1
     fi
-    api GET /metrics 2>/dev/null >"$work/metrics.txt" || true
+    metrics_fetch 2>/dev/null >"$work/metrics.txt" || true
     if ((watch)) && has_tty; then
         metrics_watch_loop "$work"
         rm -rf -- "$work"
@@ -1415,6 +1967,7 @@ cmd_uninstall() {
     systemctl disable --now "$MTDD_NETTUNE_SERVICE" 2>/dev/null || true
     rm -f -- "$MTDD_NETTUNE_UNIT" "$MTDD_NETTUNE"
     systemctl daemon-reload 2>/dev/null || true
+    remove_ctl_links
     rm -f -- "$MTDD_BIN" "$MTDD_CTL"
     ok 'Служба, бинарник и менеджер mtdd-ctl удалены'
     local remove_state=0
@@ -1458,6 +2011,42 @@ menu_run() { # menu_run КОМАНДА [АРГУМЕНТЫ…] — не даёт
     return 0
 }
 
+menu_ask_set() { # menu_ask_set ИМЯ ПОЛЕ ПОДСКАЗКА — спросить значение и применить
+    local value
+    menu_read value "  › $3: " || return 0
+    menu_run cmd_users_set "$1" "$2" "$value"
+}
+
+menu_user_policy() { # menu_user_policy ИМЯ — политики одного пользователя
+    local name=$1 choice
+    valid_user_name "$name" || { err 'Неверное имя пользователя'; menu_pause; return 0; }
+    while :; do
+        menu_frame "Пользователь · $name" ''
+        menu_row 1 'Подробности' 6 'Лимит скорости ↓'
+        menu_row 2 'Срок действия' 7 'Заметка'
+        menu_row 3 'Квота трафика' 8 'Включить'
+        menu_row 4 'Лимит уникальных IP' 9 'Отключить'
+        menu_row 5 'Лимит скорости ↑' 10 'Сбросить квоту'
+        menu_row 0 'Назад'
+        menu_footer
+        menu_read choice '  › ' || return 0
+        case $choice in
+            1) menu_run cmd_users_show "$name"; menu_pause ;;
+            2) menu_ask_set "$name" expires_at 'Срок (ГГГГ-ММ-ДД или RFC 3339, Enter/none — бессрочно)'; menu_pause ;;
+            3) menu_ask_set "$name" data_quota_bytes 'Квота (10G, 500M, 1T, байты; Enter/none — без лимита)'; menu_pause ;;
+            4) menu_ask_set "$name" max_unique_ips 'Макс. уникальных IP (число; Enter/none — без лимита)'; menu_pause ;;
+            5) menu_ask_set "$name" rate_limit_up_bytes_per_sec 'Скорость ↑ в секунду (например 2M, минимум 1K; Enter/none — без лимита)'; menu_pause ;;
+            6) menu_ask_set "$name" rate_limit_down_bytes_per_sec 'Скорость ↓ в секунду (например 2M, минимум 1K; Enter/none — без лимита)'; menu_pause ;;
+            7) menu_ask_set "$name" note 'Заметка (до 256 символов; Enter — очистить)'; menu_pause ;;
+            8) menu_run cmd_users_action "$name" enable; menu_pause ;;
+            9) menu_run cmd_users_action "$name" disable; menu_pause ;;
+            10) menu_run cmd_users_action "$name" reset-quota; menu_pause ;;
+            0|q|Q) return 0 ;;
+            *) : ;;
+        esac
+    done
+}
+
 menu_users() {
     local choice name
     while :; do
@@ -1465,6 +2054,7 @@ menu_users() {
         menu_row 1 'Список' 4 'Отключить'
         menu_row 2 'Добавить' 5 'Удалить'
         menu_row 3 'Включить' 6 'Новый секрет'
+        menu_row 7 'Политики пользователя' 8 'Журнал аудита'
         menu_row 0 'Назад'
         menu_footer
         menu_read choice '  › ' || return 0
@@ -1493,6 +2083,12 @@ menu_users() {
             6)
                 menu_read name '  › Имя пользователя: ' || return 0
                 [[ -n $name ]] && menu_run cmd_users_rotate "$name"
+                menu_pause ;;
+            7)
+                menu_read name '  › Имя пользователя: ' || return 0
+                [[ -n $name ]] && menu_user_policy "$name" ;;
+            8)
+                menu_run cmd_audit 20
                 menu_pause ;;
             0|q|Q) return 0 ;;
             *) : ;;
@@ -1629,34 +2225,143 @@ for user in users:
 PY
 }
 
+# URL установщика для mtdd-ctl: ветка совпадает с выбранным каналом (main|dev).
+# MTDD_LAUNCHER_URL — только для тестов.
+launcher_source_url() {
+    printf '%s' "${MTDD_LAUNCHER_URL:-https://raw.githubusercontent.com/$repo/$channel/install.sh}"
+}
+
+# Команда для ручной установки менеджера, если автоматическая не удалась.
+launcher_manual_command() {
+    printf 'sudo curl -fsSLo %s https://raw.githubusercontent.com/%s/%s/install.sh && sudo chmod 755 %s' \
+        "$MTDD_CTL" "$repo" "$channel" "$MTDD_CTL"
+}
+
+# Файл похож на наш установщик: shebang и функция установки менеджера.
+launcher_source_valid() {
+    [[ -s $1 ]] && head -n 1 -- "$1" | grep -q '^#!/usr/bin/env bash' \
+        && grep -q 'install_launcher_copy' "$1"
+}
+
+# fetch_launcher_source ПУТЬ: скачать установщик канала (3 попытки) и проверить его.
+fetch_launcher_source() {
+    local dest=$1 url
+    url=$(launcher_source_url)
+    for _ in 1 2 3; do
+        if curl -fsSL --connect-timeout 20 -o "$dest" "$url" && launcher_source_valid "$dest"; then
+            return 0
+        fi
+        sleep 1
+    done
+    rm -f -- "$dest"
+    return 1
+}
+
+# Атомарная установка менеджера: временный файл в том же каталоге + mv -f,
+# чтобы не портить запущенный скрипт (bash читает его постепенно).
+install_launcher_file() {
+    local src=$1 tmp
+    tmp=$(mktemp "$(dirname -- "$MTDD_CTL")/.mtdd-ctl.XXXXXXXX") || return 1
+    if install -m 0755 -- "$src" "$tmp" && chmod 0755 -- "$tmp" && mv -f -- "$tmp" "$MTDD_CTL"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# secure_path из sudo (пусто, если определить не удалось).
+sudo_secure_path() {
+    local value=
+    if command -v sudo >/dev/null 2>&1; then
+        value=$(sudo -V 2>/dev/null | sed -n "s/^[[:space:]]*Value to override user's \$PATH with:[[:space:]]*//p" | head -n 1 || true)
+    fi
+    if [[ -z $value ]]; then
+        value=$(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null \
+            | sed -n 's/^[[:space:]]*Defaults.*secure_path[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' \
+            | head -n 1 || true)
+    fi
+    printf '%s' "$value"
+}
+
+path_has_dir() { # path_has_dir СПИСОК_ЧЕРЕЗ_ДВОЕТОЧИЕ КАТАЛОГ
+    case ":$1:" in *":$2:"*) return 0 ;; *) return 1 ;; esac
+}
+
+# Если /usr/local/bin нет в secure_path sudo (RHEL/Alma/Rocky/CentOS/Fedora),
+# делаем симлинк, чтобы работало `sudo mtdd-ctl`.
+ensure_sudo_visibility() {
+    local sp link_dir=/usr/sbin link
+    sp=$(sudo_secure_path)
+    if [[ -n $sp ]]; then
+        path_has_dir "$sp" /usr/local/bin && return 0
+        if ! path_has_dir "$sp" /usr/sbin && path_has_dir "$sp" /usr/bin; then link_dir=/usr/bin; fi
+    fi
+    [[ -d $link_dir ]] || return 0
+    link=$link_dir/mtdd-ctl
+    if [[ -L $link && $(readlink -- "$link") == "$MTDD_CTL" ]]; then
+        return 0
+    fi
+    if [[ -e $link || -L $link ]]; then
+        warn "$link уже существует и не наш; sudo mtdd-ctl может не найтись, используйте sudo $MTDD_CTL"
+        return 0
+    fi
+    if ln -s -- "$MTDD_CTL" "$link"; then
+        ok "secure_path sudo без /usr/local/bin: создана ссылка $link"
+    else
+        warn "Не удалось создать ссылку $link; используйте sudo $MTDD_CTL"
+    fi
+}
+
+remove_ctl_links() {
+    local link
+    for link in /usr/sbin/mtdd-ctl /usr/bin/mtdd-ctl; do
+        if [[ -L $link && $(readlink -- "$link") == "$MTDD_CTL" ]]; then rm -f -- "$link"; fi
+    done
+}
+
+# Итоговая проверка: находит ли `sudo mtdd-ctl` менеджер при secure_path.
+verify_launcher_resolves() {
+    local sp
+    sp=$(sudo_secure_path)
+    [[ -n $sp ]] || sp=/sbin:/bin:/usr/sbin:/usr/bin
+    if env -i PATH="$sp" bash -c 'command -v mtdd-ctl' >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "'sudo mtdd-ctl' не найдёт команду (secure_path: $sp)"
+    warn "Используйте абсолютный путь: sudo $MTDD_CTL"
+    return 1
+}
+
 install_launcher_copy() {
     local src=${BASH_SOURCE[0]:-}
-    if [[ -z $src || $src == /dev/stdin || $src == /dev/fd/* || ! -f $src ]]; then
-        # Pipe mode: the script is a stream, so fetch the canonical installer
-        # for the same repository and install that copy as the manager.
-        local self_url="https://raw.githubusercontent.com/$repo/main/install.sh"
-        local self_copy="$work/mtdd-ctl.src"
-        if curl -fsSL --retry 3 --connect-timeout 20 -o "$self_copy" "$self_url" \
-            && [[ -s $self_copy ]] && grep -q '^#!/usr/bin/env bash' "$self_copy"; then
-            src="$self_copy"
-            ok 'Копия установщика получена из репозитория'
+    local self_copy="$work/mtdd-ctl.src"
+    if [[ -z $src || $src == /dev/stdin || $src == /dev/fd/* || ! -f $src ]] || [[ $src -ef $MTDD_CTL ]]; then
+        # Конвейер или запуск самого mtdd-ctl: берём свежий установщик нужного канала.
+        if fetch_launcher_source "$self_copy"; then
+            src=$self_copy
+            ok "Копия установщика получена из репозитория (канал $channel)"
         else
-            warn 'Не удалось получить установщик для mtdd-ctl; управляйте этим же скриптом'
-            warn 'Скачайте install.sh на сервер и запустите его из файла'
+            if [[ -x $MTDD_CTL ]]; then
+                launcher_installed=1
+                warn "Не удалось обновить mtdd-ctl, оставлена прежняя версия ($MTDD_CTL)"
+                warn "Обновить вручную: $(launcher_manual_command)"
+                ensure_sudo_visibility
+                return 0
+            fi
+            warn '!!! mtdd-ctl НЕ УСТАНОВЛЕН: не удалось скачать install.sh из репозитория'
+            warn "!!! Установите менеджер вручную: $(launcher_manual_command)"
             return 0
         fi
     fi
-    if [[ $src -ef $MTDD_CTL ]]; then
-        launcher_installed=1
-        ok "Менеджер управления уже установлен: sudo mtdd-ctl"
-        return 0
-    fi
-    if install -m 0755 "$src" "$MTDD_CTL"; then
+    if install_launcher_file "$src"; then
         launcher_installed=1
         ok "Менеджер управления: sudo mtdd-ctl ($MTDD_CTL)"
     else
         warn 'Не удалось установить mtdd-ctl; управление доступно через этот же скрипт'
+        warn "Установите вручную: $(launcher_manual_command)"
+        return 0
     fi
+    ensure_sudo_visibility
 }
 
 download_and_stage() {
@@ -1751,6 +2456,9 @@ run_install() {
     step "Публичный адрес для ссылок: $public_host${public_port:+:$public_port}"
 
     download_and_stage
+    # Менеджер ставим сразу после проверки бинарника: сбой запуска службы ниже
+    # (set -e) не должен оставить сервер без mtdd-ctl.
+    install_launcher_copy
 
     if ! getent passwd mtdd >/dev/null; then
         useradd --system --user-group --home-dir "$MTDD_STATE" --shell /usr/sbin/nologin mtdd
@@ -1776,7 +2484,9 @@ if os.environ["MTDD_PUBLIC_PORT"]:
 users = {"version": 1, "revision": 1, "users": [{"name": os.environ["MTDD_INSTALL_USER"],
          "secret": secrets.token_hex(16), "enabled": True, "max_connections": None, "generation": 1}]}
 Path('/etc/mtdd/config.json').write_text(json.dumps(config, indent=2) + '\n')
-Path('/etc/mtdd/credentials.env').write_text('MTDD_API_TOKEN=' + secrets.token_hex(32) + '\n')
+Path('/etc/mtdd/credentials.env').write_text(''.join(
+    f'{name}={secrets.token_hex(32)}\n'
+    for name in ('MTDD_API_TOKEN', 'MTDD_API_READ_TOKEN', 'MTDD_METRICS_TOKEN')))
 Path('/var/lib/mtdd/users.json').write_text(json.dumps(users, indent=2) + '\n')
 PY
         chown root:mtdd /etc/mtdd/config.json
@@ -1785,10 +2495,34 @@ PY
         chmod 0600 /etc/mtdd/credentials.env
         chown mtdd:mtdd "$MTDD_STATE/users.json"
         chmod 0600 "$MTDD_STATE/users.json"
+    else
+        # Обновление: дописываем недостающие токены, существующие значения не трогаем.
+        python3 - "$MTDD_CREDS" <<'PY'
+import re
+import secrets
+import sys
+
+path = sys.argv[1]
+with open(path, 'r+') as f:  # открытие на месте сохраняет владельца и режим файла
+    text = f.read()
+    add = ''
+    for name in ('MTDD_API_READ_TOKEN', 'MTDD_METRICS_TOKEN'):
+        if not re.search(r'^(export\s+)?' + name + r'=', text, re.M):
+            add += f'{name}={secrets.token_hex(32)}\n'
+    if add:
+        if text and not text.endswith('\n'):
+            add = '\n' + add
+        f.write(add)
+PY
     fi
     config_candidate=$(mktemp /etc/mtdd/.config.XXXXXXXX)
     trap 'rm -rf -- "$work"; rm -f -- "$staged" "$config_candidate"' EXIT
-    MTDD_PUBLIC_HOST=$public_host MTDD_PUBLIC_PORT=$public_port python3 - "$config_candidate" <<'PY'
+    # Отдельные токены read/metrics и файл расхода квот знает только новый бинарник:
+    # сначала пробуем конфиг с ними, при отказе (старый канал) — без них.
+    local scoped
+    for scoped in 1 0; do
+        MTDD_SCOPED_TOKENS=$scoped MTDD_PUBLIC_HOST=$public_host MTDD_PUBLIC_PORT=$public_port \
+            python3 - "$config_candidate" <<'PY'
 import json, os, sys
 from pathlib import Path
 config = json.loads(Path('/etc/mtdd/config.json').read_text())
@@ -1807,9 +2541,20 @@ except (OSError, StopIteration, ValueError):
 if ram:
     config.setdefault('global_buffer_bytes', max(64 << 20, min(ram // 4, 1 << 30)))
 config.setdefault('me_connections_per_dc', 16)
+scoped = {'api_read_token_env': 'MTDD_API_READ_TOKEN', 'metrics_token_env': 'MTDD_METRICS_TOKEN',
+          'usage_state_path': '/var/lib/mtdd/usage.json'}
+if os.environ['MTDD_SCOPED_TOKENS'] == '1':
+    for key, value in scoped.items():
+        config.setdefault(key, value)
+else:
+    for key in scoped:
+        config.pop(key, None)
 Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + '\n')
 PY
-    "$staged" --config "$config_candidate" --check-config >/dev/null || die 'Проверка конфигурации не пройдена'
+        if "$staged" --config "$config_candidate" --check-config >/dev/null 2>&1; then break; fi
+        ((scoped)) && continue
+        "$staged" --config "$config_candidate" --check-config >/dev/null || die 'Проверка конфигурации не пройдена'
+    done
     chown root:mtdd "$config_candidate"
     chmod 0640 "$config_candidate"
     mv -f -- "$config_candidate" "$MTDD_CONF"
@@ -1850,7 +2595,6 @@ EOF
     step 'Запускаю службу systemd…'
     systemctl enable --now "$MTDD_SERVICE"
     if ((!fresh)); then systemctl restart "$MTDD_SERVICE"; fi
-    install_launcher_copy
     section 'Готово · ссылки для Telegram'
     ok "Бинарник: $channel · служба: mtdd"
     warn 'Ссылки содержат секреты. Передавайте их только своим пользователям.'
@@ -1858,7 +2602,11 @@ EOF
     print_links_from_files
     printf '\n'
     if ((launcher_installed)); then
-        step 'Управление: sudo mtdd-ctl (меню)'
+        if verify_launcher_resolves; then
+            step 'Управление: sudo mtdd-ctl (меню)'
+        else
+            step "Управление: sudo $MTDD_CTL (меню)"
+        fi
     else
         step 'Управление: sudo bash '"$src_desc"' (то же меню, что и mtdd-ctl)'
     fi
@@ -2038,6 +2786,8 @@ UNIT
 # ---------------------------------------------------------------------------
 # Диспетчер
 # ---------------------------------------------------------------------------
+# Тестовый хук: подключить функции без запуска (MTDD_INSTALLER_SOURCE_ONLY=1 source install.sh).
+if [[ ${MTDD_INSTALLER_SOURCE_ONLY:-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
 for cmd_dep in curl sha256sum awk mktemp install; do need "$cmd_dep"; done
 if [[ -n $command ]]; then
     case $command in

@@ -426,6 +426,14 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     }
     client.metrics->add_payload(control::Direction::server_to_client, payload.size());
     media_account(client, payload.size(), now);
+    note_ip_payload(client, payload.size());
+    // ME shares one socket across users, so s2c cannot be gated at the source.
+    // Charge the bucket anyway: an overdrawn bucket pauses this client's c2s
+    // reads (see update_client_interest), which throttles request-driven
+    // downloads. A single answer can still exceed the rate momentarily.
+    if (client.rate_down != 0) {
+        charge_rate(client, control::Direction::server_to_client, payload.size(), now);
+    }
     client.awaiting_reply = false;
     ++me.ans_delivered;
     stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::delivered);

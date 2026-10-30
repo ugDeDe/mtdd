@@ -112,6 +112,188 @@ TEST(Runtime, UniqueIpKeyNormalizesIpv4MappedAndKeepsNativeV6Distinct) {
     EXPECT_FALSE(std::equal(v4.begin(), v4.begin() + 16, native.begin()));
 }
 
+TEST(Runtime, UniqueIpCollapseKeepsIpv4AndMappedAndTruncatesIpv6ToSlash64) {
+    using mtdd::detail::collapse_ip_key;
+    using mtdd::detail::IpKey;
+    const auto key_of = [](const std::array<std::uint8_t, 16>& address) {
+        const auto wire = mtdd::protocol::Endpoint::v6(address, 1).wire20();
+        IpKey key{};
+        std::copy_n(wire.begin(), key.size(), key.begin());
+        return collapse_ip_key(key);
+    };
+    // Same /64, different interface identifiers (privacy-address rotation).
+    const std::array<std::uint8_t, 16> a{0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8};
+    auto b = a;
+    b[8] = 0xfe;
+    b[15] = 0x99;
+    auto other_prefix = a;
+    other_prefix[7] = 3;
+    EXPECT_EQ(key_of(a), key_of(b));
+    EXPECT_NE(key_of(a), key_of(other_prefix));
+    // The collapsed key keeps the /64 and zeroes the host half.
+    const IpKey collapsed = key_of(a);
+    EXPECT_TRUE(std::equal(a.begin(), a.begin() + 8, collapsed.begin()));
+    EXPECT_TRUE(std::all_of(collapsed.begin() + 8, collapsed.end(),
+                            [](std::uint8_t byte) { return byte == 0; }));
+    // IPv4 and IPv4-mapped addresses are untouched, so /32 hosts stay distinct.
+    const auto v4a = mtdd::protocol::Endpoint::v4({192, 0, 2, 1}, 1).wire20();
+    const auto v4b = mtdd::protocol::Endpoint::v4({192, 0, 2, 2}, 1).wire20();
+    IpKey ka{};
+    IpKey kb{};
+    std::copy_n(v4a.begin(), ka.size(), ka.begin());
+    std::copy_n(v4b.begin(), kb.size(), kb.begin());
+    EXPECT_EQ(collapse_ip_key(ka), ka);
+    EXPECT_NE(collapse_ip_key(ka), collapse_ip_key(kb));
+}
+
+// A handshake alone counts as "seen" but not "active" (default 1 MiB).
+TEST(Runtime, UniqueIpHandshakeOnlyIsSeenButNotActive) {
+    Daemon daemon(1, false, [](mtdd::Config& config) {
+        config.handshake_timeout = std::chrono::seconds{10};
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour == 1; }, 2000ms));
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.unique_ip_min_bytes, 1048576U);
+    EXPECT_EQ(snapshot.active_unique_ips, 1U);
+    EXPECT_EQ(snapshot.qualified_unique_ips, 0U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_active, 1U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.day, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.week, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour_active, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.day_active, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.week_active, 0U);
+}
+
+// unique_ip_min_bytes == 0 means active == seen: qualified at handshake.
+TEST(Runtime, UniqueIpMinBytesZeroMakesActiveEqualSeen) {
+    Daemon daemon(1, false, [](mtdd::Config& config) {
+        config.handshake_timeout = std::chrono::seconds{10};
+        config.unique_ip_min_bytes = 0;
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour_active == 1; },
+        2000ms));
+    auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.active_unique_ips, 1U);
+    EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.day_active, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.week_active, 1U);
+    client.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto current = daemon.services.stats.snapshot();
+            return current.active_unique_ips == 0 && current.qualified_unique_ips == 0;
+        },
+        2000ms));
+    snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour_active, 1U);  // history outlives the session
+}
+
+// The IP becomes active once, on the first connection that crosses the byte
+// threshold; more qualified connections from the same IP do not add to it, and
+// it stays active until the last qualified connection closes.
+TEST(Runtime, UniqueIpBecomesActiveAfterByteThresholdExactlyOnce) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true, [](mtdd::Config& config) {
+        config.unique_ip_min_bytes = 1;
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    TestClient first(daemon.port(), secret_bytes());
+    TestClient second(daemon.port(), secret_bytes());
+    TestClient idle(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(idle.valid());
+    ASSERT_TRUE(first.send_hello(0, 21));
+    ASSERT_TRUE(second.send_hello(0, 22));
+    ASSERT_TRUE(idle.send_hello(0, 23));
+    ASSERT_TRUE(first.start_obfuscation(2));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(idle.start_obfuscation(2));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour == 1; }, 2000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.active_unique_ips, 1U);
+        EXPECT_EQ(snapshot.qualified_unique_ips, 0U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour_active, 0U);
+    }
+
+    ASSERT_TRUE(first.send_message(burst_payload(0)));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().qualified_unique_ips == 1; }, 3000ms));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour_active == 1; },
+        2000ms));
+    ASSERT_TRUE(second.send_message(burst_payload(1)));
+    ASSERT_TRUE(first.send_message(burst_payload(2)));
+    const std::uint64_t floor = burst_payload(0).size() * 3;
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.users.at("alice").payload_c2s_bytes >= floor;
+        },
+        3000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.active_unique_ips, 1U);
+        EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+        EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.day_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.week_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour, 1U);
+    }
+
+    // Closing a connection that never qualified, then one of two qualified
+    // ones, must keep the IP active.
+    idle.close();
+    first.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.users.at("alice").active_connections == 1;
+        },
+        2000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+        EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+    }
+    // A half-closed client with an unanswered ME request is held until
+    // shutdown_timeout (2 s in the fixture), so wait past it.
+    second.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.active_unique_ips == 0 && snapshot.qualified_unique_ips == 0;
+        },
+        5000ms))
+        << "active=" << daemon.services.stats.snapshot().active_unique_ips
+        << " qualified=" << daemon.services.stats.snapshot().qualified_unique_ips
+        << " conns=" << daemon.services.stats.snapshot().users.at("alice").active_connections;
+    const auto after = daemon.services.stats.snapshot();
+    EXPECT_EQ(after.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(after.unique_ip_history.hour_active, 1U);
+    EXPECT_EQ(after.ip_history_observation_failures, 0U);
+}
+
 TEST(Runtime, UniqueIpsShutdownClearsActiveCounts) {
     Daemon daemon(1, false, [](mtdd::Config& config) {
         config.handshake_timeout = std::chrono::seconds{10};

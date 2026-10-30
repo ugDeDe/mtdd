@@ -1,11 +1,14 @@
 // Calendar-bound unique-IP estimates for mtdd (global only, no per-user
-// history). Three fixed 1024-register HyperLogLog sketches (~3 KiB total,
+// history). Two sets of three fixed 1024-register HyperLogLog sketches (~3 KiB per set,
 // ~3.25% relative standard error, not a hard bound) count unique canonical
 // client IPs for:
 //   hour: current UTC hour
 //   day:  current UTC midnight-based day
 //   week: current ISO week (Monday 00:00 UTC)
 // These are fixed calendar boundaries, not rolling windows.
+// The "seen" set is fed by observe() (authenticated handshake); the "active" set
+// by observe_active() (IP transferred at least the configured payload bytes).
+// Both rotate together and use the same HMAC key.
 //
 // Only the caller advances periods through rotate(). observe() and snapshot()
 // never rotate implicitly, so the runtime can seed long-lived active IPs after
@@ -26,6 +29,7 @@
 // synchronous checkpoint intended for tests and shutdown only; do not call it
 // from the proxy reactor. Checkpoint failures increment persistence_failures and
 // are retried; they never reset counts or terminate the process. The state file
+// (state format version 2; version 1 files load with empty active sketches)
 // stores only the random HMAC key, register arrays and timestamps: no IP
 // addresses and no per-address data. Neither the key nor any address is logged.
 //
@@ -45,6 +49,10 @@ struct IpHistorySnapshot {
   uint64_t hour{};
   uint64_t day{};
   uint64_t week{};
+  // Same periods, counting only IPs observed through observe_active().
+  uint64_t hour_active{};
+  uint64_t day_active{};
+  uint64_t week_active{};
   int64_t hour_started_at{};
   int64_t day_started_at{};
   int64_t week_started_at{};
@@ -77,6 +85,8 @@ class IpHistory {
   // Hashes ip with the persisted key and updates all three sketches. Returns
   // true when the keyed hash and register update completed. Does not rotate.
   bool observe(const Ip& ip);
+  // Same, for the "active" sketches only.
+  bool observe_active(const Ip& ip);
 
   // Consistent copy of estimates and timestamps. Does not rotate or perform
   // I/O. Counts are HLL estimates of unique IPs, never unique people.

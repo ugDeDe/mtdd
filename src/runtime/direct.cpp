@@ -220,7 +220,8 @@ void Runtime::Impl::update_direct_interest(Client& client) {
         desired |= EPOLLOUT;
     } else {
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
-        if (!client.direct_eof && !client.direct_budget_paused && !client.media_throttled) {
+        if (!client.direct_eof && !client.direct_budget_paused && !client.media_throttled &&
+            !client.rate_pause_s2c) {
             // While paused, keep EPOLLIN out of the mask or a level-triggered
             // epoll wakes forever on the unread DC bytes. RDHUP is persistent
             // once seen, so it is also removed during pause and after latching
@@ -289,6 +290,7 @@ void Runtime::Impl::pump_direct_c2s(Client& client) {
 
 void Runtime::Impl::read_direct_backend(Client& client, Time now) {
     if (client.direct_connecting || client.direct_eof || !client.out) return;
+    if (client.rate_pause_s2c) return;  // resumed by process_rate_resumes()
     if (!budget_allows(detail::kDirectReadReservation)) {
         if (!client.direct_budget_paused) {
             client.direct_budget_paused = true;
@@ -309,6 +311,7 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
     std::size_t total = 0;
     bool eof = false;
     while (total < detail::kReadBatch) {
+        if (client.rate_pause_s2c) break;
         // Bytes already staged in this read's batch count against the client
         // queue limit, so a slow client still pauses DC reads.
         const std::size_t queued = client.out->bytes() + client.s2c_batch.size();
@@ -339,6 +342,10 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
             }
             if (client.metrics) {
                 client.metrics->add_payload(control::Direction::server_to_client, bytes);
+                note_ip_payload(client, bytes);
+                if (client.rate_down != 0) {
+                    charge_rate(client, control::Direction::server_to_client, bytes, now);
+                }
             }
             media_account(client, bytes, now);
             client.awaiting_reply = false;
@@ -413,7 +420,7 @@ void Runtime::Impl::handle_direct_backend(Client& client, std::uint32_t events, 
         }
         update_direct_interest(client);
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
-        if (room && !client.direct_budget_paused) {
+        if (room && !client.direct_budget_paused && !client.rate_pause_s2c) {
             read_direct_backend(client, now);
             if (clients_.find(client.token) == clients_.end()) return;
         }

@@ -850,4 +850,159 @@ TEST(IpHistory, ExistingPrivateStateFileIsAccepted) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// "Active" sketches (IPs past the byte threshold) and state format v2
+// ---------------------------------------------------------------------------
+
+// 3 sigma of the HLL relative standard error: 3 * 1.04 / sqrt(1024).
+constexpr double kThreeSigma = 3.0 * 1.04 / 32.0;
+
+class IpHistoryAccuracy : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(IpHistoryAccuracy, SeenAndActiveEstimatesStayWithinThreeSigma) {
+  const uint32_t count = GetParam();
+  TempDir directory;
+  IpHistory history(pinned_state(directory, "accuracy.json", 0x33));
+  // Different key ranges: the two sketches are fed independently.
+  for (uint32_t i = 0; i < count; ++i) {
+    ASSERT_TRUE(history.observe(make_ip(i)));
+    ASSERT_TRUE(history.observe_active(make_ip(0x100000 + i)));
+  }
+  const IpHistorySnapshot snapshot = history.snapshot();
+  const double tolerance = static_cast<double>(count) * kThreeSigma;
+  for (const uint64_t estimate :
+       {snapshot.hour, snapshot.day, snapshot.week, snapshot.hour_active,
+        snapshot.day_active, snapshot.week_active}) {
+    EXPECT_NEAR(static_cast<double>(estimate), static_cast<double>(count), tolerance);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Distinct, IpHistoryAccuracy,
+                         ::testing::Values(10'000U, 100'000U));
+
+TEST(IpHistory, ActiveSketchesAreIndependentOfSeenAndIdempotent) {
+  TempDir directory;
+  IpHistory history(pinned_state(directory, "active.json", 0x44));
+  ASSERT_TRUE(history.observe_active(make_ip(1)));
+  IpHistorySnapshot snapshot = history.snapshot();
+  EXPECT_EQ(snapshot.hour, 0U);
+  EXPECT_EQ(snapshot.hour_active, 1U);
+  EXPECT_EQ(snapshot.day_active, 1U);
+  EXPECT_EQ(snapshot.week_active, 1U);
+
+  ASSERT_TRUE(history.observe(make_ip(1)));
+  ASSERT_TRUE(history.observe(make_ip(2)));
+  ASSERT_TRUE(history.observe_active(make_ip(1)));  // duplicate
+  snapshot = history.snapshot();
+  EXPECT_EQ(snapshot.hour, 2U);
+  EXPECT_EQ(snapshot.hour_active, 1U);
+}
+
+TEST(IpHistory, ActiveSketchesRotateWithTheirPeriods) {
+  TempDir directory;
+  IpHistory history(pinned_state(directory, "active-rotate.json", 0x55));
+  ASSERT_TRUE(history.rotate(kTue1030));
+  ASSERT_TRUE(history.observe(make_ip(1)));
+  ASSERT_TRUE(history.observe_active(make_ip(1)));
+  ASSERT_TRUE(history.rotate(kTue1100));  // new hour only
+  IpHistorySnapshot snapshot = history.snapshot();
+  EXPECT_EQ(snapshot.hour_active, 0U);
+  EXPECT_EQ(snapshot.day_active, 1U);
+  EXPECT_EQ(snapshot.week_active, 1U);
+  ASSERT_TRUE(history.rotate(kNextMon0000));  // new day and week
+  snapshot = history.snapshot();
+  EXPECT_EQ(snapshot.day_active, 0U);
+  EXPECT_EQ(snapshot.week_active, 0U);
+}
+
+TEST(IpHistory, VersionTwoStateRoundTripsActiveSketches) {
+  TempDir directory;
+  const std::filesystem::path path = directory.file("unique-ips.json");
+  IpHistorySnapshot before;
+  {
+    IpHistory history(path);
+    for (uint32_t i = 0; i < 500; ++i) ASSERT_TRUE(history.observe(make_ip(i)));
+    for (uint32_t i = 0; i < 200; ++i) ASSERT_TRUE(history.observe_active(make_ip(i)));
+    ASSERT_TRUE(history.flush());
+    before = history.snapshot();
+  }
+  const nlohmann::json root = nlohmann::json::parse(read_text(path));
+  EXPECT_EQ(root["version"], 2);
+  EXPECT_EQ(root["hour_active_registers"].get<std::string>().size(), 2048U);
+  EXPECT_EQ(file_mode(path), 0600U);
+
+  IpHistory restarted(path);
+  const IpHistorySnapshot after = restarted.snapshot();
+  EXPECT_EQ(after.hour, before.hour);
+  EXPECT_EQ(after.hour_active, before.hour_active);
+  EXPECT_EQ(after.day_active, before.day_active);
+  EXPECT_EQ(after.week_active, before.week_active);
+  EXPECT_NEAR(static_cast<double>(after.hour_active), 200.0, 25.0);
+  // Same key after restart: re-observing keeps the active estimate unchanged.
+  ASSERT_TRUE(restarted.observe_active(make_ip(7)));
+  EXPECT_EQ(restarted.snapshot().hour_active, before.hour_active);
+}
+
+TEST(IpHistory, VersionOneStateLoadsWithEmptyActiveAndIsUpgradedOnCheckpoint) {
+  TempDir directory;
+  const std::filesystem::path path = directory.file("unique-ips.json");
+  IpHistorySnapshot before;
+  {
+    IpHistory history(path);
+    for (uint32_t i = 0; i < 300; ++i) ASSERT_TRUE(history.observe(make_ip(i)));
+    ASSERT_TRUE(history.flush());
+    before = history.snapshot();
+  }
+  nlohmann::json root = nlohmann::json::parse(read_text(path));
+  root["version"] = 1;
+  root.erase("hour_active_registers");
+  root.erase("day_active_registers");
+  root.erase("week_active_registers");
+  write_text(path, root.dump() + "\n");
+
+  {
+    IpHistory history(path);
+    const IpHistorySnapshot loaded = history.snapshot();
+    EXPECT_EQ(loaded.hour, before.hour);
+    EXPECT_EQ(loaded.day, before.day);
+    EXPECT_EQ(loaded.week, before.week);
+    EXPECT_EQ(loaded.hour_active, 0U);
+    EXPECT_EQ(loaded.day_active, 0U);
+    EXPECT_EQ(loaded.week_active, 0U);
+    ASSERT_TRUE(history.observe_active(make_ip(5)));
+    ASSERT_TRUE(history.flush());
+  }
+  // The checkpoint rewrote the file as v2, keeping the seen sketches.
+  EXPECT_EQ(nlohmann::json::parse(read_text(path))["version"], 2);
+  IpHistory reopened(path);
+  const IpHistorySnapshot upgraded = reopened.snapshot();
+  EXPECT_EQ(upgraded.hour, before.hour);
+  EXPECT_EQ(upgraded.hour_active, 1U);
+}
+
+TEST(IpHistory, VersionMismatchesInStateFileAreRejected) {
+  TempDir directory;
+  const std::filesystem::path path = directory.file("unique-ips.json");
+  {
+    IpHistory history(path);
+    ASSERT_TRUE(history.flush());
+  }
+  const nlohmann::json valid = nlohmann::json::parse(read_text(path));
+
+  nlohmann::json future = valid;
+  future["version"] = 3;
+  write_text(path, future.dump() + "\n");
+  EXPECT_THROW((void)IpHistory{path}, std::runtime_error);
+
+  nlohmann::json v1_with_active = valid;  // active fields did not exist in v1
+  v1_with_active["version"] = 1;
+  write_text(path, v1_with_active.dump() + "\n");
+  EXPECT_THROW((void)IpHistory{path}, std::runtime_error);
+
+  nlohmann::json v2_missing = valid;
+  v2_missing.erase("week_active_registers");
+  write_text(path, v2_missing.dump() + "\n");
+  EXPECT_THROW((void)IpHistory{path}, std::runtime_error);
+}
+
 }  // namespace

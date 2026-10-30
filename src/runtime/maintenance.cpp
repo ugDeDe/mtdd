@@ -410,7 +410,10 @@ void Runtime::Impl::finalize() {
             const std::lock_guard lock{shared_->ip_mutex};
             shared_->unique_ip_counts.clear();
             shared_->user_unique_ip_counts.clear();
+            shared_->active_ip_counts.clear();
+            shared_->user_active_ip_counts.clear();
             stats_.set_active_unique_ips(0);
+            stats_.set_qualified_unique_ips(0);
         }
     }
     barrier_.stop();

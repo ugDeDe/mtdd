@@ -118,6 +118,53 @@ class Result {
 
 // max_connections == nullopt means "unlimited"; 0 is rejected so null is the
 // only unlimited spelling.
+inline constexpr size_t kMaxNoteBytes = 256;
+inline constexpr uint64_t kMaxQuotaBytes = 1ull << 60;
+inline constexpr uint32_t kMaxUniqueIpsLimit = 1'000'000;
+inline constexpr uint64_t kMinRateLimitBytesPerSecond = 1024;
+inline constexpr uint64_t kMaxRateLimitBytesPerSecond = 100'000'000'000ull;
+inline constexpr int64_t kMaxExpiresAt = 253402300799;  // 9999-12-31T23:59:59Z
+
+// Optional per-user limits. nullopt / empty note means "not set". Any set
+// field makes the users file version 2; without them it stays version 1 so a
+// previous binary can still read it.
+struct UserPolicy {
+  std::optional<int64_t> expires_at;  // Unix seconds, UTC
+  std::optional<uint64_t> data_quota_bytes;  // c2s + s2c payload
+  std::optional<uint32_t> max_unique_ips;    // concurrent distinct client IPs
+  // Shaping in payload bytes per second, shared by all of the user's
+  // connections: up = client to Telegram, down = Telegram to client.
+  std::optional<uint64_t> rate_limit_up_bytes_per_sec;
+  std::optional<uint64_t> rate_limit_down_bytes_per_sec;
+  std::string note;  // admin free text, <= kMaxNoteBytes of printable UTF-8
+
+  bool empty() const noexcept {
+    return !expires_at && !data_quota_bytes && !max_unique_ips &&
+           !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           note.empty();
+  }
+  bool operator==(const UserPolicy&) const = default;
+};
+
+// Explicit-null-aware patch: outer nullopt = unchanged, inner nullopt = clear.
+template <typename T>
+using Patch = std::optional<std::optional<T>>;
+
+struct UserPolicyPatch {
+  Patch<int64_t> expires_at;
+  Patch<uint64_t> data_quota_bytes;
+  Patch<uint32_t> max_unique_ips;
+  Patch<uint64_t> rate_limit_up_bytes_per_sec;
+  Patch<uint64_t> rate_limit_down_bytes_per_sec;
+  std::optional<std::string> note;  // "" clears
+
+  bool empty() const noexcept {
+    return !expires_at && !data_quota_bytes && !max_unique_ips &&
+           !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           !note;
+  }
+};
+
 struct UserRecord {
   std::string name;
   // 32 lowercase hexadecimal characters. Sensitive: never serialize through
@@ -131,6 +178,7 @@ struct UserRecord {
   // sessions by absence from the snapshot. Runtime authorizes a session only if
   // both name and generation match the current immutable snapshot.
   uint64_t generation{1};
+  UserPolicy policy;
 };
 
 struct UserSnapshot {
@@ -168,6 +216,7 @@ struct CreateUserRequest {
   std::optional<std::string> secret;  // omitted => generate via RAND_bytes
   bool enabled{true};
   std::optional<uint32_t> max_connections;  // nullopt => unlimited
+  UserPolicy policy;
   std::optional<uint64_t> if_match;         // optional optimistic concurrency
 };
 
@@ -176,6 +225,7 @@ struct UpdateUserRequest {
   std::optional<bool> enabled;       // nullopt => unchanged
   bool set_max_connections{false};   // distinguishes absent from explicit null
   std::optional<uint32_t> max_connections;  // nullopt + set_* => unlimited
+  UserPolicyPatch policy;
   std::optional<uint64_t> if_match;
 };
 
@@ -225,6 +275,9 @@ class UserStore {
   static Result<std::string> generate_secret();
   static bool is_valid_name(std::string_view name) noexcept;
   static bool is_valid_secret_hex(std::string_view secret) noexcept;
+  // Range and content checks shared by the API and the users file parser;
+  // returns a human-readable reason on failure.
+  static std::optional<std::string> validate_policy(const UserPolicy& policy);
 
  private:
   struct Impl;
@@ -243,6 +296,11 @@ enum class RejectReason {
   handshake_timeout,
   invalid_request,
   other,
+  // Per-user policy rejections (UserPolicy / UserRecord::max_connections).
+  user_connection_limit,
+  user_expired,
+  user_quota_exceeded,
+  user_ip_limit,
 };
 
 enum class HandshakeResult { success, failure, timeout, replay };
@@ -276,6 +334,15 @@ enum class ApiRoute {
   rotate_secret,
   metrics,
   unknown,
+  system_info,
+  config,
+  stats_summary,
+  stats_me,
+  stats_users,
+  events,
+  user_enable,
+  user_disable,
+  user_reset_quota,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -289,9 +356,16 @@ const char* to_string(ApiMethod method) noexcept;
 
 struct UserMetricsSnapshot {
   uint64_t active_connections{0};
+  // Online IPs counted at authenticated handshake ("seen").
   uint64_t unique_ips_active{0};
+  // Online IPs whose connections moved >= unique_ip_min_bytes ("active").
+  uint64_t unique_ips_qualified{0};
   uint64_t payload_c2s_bytes{0};
   uint64_t payload_s2c_bytes{0};
+  // c2s + s2c payload bytes counted against UserPolicy::data_quota_bytes.
+  uint64_t quota_used_bytes{0};
+  // Unix seconds of the last reset_quota(); 0 = never reset.
+  int64_t quota_reset_at{0};
 };
 
 struct MeDcSnapshot {
@@ -405,7 +479,9 @@ struct StatisticsSnapshot {
   bool ready{false};
   uint64_t connections_accepted_total{0};
   uint64_t connections_active{0};
-  uint64_t active_unique_ips{0};
+  uint64_t active_unique_ips{0};     // online, counted at handshake ("seen")
+  uint64_t qualified_unique_ips{0};  // online, past the byte threshold ("active")
+  uint64_t unique_ip_min_bytes{0};
   uint64_t connections_rejected_total{0};
   std::map<std::string, uint64_t> rejected_by_reason;
   std::map<std::string, uint64_t> handshakes_by_result;
@@ -442,19 +518,52 @@ class UserMetrics {
   // per-user limit when two reactors admitted the same user concurrently.
   bool try_connection_open(uint64_t limit) noexcept;
   void connection_closed() noexcept;
+  // Also adds `bytes` to the quota counter, so every payload call site is
+  // quota-accounted without a second call.
   void add_payload(Direction direction, uint64_t bytes) noexcept;
+
+  // Quota counter (c2s + s2c payload). Not reset by connection churn.
+  uint64_t quota_used_bytes() const noexcept;
+  void set_quota_used_bytes(uint64_t value) noexcept;
+  // Startup restore of a persisted counter: both fields at once.
+  void restore_quota(uint64_t used_bytes, int64_t reset_at) noexcept;
+  // Zeroes the counter and records the wall-clock reset time (unix seconds).
+  void reset_quota() noexcept;
+  int64_t quota_reset_at() const noexcept;
+
+  // Per-user token bucket (one per direction), shared by every connection of
+  // the user on every reactor. Implemented as a GCRA "theoretical arrival
+  // time" in steady-clock nanoseconds, so it is one lock-free atomic per
+  // direction and a rate change needs no bucket state migration.
+  // Charges `bytes` against `rate_bytes_per_sec` (0 = unlimited, no-op).
+  // Always succeeds (debt model): returns the steady-clock time in ns at which
+  // the direction may be read again, or 0 if no pause is needed.
+  int64_t rate_consume(Direction direction, uint64_t bytes,
+                       uint64_t rate_bytes_per_sec, int64_t now_ns) noexcept;
+  // Same pause computation without charging anything.
+  int64_t rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
+                         int64_t now_ns) const noexcept;
+  // Burst allowance in bytes for a rate: max(rate, 64 KiB).
+  static uint64_t rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept;
 
   uint64_t active_connections() const noexcept;
   void set_active_unique_ips(uint64_t value) noexcept;
   uint64_t active_unique_ips() const noexcept;
+  void set_qualified_unique_ips(uint64_t value) noexcept;
+  uint64_t qualified_unique_ips() const noexcept;
   uint64_t payload_c2s_bytes() const noexcept;
   uint64_t payload_s2c_bytes() const noexcept;
 
  private:
   std::atomic<uint64_t> active_{0};
   std::atomic<uint64_t> unique_ips_{0};
+  std::atomic<uint64_t> qualified_ips_{0};
   std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
+  std::atomic<uint64_t> quota_used_{0};
+  std::atomic<int64_t> quota_reset_at_{0};
+  // Own cache line: rate buckets are written by every reactor serving the user.
+  alignas(64) std::atomic<int64_t> rate_tat_[2]{};
 };
 
 // Thread-safe. Label sets are bounded by construction (enums and fixed label
@@ -493,6 +602,9 @@ class Statistics {
   void forget_user(std::string_view name) noexcept;
 
   void set_active_unique_ips(uint64_t value) noexcept;
+  // Online IPs past the byte threshold; see Config::unique_ip_min_bytes.
+  void set_qualified_unique_ips(uint64_t value) noexcept;
+  void set_unique_ip_min_bytes(uint64_t value) noexcept;
 
   // Startup-only, once, before the reactor/control threads run. An empty path
   // is memory-only. Construction may throw a generic startup/read error.
@@ -502,6 +614,8 @@ class Statistics {
   // Canonical 16-byte IP without port. False when disabled or the keyed HLL
   // update failed. Never affects proxy clients.
   bool observe_ip_history(const std::array<std::uint8_t, 16>& ip) noexcept;
+  // Same, for the "active" sketches (IP passed the byte threshold).
+  bool observe_ip_history_active(const std::array<std::uint8_t, 16>& ip) noexcept;
 
   void set_buffer_bytes(BufferState state, uint64_t bytes) noexcept;
   void set_buffer_bytes(std::size_t worker, BufferState state, uint64_t bytes) noexcept;
@@ -627,6 +741,8 @@ class Statistics {
   static std::string escape_label(std::string_view value);
 
  private:
+  bool observe_history(const std::array<std::uint8_t, 16>& ip, bool active) noexcept;
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -635,7 +751,12 @@ class Statistics {
 // HTTP control server
 // ---------------------------------------------------------------------------
 
+// A listener either serves the management API (/v1/*, plus the deprecated
+// /metrics alias for the admin token) or only the Prometheus exporter.
+enum class HttpRole { api, metrics };
+
 struct HttpOptions {
+  HttpRole role{HttpRole::api};
   std::string public_host;
   uint16_t public_port{0};
   std::string tls_domain;
@@ -643,7 +764,16 @@ struct HttpOptions {
   uint16_t port{0};  // 0 => ephemeral, actual port from start()
   // Required; never persisted or logged by this module. Supplied by the leader
   // from the environment.
+  // api role: admin token, required. Ignored by the metrics role.
   std::string bearer_token;
+  // api role, optional: GET-only token; never sees /links or /metrics.
+  std::string read_token;
+  // metrics role, optional: when empty the listener relies on allow_networks
+  // alone, which then must not be empty.
+  std::string metrics_token;
+  // CIDR allowlist of peer addresses ("127.0.0.0/8", "::1"). Empty => any
+  // peer that holds a valid token. Refused peers get 403 before auth.
+  std::vector<std::string> allow_networks;
   size_t max_body_bytes{64 * 1024};
   size_t max_header_bytes{16 * 1024};
   // Max retained HTTP connections (1..4096). Each accepted connection gets an
@@ -659,6 +789,11 @@ struct HttpOptions {
   double global_rate_limit_per_second{1000.0};
   double global_rate_limit_burst{2000.0};
   size_t rate_limit_sources{256};
+  // api role: pre-rendered JSON objects served by GET /v1/config and merged
+  // into GET /v1/system/info. Built by the leader from Config with every token
+  // and the ad_tag left out; empty means "{}".
+  std::string config_json;
+  std::string system_info_json;
 };
 
 class ControlServer {

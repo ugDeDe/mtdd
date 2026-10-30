@@ -17,17 +17,19 @@
 namespace mtdd::control {
 namespace {
 
-constexpr size_t kRejectReasonCount = 6;
+constexpr size_t kRejectReasonCount = 10;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 9;
+constexpr size_t kApiRouteCount = 18;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
 
 constexpr std::array<const char*, kRejectReasonCount> kRejectLabels = {
     "overload", "rate_limited", "auth_failed",
-    "handshake_timeout", "invalid_request", "other"};
+    "handshake_timeout", "invalid_request", "other",
+    "user_connection_limit", "user_expired", "user_quota_exceeded",
+    "user_ip_limit"};
 
 constexpr std::array<const char*, kHandshakeResultCount> kHandshakeLabels = {
     "success", "failure", "timeout", "replay"};
@@ -38,7 +40,10 @@ constexpr std::array<const char*, kBufferStateCount> kBufferLabels = {
 constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/health", "/v1/ready", "/v1/status", "/v1/users",
     "/v1/users/{name}", "/v1/users/{name}/rotate-secret", "/metrics", "unknown",
-    "/v1/users/{name}/links"};
+    "/v1/users/{name}/links", "/v1/system/info", "/v1/config",
+    "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
+    "/v1/users/{name}/enable", "/v1/users/{name}/disable",
+    "/v1/users/{name}/reset-quota"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -62,6 +67,10 @@ size_t reject_index(RejectReason reason) {
     case RejectReason::handshake_timeout: return 3;
     case RejectReason::invalid_request: return 4;
     case RejectReason::other: return 5;
+    case RejectReason::user_connection_limit: return 6;
+    case RejectReason::user_expired: return 7;
+    case RejectReason::user_quota_exceeded: return 8;
+    case RejectReason::user_ip_limit: return 9;
   }
   return 5;
 }
@@ -96,6 +105,15 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::metrics: return 6;
     case ApiRoute::unknown: return 7;
     case ApiRoute::user_links: return 8;
+    case ApiRoute::system_info: return 9;
+    case ApiRoute::config: return 10;
+    case ApiRoute::stats_summary: return 11;
+    case ApiRoute::stats_me: return 12;
+    case ApiRoute::stats_users: return 13;
+    case ApiRoute::events: return 14;
+    case ApiRoute::user_enable: return 15;
+    case ApiRoute::user_disable: return 16;
+    case ApiRoute::user_reset_quota: return 17;
   }
   return 7;
 }
@@ -210,6 +228,69 @@ void UserMetrics::add_payload(Direction direction, uint64_t bytes) noexcept {
   } else {
     payload_s2c_.fetch_add(bytes, std::memory_order_relaxed);
   }
+  quota_used_.fetch_add(bytes, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::quota_used_bytes() const noexcept {
+  return quota_used_.load(std::memory_order_relaxed);
+}
+void UserMetrics::set_quota_used_bytes(uint64_t value) noexcept {
+  quota_used_.store(value, std::memory_order_relaxed);
+}
+void UserMetrics::restore_quota(uint64_t used_bytes, int64_t reset_at) noexcept {
+  quota_used_.store(used_bytes, std::memory_order_relaxed);
+  quota_reset_at_.store(reset_at, std::memory_order_relaxed);
+}
+void UserMetrics::reset_quota() noexcept {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  quota_reset_at_.store(
+      static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count()),
+      std::memory_order_relaxed);
+  quota_used_.store(0, std::memory_order_relaxed);
+}
+int64_t UserMetrics::quota_reset_at() const noexcept {
+  return quota_reset_at_.load(std::memory_order_relaxed);
+}
+
+namespace {
+constexpr uint64_t kRateMinBurstBytes = 64 * 1024;
+constexpr int64_t kRateMaxCostNs = 1'000'000'000'000'000;  // ~11.5 days
+
+int64_t rate_ns_for(uint64_t bytes, uint64_t rate) noexcept {
+  const long double ns = static_cast<long double>(bytes) * 1e9L /
+                         static_cast<long double>(rate);
+  if (ns >= static_cast<long double>(kRateMaxCostNs)) return kRateMaxCostNs;
+  return static_cast<int64_t>(ns);
+}
+}  // namespace
+
+uint64_t UserMetrics::rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept {
+  return std::max(rate_bytes_per_sec, kRateMinBurstBytes);
+}
+int64_t UserMetrics::rate_consume(Direction direction, uint64_t bytes,
+                                  uint64_t rate_bytes_per_sec,
+                                  int64_t now_ns) noexcept {
+  if (rate_bytes_per_sec == 0) return 0;
+  auto& tat = rate_tat_[direction == Direction::client_to_server ? 0 : 1];
+  const int64_t cost = rate_ns_for(bytes, rate_bytes_per_sec);
+  int64_t current = tat.load(std::memory_order_relaxed);
+  int64_t next = 0;
+  do {
+    next = std::max(current, now_ns) + cost;
+  } while (!tat.compare_exchange_weak(current, next, std::memory_order_relaxed,
+                                      std::memory_order_relaxed));
+  const int64_t resume =
+      next - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
+  return resume > now_ns ? resume : 0;
+}
+int64_t UserMetrics::rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
+                                    int64_t now_ns) const noexcept {
+  if (rate_bytes_per_sec == 0) return 0;
+  const int64_t tat =
+      rate_tat_[direction == Direction::client_to_server ? 0 : 1].load(
+          std::memory_order_relaxed);
+  const int64_t resume =
+      tat - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
+  return resume > now_ns ? resume : 0;
 }
 uint64_t UserMetrics::active_connections() const noexcept {
   return active_.load(std::memory_order_relaxed);
@@ -219,6 +300,12 @@ void UserMetrics::set_active_unique_ips(uint64_t value) noexcept {
 }
 uint64_t UserMetrics::active_unique_ips() const noexcept {
   return unique_ips_.load(std::memory_order_relaxed);
+}
+void UserMetrics::set_qualified_unique_ips(uint64_t value) noexcept {
+  qualified_ips_.store(value, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::qualified_unique_ips() const noexcept {
+  return qualified_ips_.load(std::memory_order_relaxed);
 }
 uint64_t UserMetrics::payload_c2s_bytes() const noexcept {
   return payload_c2s_.load(std::memory_order_relaxed);
@@ -372,6 +459,8 @@ struct Statistics::Impl {
   std::atomic<uint64_t> accepted{0};
   std::atomic<uint64_t> active{0};
   std::atomic<uint64_t> unique_ips{0};
+  std::atomic<uint64_t> qualified_ips{0};
+  std::atomic<uint64_t> unique_ip_min_bytes{0};
   std::atomic<uint64_t> rejected{0};
   mutable std::mutex users_mutex;
   std::unordered_map<std::string, std::shared_ptr<UserMetrics>> users;
@@ -474,6 +563,14 @@ void Statistics::set_active_unique_ips(uint64_t value) noexcept {
   impl_->unique_ips.store(value, std::memory_order_relaxed);
 }
 
+void Statistics::set_qualified_unique_ips(uint64_t value) noexcept {
+  impl_->qualified_ips.store(value, std::memory_order_relaxed);
+}
+
+void Statistics::set_unique_ip_min_bytes(uint64_t value) noexcept {
+  impl_->unique_ip_min_bytes.store(value, std::memory_order_relaxed);
+}
+
 void Statistics::enable_ip_history(std::string path) {
   if (impl_->ip_history) {
     throw std::logic_error("IP history is already enabled");
@@ -493,9 +590,20 @@ bool Statistics::rotate_ip_history(int64_t unix_seconds) noexcept {
 }
 
 bool Statistics::observe_ip_history(const std::array<std::uint8_t, 16>& ip) noexcept {
+  return observe_history(ip, false);
+}
+
+bool Statistics::observe_ip_history_active(
+    const std::array<std::uint8_t, 16>& ip) noexcept {
+  return observe_history(ip, true);
+}
+
+bool Statistics::observe_history(const std::array<std::uint8_t, 16>& ip,
+                                 bool active) noexcept {
   if (!impl_->ip_history) return false;
   try {
-    const bool observed = impl_->ip_history->observe(ip);
+    const bool observed = active ? impl_->ip_history->observe_active(ip)
+                                 : impl_->ip_history->observe(ip);
     if (!observed) {
       impl_->ip_history_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -891,6 +999,9 @@ StatisticsSnapshot Statistics::snapshot() const {
       impl_->accepted.load(std::memory_order_relaxed);
   out.connections_active = impl_->active.load(std::memory_order_relaxed);
   out.active_unique_ips = impl_->unique_ips.load(std::memory_order_relaxed);
+  out.qualified_unique_ips = impl_->qualified_ips.load(std::memory_order_relaxed);
+  out.unique_ip_min_bytes =
+      impl_->unique_ip_min_bytes.load(std::memory_order_relaxed);
   out.connections_rejected_total =
       impl_->rejected.load(std::memory_order_relaxed);
   for (size_t i = 0; i < kRejectReasonCount; ++i) {
@@ -908,8 +1019,11 @@ StatisticsSnapshot Statistics::snapshot() const {
       UserMetricsSnapshot entry;
       entry.active_connections = metrics->active_connections();
       entry.unique_ips_active = metrics->active_unique_ips();
+      entry.unique_ips_qualified = metrics->qualified_unique_ips();
       entry.payload_c2s_bytes = metrics->payload_c2s_bytes();
       entry.payload_s2c_bytes = metrics->payload_s2c_bytes();
+      entry.quota_used_bytes = metrics->quota_used_bytes();
+      entry.quota_reset_at = metrics->quota_reset_at();
       out.users.emplace(name, entry);
     }
   }
@@ -1145,11 +1259,31 @@ std::string Statistics::prometheus_text() const {
       << escape_label(snapshot.build_version) << "\"} 1\n";
   append_metric(out, "mtdd_uptime_seconds", "", snapshot.uptime_seconds);
   append_metric(out, "mtdd_connections_active", "", snapshot.connections_active);
-  append_metric(out, "mtdd_unique_ips_active", "", snapshot.active_unique_ips);
+  out << "# HELP mtdd_unique_ips_active Online unique client IPs (IPv6 as /64) "
+         "whose connections moved at least mtdd_unique_ips_min_bytes of payload.\n";
+  out << "# TYPE mtdd_unique_ips_active gauge\n";
+  append_metric(out, "mtdd_unique_ips_active", "", snapshot.qualified_unique_ips);
+  out << "# HELP mtdd_unique_ips_seen Online unique client IPs (IPv6 as /64) "
+         "counted at authenticated handshake, before any traffic.\n";
+  out << "# TYPE mtdd_unique_ips_seen gauge\n";
+  append_metric(out, "mtdd_unique_ips_seen", "", snapshot.active_unique_ips);
+  out << "# HELP mtdd_unique_ips_min_bytes Payload bytes (c2s+s2c) a connection "
+         "must move before its IP counts as active.\n";
+  out << "# TYPE mtdd_unique_ips_min_bytes gauge\n";
+  append_metric(out, "mtdd_unique_ips_min_bytes", "", snapshot.unique_ip_min_bytes);
   const auto& history = snapshot.unique_ip_history;
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"hour\"", history.hour);
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"day\"", history.day);
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"week\"", history.week);
+  out << "# HELP mtdd_unique_ips_active_estimate HyperLogLog estimate of unique "
+         "client IPs that passed the byte threshold in the calendar period.\n";
+  out << "# TYPE mtdd_unique_ips_active_estimate gauge\n";
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"hour\"",
+                history.hour_active);
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"day\"",
+                history.day_active);
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"week\"",
+                history.week_active);
   append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"hour\"",
                 static_cast<uint64_t>(history.hour_started_at));
   append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"day\"",
@@ -1172,11 +1306,21 @@ std::string Statistics::prometheus_text() const {
     append_metric(out, "mtdd_handshakes_total",
                   "result=\"" + escape_label(result) + "\"", value);
   }
+  out << "# HELP mtdd_user_quota_used_bytes Payload bytes (c2s+s2c) counted "
+         "against the user's data quota since the last quota reset.\n";
+  out << "# TYPE mtdd_user_quota_used_bytes gauge\n";
+  for (const auto& [name, metrics] : snapshot.users) {
+    const std::string label = "user=\"" + escape_label(name) + "\"";
+    append_metric(out, "mtdd_user_quota_used_bytes", label,
+                  metrics.quota_used_bytes);
+  }
   for (const auto& [name, metrics] : snapshot.users) {
     const std::string label = "user=\"" + escape_label(name) + "\"";
     append_metric(out, "mtdd_user_connections_active", label,
                   metrics.active_connections);
     append_metric(out, "mtdd_user_unique_ips_active", label,
+                  metrics.unique_ips_qualified);
+    append_metric(out, "mtdd_user_unique_ips_seen", label,
                   metrics.unique_ips_active);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
                   label + ",direction=\"c2s\"", metrics.payload_c2s_bytes);

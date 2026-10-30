@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -38,14 +40,18 @@ Arguments arguments(int argc, char** argv) {
     return result;
 }
 
-std::string api_token(const mtdd::Config& config) {
-    const auto* value = std::getenv(config.api_token_env.c_str());
+std::string token_from_env(const std::string& name) {
+    const auto* value = std::getenv(name.c_str());
     const std::string token = value ? value : "";
     if (token.size() < 32 || token.size() > 512 ||
         !std::all_of(token.begin(), token.end(), [](unsigned char c) { return c >= 33 && c <= 126; }))
-        throw std::invalid_argument("API token environment variable must contain 32..512 printable non-space characters");
+        throw std::invalid_argument(name + " must contain 32..512 printable non-space characters");
     return token;
 }
+
+// A configured-but-missing optional token is an error, not "disabled": silently
+// dropping auth from the metrics listener would be worse than not starting.
+std::string optional_token(const std::string& name) { return name.empty() ? std::string{} : token_from_env(name); }
 
 void block_shutdown_signals() {
     sigset_t signals;
@@ -60,7 +66,12 @@ void block_shutdown_signals() {
 }
 
 int serve(const mtdd::Config& config, const std::filesystem::path& config_path) {
-    const auto token = api_token(config);
+    const auto token = token_from_env(config.api_token_env);
+    const auto read_token = optional_token(config.api_read_token_env);
+    const auto metrics_token = optional_token(config.metrics_token_env);
+    if ((!read_token.empty() && (read_token == token || read_token == metrics_token)) ||
+        (!metrics_token.empty() && metrics_token == token))
+        throw std::invalid_argument("API, read and metrics tokens must all differ");
     block_shutdown_signals(); // All background threads inherit this mask.
     mtdd::RevisionBarrier applied;
     mtdd::control::StoreOptions store_options;
@@ -95,25 +106,53 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
     http.bind_address = config.control_host;
     http.port = config.control_port;
     http.bearer_token = token;
+    http.read_token = read_token;
+    http.allow_networks = config.control_allow;
     http.public_host = config.public_host;
     http.public_port = config.public_port;
     http.tls_domain = config.tls_domain;
+    http.config_json = config.public_view().dump();
+    http.system_info_json =
+        nlohmann::json{{"workers_configured", config.workers},
+                       {"security", config.security_posture()}}.dump();
     mtdd::control::ControlServer management{users, stats, std::move(http)};
     const auto listening = management.start();
     if (!listening) throw std::runtime_error("cannot start management listener");
+    std::optional<mtdd::control::ControlServer> exporter;
+    std::string metrics_endpoint{"off"};
+    if (config.metrics_port != 0) {
+        mtdd::control::HttpOptions scrape;
+        scrape.role = mtdd::control::HttpRole::metrics;
+        scrape.bind_address = config.metrics_host;
+        scrape.port = config.metrics_port;
+        scrape.metrics_token = metrics_token;
+        scrape.allow_networks = config.metrics_allow;
+        exporter.emplace(users, stats, std::move(scrape));
+        const auto scraping = exporter->start();
+        if (!scraping) {
+            management.stop();
+            throw std::runtime_error("cannot start metrics listener: " + scraping.error().message);
+        }
+        metrics_endpoint = config.metrics_host + ':' + std::to_string(scraping.value());
+    }
     std::cerr << "mtdd " << MTDD_VERSION << ": proxy=" << config.proxy_host << ':' << runtime.port()
-              << " management=" << config.control_host << ':' << listening.value() << '\n';
+              << " management=" << config.control_host << ':' << listening.value()
+              << " metrics=" << metrics_endpoint << '\n';
+    const auto stop_listeners = [&] {
+        if (exporter) exporter->stop();
+        management.stop();
+    };
     try {
         runtime.run();
     } catch (...) {
         stats.set_ready(false);
         applied.stop();
-        management.stop();
+        stop_listeners();
         throw;
     }
     stats.set_ready(false);
     applied.stop();
-    management.stop();
+    stop_listeners();
     return 0;
 }
 } // namespace
