@@ -644,6 +644,9 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         // Relay the authenticated padded-intermediate transport bytes verbatim.
         // Decoding and re-framing here would strip only 0..3 padding bytes and
         // corrupt encrypted MTProto lengths/CRC for padding 4..15.
+        if (client.device_scan_left != 0 && !scan_direct_auth_key(client, plain_buffer_, now)) {
+            return;
+        }
         try {
             client.direct_encrypt->apply(plain_buffer_);
         } catch (const std::exception&) {
@@ -696,6 +699,16 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         const std::size_t cap_limit =
             std::max(config_.connection_queue_bytes, config_.max_frame_bytes + 4096);
         for (auto& message : messages) {
+            if (client.device_scan_left != 0) {
+                --client.device_scan_left;
+                if (message.data.size() >= 8) {
+                    std::uint64_t key = 0;
+                    for (int i = 7; i >= 0; --i) {
+                        key = (key << 8) | message.data[static_cast<std::size_t>(i)];
+                    }
+                    if (key != 0 && !register_device(client, key, now)) return;
+                }
+            }
             const std::size_t bytes = message.data.capacity();
             if (client.c2s_capacity + bytes > cap_limit ||
                 !budget_allows(bytes + detail::kMeEncodeOverhead)) {
@@ -729,6 +742,10 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     const auto tag = client.tls->proto_tag();
     const std::int16_t dc = client.tls->dc_id();
     client.media = dc < 0;
+    // Devices are counted per signed DC: a device holds one current auth key
+    // per DC, and Android uses a separate temporary key for media DCs.
+    client.device_dc = dc;
+    client.device_scan_left = detail::kDeviceScanFrames;
     // The share was first computed at authentication, before the DC (and so
     // the media class) was known.
     if (client.media) recompute_rate_share(client);

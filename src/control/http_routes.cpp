@@ -407,6 +407,14 @@ std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& o
     out.max_unique_ips = *unique_ips ? std::optional<uint32_t>(static_cast<uint32_t>(**unique_ips))
                                      : std::optional<uint32_t>{};
   }
+  Patch<uint64_t> devices;
+  if (auto error = parse_nullable_u64(body, "max_devices", kMaxDevicesLimit, devices)) {
+    return error;
+  }
+  if (devices) {
+    out.max_devices = *devices ? std::optional<uint32_t>(static_cast<uint32_t>(**devices))
+                               : std::optional<uint32_t>{};
+  }
   for (const auto& [key, target] :
        {std::pair{"data_quota_bytes", &out.data_quota_bytes},
         std::pair{"rate_limit_up_bytes_per_sec", &out.rate_limit_up_bytes_per_sec},
@@ -427,6 +435,7 @@ UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
   if (patch.expires_at) policy.expires_at = *patch.expires_at;
   if (patch.data_quota_bytes) policy.data_quota_bytes = *patch.data_quota_bytes;
   if (patch.max_unique_ips) policy.max_unique_ips = *patch.max_unique_ips;
+  if (patch.max_devices) policy.max_devices = *patch.max_devices;
   if (patch.rate_limit_up_bytes_per_sec) {
     policy.rate_limit_up_bytes_per_sec = *patch.rate_limit_up_bytes_per_sec;
   }
@@ -446,6 +455,7 @@ json policy_json(const UserPolicy& policy) {
       policy.expires_at ? json(format_rfc3339(*policy.expires_at)) : json(nullptr);
   out["data_quota_bytes"] = nullable(policy.data_quota_bytes);
   out["max_unique_ips"] = nullable(policy.max_unique_ips);
+  out["max_devices"] = nullable(policy.max_devices);
   out["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
   out["rate_limit_down_bytes_per_sec"] = nullable(policy.rate_limit_down_bytes_per_sec);
   out["note"] = policy.note;
@@ -469,6 +479,7 @@ json user_json(const UserRecord& user, const StatisticsSnapshot& stats) {
   entry["stats"] = {{"active_connections", metrics.active_connections},
                     {"unique_ips_active", metrics.unique_ips_qualified},
                     {"unique_ips_seen", metrics.unique_ips_active},
+                    {"devices", metrics.devices},
                     {"payload_bytes_c2s", metrics.payload_c2s_bytes},
                     {"payload_bytes_s2c", metrics.payload_s2c_bytes},
                     {"quota_used_bytes", metrics.quota_used_bytes}};

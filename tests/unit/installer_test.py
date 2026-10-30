@@ -874,6 +874,14 @@ class UserPolicyTest(PolicyShellCase):
             with self.subTest(raw=raw):
                 self.assertRejected("max_unique_ips", raw)
 
+    def test_device_limit_bounds(self):
+        self.assertBody("max_devices", "2", 2)
+        self.assertBody("max_devices", "1000000", 1000000)
+        self.assertBody("max_devices", "none", None)
+        for raw in ("0", "1000001", "-1", "1.5", "x"):
+            with self.subTest(raw=raw):
+                self.assertRejected("max_devices", raw)
+
     def test_expiry_date_becomes_end_of_day_utc(self):
         self.assertBody("expires_at", "2030-01-01", "2030-01-01T23:59:59Z")
         self.assertBody("expires_at", "2028-02-29", "2028-02-29T23:59:59Z")

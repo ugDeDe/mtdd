@@ -139,7 +139,8 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
-        "media_user_rate_kbps", "media_total_rate_kbps", "api_read_token_env", "control_allow",
+        "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds",
+        "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
@@ -265,6 +266,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     config.client_ack_timeout = std::chrono::seconds(number(value, "client_ack_timeout_seconds", 90, 0, 3600));
     config.media_user_rate_kbps = static_cast<std::uint64_t>(number(value, "media_user_rate_kbps", 0, 0, 100000000));
     config.media_total_rate_kbps = static_cast<std::uint64_t>(number(value, "media_total_rate_kbps", 0, 0, 100000000));
+    config.device_window = std::chrono::seconds(number(value, "device_window_seconds", 900, 60, 86400));
     if (config.client_ack_timeout.count() != 0 && config.client_ack_timeout.count() < 10)
         throw std::invalid_argument("client_ack_timeout_seconds must be 0 or at least 10");
     config.direct_fallback_enabled =

@@ -182,6 +182,7 @@ std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
   if (auto error = optional_number(j, "max_unique_ips", out.max_unique_ips)) {
     return error;
   }
+  if (auto error = optional_number(j, "max_devices", out.max_devices)) return error;
   if (auto error = optional_number(j, "rate_limit_up_bytes_per_sec",
                                    out.rate_limit_up_bytes_per_sec)) {
     return error;
@@ -214,7 +215,7 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
     }
   } else if (auto error = check_allowed_store_fields(
                  j, {"name", "secret", "enabled", "max_connections", "generation",
-                     "expires_at", "data_quota_bytes", "max_unique_ips",
+                     "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
                      "rate_limit_up_bytes_per_sec",
                      "rate_limit_down_bytes_per_sec", "note"})) {
     return error;
@@ -378,6 +379,7 @@ std::string serialize_snapshot(uint64_t revision,
       entry["expires_at"] = nullable(policy.expires_at);
       entry["data_quota_bytes"] = nullable(policy.data_quota_bytes);
       entry["max_unique_ips"] = nullable(policy.max_unique_ips);
+      entry["max_devices"] = nullable(policy.max_devices);
       entry["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
       entry["rate_limit_down_bytes_per_sec"] =
           nullable(policy.rate_limit_down_bytes_per_sec);

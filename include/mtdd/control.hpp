@@ -121,6 +121,7 @@ class Result {
 inline constexpr size_t kMaxNoteBytes = 256;
 inline constexpr uint64_t kMaxQuotaBytes = 1ull << 60;
 inline constexpr uint32_t kMaxUniqueIpsLimit = 1'000'000;
+inline constexpr uint32_t kMaxDevicesLimit = 1'000'000;
 inline constexpr uint64_t kMinRateLimitBytesPerSecond = 1024;
 inline constexpr uint64_t kMaxRateLimitBytesPerSecond = 100'000'000'000ull;
 inline constexpr int64_t kMaxExpiresAt = 253402300799;  // 9999-12-31T23:59:59Z
@@ -132,6 +133,8 @@ struct UserPolicy {
   std::optional<int64_t> expires_at;  // Unix seconds, UTC
   std::optional<uint64_t> data_quota_bytes;  // c2s + s2c payload
   std::optional<uint32_t> max_unique_ips;    // concurrent distinct client IPs
+  // Distinct devices (MTProto auth keys per DC, see the runtime device table).
+  std::optional<uint32_t> max_devices;
   // Shaping in payload bytes per second, shared by all of the user's
   // connections: up = client to Telegram, down = Telegram to client.
   std::optional<uint64_t> rate_limit_up_bytes_per_sec;
@@ -139,7 +142,7 @@ struct UserPolicy {
   std::string note;  // admin free text, <= kMaxNoteBytes of printable UTF-8
 
   bool empty() const noexcept {
-    return !expires_at && !data_quota_bytes && !max_unique_ips &&
+    return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
            note.empty();
   }
@@ -154,12 +157,13 @@ struct UserPolicyPatch {
   Patch<int64_t> expires_at;
   Patch<uint64_t> data_quota_bytes;
   Patch<uint32_t> max_unique_ips;
+  Patch<uint32_t> max_devices;
   Patch<uint64_t> rate_limit_up_bytes_per_sec;
   Patch<uint64_t> rate_limit_down_bytes_per_sec;
   std::optional<std::string> note;  // "" clears
 
   bool empty() const noexcept {
-    return !expires_at && !data_quota_bytes && !max_unique_ips &&
+    return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
            !note;
   }
@@ -316,8 +320,9 @@ enum class RelayCloseReason : uint8_t {
   remote_close,    // ME sent RPC_CLOSE_CONN
   revoked,         // user disabled, deleted or rotated
   shutdown,
+  device_limit,    // a new device (auth key) beyond the user's max_devices
 };
-inline constexpr std::size_t kRelayCloseReasons = 10;
+inline constexpr std::size_t kRelayCloseReasons = 11;
 enum class Direction { client_to_server, server_to_client };
 enum class BufferState { queued, pending_write, relay };
 enum class MeResult { success, failure, timeout };
@@ -360,6 +365,8 @@ struct UserMetricsSnapshot {
   uint64_t unique_ips_active{0};
   // Online IPs whose connections moved >= unique_ip_min_bytes ("active").
   uint64_t unique_ips_qualified{0};
+  // Distinct devices (MTProto auth keys, max over DCs) within the window.
+  uint64_t devices{0};
   uint64_t payload_c2s_bytes{0};
   uint64_t payload_s2c_bytes{0};
   // c2s + s2c payload bytes counted against UserPolicy::data_quota_bytes.
@@ -559,6 +566,8 @@ class UserMetrics {
   uint64_t active_unique_ips() const noexcept;
   void set_qualified_unique_ips(uint64_t value) noexcept;
   uint64_t qualified_unique_ips() const noexcept;
+  void set_devices(uint64_t value) noexcept;
+  uint64_t devices() const noexcept;
   uint64_t payload_c2s_bytes() const noexcept;
   uint64_t payload_s2c_bytes() const noexcept;
 
@@ -566,6 +575,7 @@ class UserMetrics {
   std::atomic<uint64_t> active_{0};
   std::atomic<uint64_t> unique_ips_{0};
   std::atomic<uint64_t> qualified_ips_{0};
+  std::atomic<uint64_t> devices_{0};
   std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
   // Quota usage is (c2s + s2c) - quota_base_: the hot path pays only the

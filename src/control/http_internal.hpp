@@ -111,7 +111,7 @@ std::optional<HttpError> parse_if_match(evhttp_request* request,
 HttpError map_store_error(const Error& error);
 
 inline constexpr std::initializer_list<std::string_view> kPolicyFields = {
-    "expires_at", "data_quota_bytes", "max_unique_ips",
+    "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
     "rate_limit_up_bytes_per_sec", "rate_limit_down_bytes_per_sec", "note"};
 
 // RFC 3339 with Z or a numeric offset; fractional seconds are truncated.

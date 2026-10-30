@@ -12,6 +12,7 @@ UserPolicy full_policy() {
   policy.expires_at = 1893456000;  // 2030-01-01
   policy.data_quota_bytes = 10ull << 30;
   policy.max_unique_ips = 3;
+  policy.max_devices = 2;
   policy.rate_limit_up_bytes_per_sec = 1 << 20;
   policy.rate_limit_down_bytes_per_sec = 4 << 20;
   policy.note = "семья · laptop";
@@ -97,6 +98,7 @@ TEST(UserPolicyStoreTest, RejectsOutOfRangeValuesWithoutMutating) {
   };
   rejects([](UserPolicyPatch& p) { p.data_quota_bytes = std::optional<uint64_t>(0); });
   rejects([](UserPolicyPatch& p) { p.max_unique_ips = std::optional<uint32_t>(0); });
+  rejects([](UserPolicyPatch& p) { p.max_devices = std::optional<uint32_t>(0); });
   rejects([](UserPolicyPatch& p) { p.rate_limit_up_bytes_per_sec = std::optional<uint64_t>(1023); });
   rejects([](UserPolicyPatch& p) { p.expires_at = std::optional<int64_t>(-1); });
   rejects([](UserPolicyPatch& p) { p.note = std::string(257, 'x'); });
@@ -147,21 +149,24 @@ TEST(UserPolicyHttpTest, CreatePatchAndReadPolicyFields) {
       "POST", "/v1/users",
       R"({"name":"alice","expires_at":"2030-01-01T03:00:00+03:00",)"
       R"("data_quota_bytes":1073741824,"max_unique_ips":2,)"
-      R"("rate_limit_down_bytes_per_sec":1048576,"note":"vip"})");
+      R"("rate_limit_down_bytes_per_sec":1048576,"max_devices":3,"note":"vip"})");
   ASSERT_EQ(created.status, 201) << created.body;
   auto user = parse_json(created)["data"]["user"];
   EXPECT_EQ(user["expires_at"], "2030-01-01T00:00:00Z");
   EXPECT_EQ(user["data_quota_bytes"], 1073741824u);
   EXPECT_EQ(user["max_unique_ips"], 2);
+  EXPECT_EQ(user["max_devices"], 3);
   EXPECT_TRUE(user["rate_limit_up_bytes_per_sec"].is_null());
   EXPECT_EQ(user["note"], "vip");
 
   const auto patched = h.req("PATCH", "/v1/users/alice",
-                             R"({"expires_at":null,"note":"","max_unique_ips":null})");
+                             R"({"expires_at":null,"note":"","max_unique_ips":null,)"
+                             R"("max_devices":null})");
   ASSERT_EQ(patched.status, 200) << patched.body;
   user = parse_json(patched)["data"]["user"];
   EXPECT_TRUE(user["expires_at"].is_null());
   EXPECT_TRUE(user["max_unique_ips"].is_null());
+  EXPECT_TRUE(user["max_devices"].is_null());
   EXPECT_EQ(user["data_quota_bytes"], 1073741824u);
   EXPECT_EQ(user["note"], "");
 
@@ -178,6 +183,7 @@ TEST(UserPolicyHttpTest, RejectsMalformedPolicyFields) {
         R"({"expires_at":"2030-01-01 00:00:00Z"})", R"({"expires_at":"2030-01-01T00:00:00"})",
         R"({"data_quota_bytes":-1})", R"({"data_quota_bytes":0})", R"({"data_quota_bytes":1.5})",
         R"({"max_unique_ips":"3"})", R"({"max_unique_ips":4294967296})",
+        R"({"max_devices":0})", R"({"max_devices":1000001})",
         R"({"rate_limit_up_bytes_per_sec":100})", R"({"note":5})", R"({"note":null})"}) {
     const auto response = h.req("PATCH", "/v1/users/alice", body);
     EXPECT_EQ(response.status, 400) << body << " -> " << response.body;

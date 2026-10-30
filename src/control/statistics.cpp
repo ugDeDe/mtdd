@@ -329,6 +329,12 @@ void UserMetrics::set_qualified_unique_ips(uint64_t value) noexcept {
 uint64_t UserMetrics::qualified_unique_ips() const noexcept {
   return qualified_ips_.load(std::memory_order_relaxed);
 }
+void UserMetrics::set_devices(uint64_t value) noexcept {
+  devices_.store(value, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::devices() const noexcept {
+  return devices_.load(std::memory_order_relaxed);
+}
 uint64_t UserMetrics::payload_c2s_bytes() const noexcept {
   return payload_c2s_.load(std::memory_order_relaxed);
 }
@@ -1042,6 +1048,7 @@ StatisticsSnapshot Statistics::snapshot() const {
       entry.active_connections = metrics->active_connections();
       entry.unique_ips_active = metrics->active_unique_ips();
       entry.unique_ips_qualified = metrics->qualified_unique_ips();
+      entry.devices = metrics->devices();
       entry.payload_c2s_bytes = metrics->payload_c2s_bytes();
       entry.payload_s2c_bytes = metrics->payload_s2c_bytes();
       entry.quota_used_bytes = metrics->quota_used_bytes();
@@ -1344,6 +1351,7 @@ std::string Statistics::prometheus_text() const {
                   metrics.unique_ips_qualified);
     append_metric(out, "mtdd_user_unique_ips_seen", label,
                   metrics.unique_ips_active);
+    append_metric(out, "mtdd_user_devices", label, metrics.devices);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
                   label + ",direction=\"c2s\"", metrics.payload_c2s_bytes);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
@@ -1357,7 +1365,8 @@ std::string Statistics::prometheus_text() const {
   {
     static constexpr std::array<const char*, kRelayCloseReasons> kNames{
         "other",   "client_eof",   "client_error", "client_timeout", "idle_timeout",
-        "me_lost", "backpressure", "remote_close", "revoked",        "shutdown"};
+        "me_lost", "backpressure", "remote_close", "revoked",        "shutdown",
+        "device_limit"};
     for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
       append_metric(out, "mtdd_relay_closes_total",
                     std::string("reason=\"") + kNames[index] + "\"",

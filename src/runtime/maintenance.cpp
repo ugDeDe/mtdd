@@ -66,6 +66,13 @@ void Runtime::Impl::housekeeping(Time now) {
     }
     shared_->replay.evict(now);
     refresh_ip_history();
+    if (worker_index_ == 0 && now >= next_device_prune_) {
+        next_device_prune_ = now + std::chrono::seconds(10);
+        try {
+            publish_devices(now);
+        } catch (...) {
+        }
+    }
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
     if (!stopping_) {
         advance_warming(now);

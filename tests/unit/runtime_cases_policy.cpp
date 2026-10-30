@@ -341,3 +341,123 @@ TEST(RuntimePolicy, UnlimitedUserIsNotThrottled) {
     EXPECT_TRUE(wait_for([&] { return metrics->payload_c2s_bytes() >= kTotal; }, 3500ms))
         << metrics->payload_c2s_bytes();
 }
+
+namespace {
+
+// An MTProto message whose first 8 bytes carry `auth_key_id` (little endian).
+Bytes keyed_message(std::uint64_t auth_key_id) {
+    Bytes payload(64, 0x11);
+    for (std::size_t i = 0; i < 8; ++i) {
+        payload[i] = static_cast<std::uint8_t>(auth_key_id >> (8 * i));
+    }
+    return payload;
+}
+
+std::uint64_t device_limit_closes(Daemon& daemon) {
+    return daemon.services.stats.snapshot().relay_closes_total[static_cast<std::size_t>(
+        mtdd::control::RelayCloseReason::device_limit)];
+}
+
+} // namespace
+
+TEST(RuntimePolicy, DeviceLimitAdmitsKnownKeyAndClosesNewKeyOverLimit) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    mtdd::control::UserPolicy policy;
+    policy.max_devices = 1;
+    ASSERT_TRUE(add_policy_user(daemon, policy));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    const auto metrics = daemon.services.stats.user("alice");
+
+    TestClient first(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(first.send_hello());
+    ASSERT_TRUE(first.start_obfuscation(2));
+    // Key exchange (auth_key_id 0) is not a device.
+    ASSERT_TRUE(first.send_message(keyed_message(0)));
+    ASSERT_TRUE(first.send_message(keyed_message(0x1111)));
+    ASSERT_TRUE(wait_for([&] { return metrics->devices() == 1U; }, 3s));
+
+    // The same key on another connection is the same device.
+    TestClient same(daemon.port(), secret_bytes());
+    ASSERT_TRUE(same.valid());
+    ASSERT_TRUE(same.send_hello(0, 1));
+    ASSERT_TRUE(same.start_obfuscation(2));
+    ASSERT_TRUE(same.send_message(keyed_message(0x1111)));
+
+    TestClient other(daemon.port(), secret_bytes());
+    ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.send_hello(0, 2));
+    ASSERT_TRUE(other.start_obfuscation(2));
+    ASSERT_TRUE(other.send_message(keyed_message(0x2222)));
+    EXPECT_TRUE(other.wait_closed_for(3000));
+    EXPECT_EQ(device_limit_closes(daemon), 1U);
+    EXPECT_EQ(metrics->devices(), 1U);
+    EXPECT_FALSE(first.wait_closed_for(200));
+    EXPECT_FALSE(same.wait_closed_for(200));
+}
+
+TEST(RuntimePolicy, DeviceKeyStaysCountedWithinTheWindowAfterClose) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    mtdd::control::UserPolicy policy;
+    policy.max_devices = 1;
+    ASSERT_TRUE(add_policy_user(daemon, policy));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    const auto metrics = daemon.services.stats.user("alice");
+    {
+        TestClient first(daemon.port(), secret_bytes());
+        ASSERT_TRUE(first.valid());
+        ASSERT_TRUE(first.send_hello());
+        ASSERT_TRUE(first.start_obfuscation(2));
+        ASSERT_TRUE(first.send_message(keyed_message(0x1111)));
+        ASSERT_TRUE(wait_for([&] { return metrics->devices() == 1U; }, 3s));
+    }
+    ASSERT_TRUE(wait_for([&] {
+        return daemon.services.stats.snapshot().users.at("alice").active_connections == 0U;
+    }, 3s));
+    // The closed device still holds its slot (device_window, 900 s default).
+    TestClient other(daemon.port(), secret_bytes());
+    ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.send_hello(0, 1));
+    ASSERT_TRUE(other.start_obfuscation(2));
+    ASSERT_TRUE(other.send_message(keyed_message(0x2222)));
+    EXPECT_TRUE(other.wait_closed_for(3000));
+    // Raising the limit admits the second device on a new connection.
+    mtdd::control::UserPolicyPatch patch;
+    patch.max_devices = std::optional<std::uint32_t>(2);
+    ASSERT_TRUE(patch_policy(daemon, patch));
+    TestClient again(daemon.port(), secret_bytes());
+    ASSERT_TRUE(again.valid());
+    ASSERT_TRUE(again.send_hello(0, 2));
+    ASSERT_TRUE(again.start_obfuscation(2));
+    ASSERT_TRUE(again.send_message(keyed_message(0x2222)));
+    EXPECT_FALSE(again.wait_closed_for(500));
+    EXPECT_TRUE(wait_for([&] { return metrics->devices() == 2U; }, 3s));
+}
+
+TEST(DeviceTable, CountsPerSignedDcAndExpiresAfterWindow) {
+    mtdd::detail::DeviceTable table;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint64_t devices = 0;
+    using Admit = mtdd::detail::DeviceTable::Admit;
+    EXPECT_EQ(table.admit("u", 2, 1, 1, t0, 60s, devices), Admit::ok);
+    // A media DC key is counted on its own DC, not as a second device.
+    EXPECT_EQ(table.admit("u", -2, 7, 1, t0, 60s, devices), Admit::ok);
+    EXPECT_EQ(devices, 1U);
+    EXPECT_EQ(table.admit("u", 2, 2, 1, t0, 60s, devices), Admit::limit);
+    table.release("u", 2, 1, t0, 60s, devices);
+    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 30s, 60s, devices), Admit::limit);
+    EXPECT_EQ(table.admit("u", 2, 2, 1, t0 + 61s, 60s, devices), Admit::ok);
+    EXPECT_EQ(devices, 1U);
+    std::vector<std::pair<std::string, std::uint64_t>> counts;
+    table.release("u", 2, 2, t0 + 61s, 60s, devices);
+    table.release("u", -2, 7, t0 + 61s, 60s, devices);
+    table.prune(t0 + 200s, 60s, counts);
+    ASSERT_EQ(counts.size(), 1U);
+    EXPECT_EQ(counts[0].second, 0U);
+    table.prune(t0 + 200s, 60s, counts);
+    EXPECT_TRUE(counts.empty());
+}

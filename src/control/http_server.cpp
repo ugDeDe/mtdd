@@ -546,6 +546,7 @@ struct ControlServer::Impl {
                                    : json(nullptr)},
            {"unique_ips_seen", row.metrics.unique_ips_active},
            {"unique_ips_active", row.metrics.unique_ips_qualified},
+           {"devices", row.metrics.devices},
            {"payload_bytes_c2s", row.metrics.payload_c2s_bytes},
            {"payload_bytes_s2c", row.metrics.payload_s2c_bytes},
            {"payload_bytes_total",
@@ -843,7 +844,7 @@ struct ControlServer::Impl {
             check_allowed_fields(body.value,
                                  {"name", "secret", "enabled", "max_connections",
                                   "expires_at", "data_quota_bytes",
-                                  "max_unique_ips", "rate_limit_up_bytes_per_sec",
+                                  "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
                                   "rate_limit_down_bytes_per_sec", "note"})) {
       status = error->status;
       send_error(request, status, error->type, error->message);
@@ -950,7 +951,7 @@ struct ControlServer::Impl {
       if (auto error = check_allowed_fields(body.value,
                                             {"enabled", "max_connections",
                                              "expires_at", "data_quota_bytes",
-                                             "max_unique_ips", "rate_limit_up_bytes_per_sec",
+                                             "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
                                              "rate_limit_down_bytes_per_sec", "note"})) {
         status = error->status;
         send_error(request, status, error->type, error->message);

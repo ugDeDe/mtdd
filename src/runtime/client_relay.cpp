@@ -411,6 +411,7 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
             }
         }
     }
+    release_device(client, Clock::now());
     if (client.conn_registered) {
         clients_by_conn_.erase(client.conn_id);
         client.conn_registered = false;

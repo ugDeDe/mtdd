@@ -60,6 +60,7 @@ std::uint64_t tighter(std::uint64_t left, std::uint64_t right) noexcept {
 void Runtime::Impl::load_client_rates(Client& client, const control::UserRecord& user) {
     client.policy_up = user.policy.rate_limit_up_bytes_per_sec.value_or(0);
     client.policy_down = user.policy.rate_limit_down_bytes_per_sec.value_or(0);
+    client.max_devices = user.policy.max_devices.value_or(0);
     recompute_rate_share(client);
 }
 

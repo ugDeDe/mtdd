@@ -239,6 +239,9 @@ std::optional<std::string> UserStore::validate_policy(const UserPolicy& policy) 
       (*policy.max_unique_ips == 0 || *policy.max_unique_ips > kMaxUniqueIpsLimit)) {
     return "max_unique_ips must be null or 1.." + std::to_string(kMaxUniqueIpsLimit);
   }
+  if (policy.max_devices && (*policy.max_devices == 0 || *policy.max_devices > kMaxDevicesLimit)) {
+    return "max_devices must be null or 1.." + std::to_string(kMaxDevicesLimit);
+  }
   for (const auto& rate : {policy.rate_limit_up_bytes_per_sec,
                            policy.rate_limit_down_bytes_per_sec}) {
     if (rate && (*rate < kMinRateLimitBytesPerSecond ||
@@ -503,6 +506,7 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
   if (patch.expires_at) policy.expires_at = *patch.expires_at;
   if (patch.data_quota_bytes) policy.data_quota_bytes = *patch.data_quota_bytes;
   if (patch.max_unique_ips) policy.max_unique_ips = *patch.max_unique_ips;
+  if (patch.max_devices) policy.max_devices = *patch.max_devices;
   if (patch.rate_limit_up_bytes_per_sec) {
     policy.rate_limit_up_bytes_per_sec = *patch.rate_limit_up_bytes_per_sec;
   }

@@ -660,6 +660,13 @@ elif field == "max_unique_ips":
         if not re.fullmatch(r"\d{1,10}", raw) or not 1 <= int(raw) <= 2 ** 32 - 1:
             fail("Лимит IP: целое число от 1 до 4294967295 или none")
         value = int(raw)
+elif field == "max_devices":
+    if raw.lower() in CLEAR:
+        value = None
+    else:
+        if not re.fullmatch(r"\d{1,7}", raw) or not 1 <= int(raw) <= 1000000:
+            fail("Лимит устройств: целое число от 1 до 1000000 или none")
+        value = int(raw)
 elif field == "note":
     try:
         raw.encode("utf-8")
@@ -775,12 +782,14 @@ rows = [
     ("Срок действия", expiry(user.get("expires_at"))),
     ("Квота трафика", quota(user.get("data_quota_bytes"), used)),
     ("Лимит IP", "без лимита" if user.get("max_unique_ips") is None else str(user["max_unique_ips"])),
+    ("Лимит устройств", "без лимита" if user.get("max_devices") is None else str(user["max_devices"])),
     ("Скорость ↑", rate(user.get("rate_limit_up_bytes_per_sec"))),
     ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
     ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
     ("Заметка", user.get("note") or "—"),
     ("Соединений", str(stats.get("active_connections", 0))),
     ("Уникальных IP", str(stats.get("unique_ips_active", 0))),
+    ("Устройств", str(stats.get("devices", 0))),
 ]
 for label, value in rows:
     print("{}\t{}".format(label, str(value).replace("\n", " ")))
@@ -853,7 +862,7 @@ cmd_users() {
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users show ИМЯ'; return 1; }
             cmd_users_show "${cargs[1]}" ;;
         set)
-            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
         reset-quota)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
@@ -2027,7 +2036,7 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
         menu_row 3 'Квота трафика' 8 'Включить'
         menu_row 4 'Лимит уникальных IP' 9 'Отключить'
         menu_row 5 'Лимит скорости ↑' 10 'Сбросить квоту'
-        menu_row 0 'Назад'
+        menu_row 11 'Лимит устройств' 0 'Назад'
         menu_footer
         menu_read choice '  › ' || return 0
         case $choice in
@@ -2041,6 +2050,7 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
             8) menu_run cmd_users_action "$name" enable; menu_pause ;;
             9) menu_run cmd_users_action "$name" disable; menu_pause ;;
             10) menu_run cmd_users_action "$name" reset-quota; menu_pause ;;
+            11) menu_ask_set "$name" max_devices 'Макс. устройств (по auth_key_id; Enter/none — без лимита)'; menu_pause ;;
             0|q|Q) return 0 ;;
             *) : ;;
         esac

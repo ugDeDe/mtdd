@@ -1276,3 +1276,43 @@ TEST(Runtime, MediaUserRateIsSplitEvenlyAcrossConnections) {
               2.0 * static_cast<double>(fastest.count()))
         << "fastest=" << fastest.count() << "ms slowest=" << slowest.count() << "ms";
 }
+
+TEST(Runtime, DeviceLimitClosesNewAuthKeyOnTheMiddleEndPath) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    mtdd::control::CreateUserRequest request;
+    request.name = "alice";
+    request.secret = std::string(kSecretHex);
+    request.policy.max_devices = 1;
+    ASSERT_TRUE(daemon.services.store->create_user(request).ok());
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+    // burst_payload(0) starts with a non-zero auth_key_id (00 01 01 ...).
+    const auto keyed = [](std::uint8_t key) {
+        Bytes payload = burst_payload(0);
+        if (key != 0) payload[1] = key;
+        return payload;
+    };
+
+    TestClient first(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(first.send_hello());
+    ASSERT_TRUE(first.start_obfuscation(2));
+    const Bytes first_request = keyed(0);
+    ASSERT_TRUE(first.send_message(first_request));
+    ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(me.future().get().inner, first_request);
+    EXPECT_EQ(daemon.services.stats.user("alice")->devices(), 1U);
+
+    TestClient second(daemon.port(), secret_bytes());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(second.send_hello(0, 1));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(second.send_message(keyed(0x22)));
+    EXPECT_TRUE(second.wait_closed_for(3000));
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.relay_closes_total[static_cast<std::size_t>(
+                  mtdd::control::RelayCloseReason::device_limit)],
+              1U);
+    EXPECT_EQ(snapshot.users.at("alice").devices, 1U);
+}

@@ -388,6 +388,58 @@ private:
         order_;
 };
 
+// Leading client frames inspected for a non-zero auth_key_id. Key exchange
+// (auth_key_id 0) takes a few frames; nothing after the first key is read.
+inline constexpr std::uint8_t kDeviceScanFrames = 16;
+
+// Per-user device table for max_devices. A device is identified by the MTProto
+// auth_key_id its connections present, per signed DC (Android keeps a separate
+// temporary key for media DCs). One app installation keeps one current key per
+// signed DC, so the device count is the maximum over DCs. A key stays present
+// while it has an open connection and for `window` after the last one closed,
+// which bridges reconnects and temporary-key rotation. Touched once per
+// connection (admit/release) and by a periodic prune, never per packet.
+
+class DeviceTable {
+public:
+    using Clock = std::chrono::steady_clock;
+    enum class Admit : std::uint8_t { ok, limit };
+
+    Admit admit(const std::string& user, std::int16_t dc, std::uint64_t key,
+                std::uint32_t max_devices, Clock::time_point now,
+                std::chrono::seconds window, std::uint64_t& devices);
+    void release(const std::string& user, std::int16_t dc, std::uint64_t key,
+                 Clock::time_point now, std::chrono::seconds window, std::uint64_t& devices);
+    // Drops expired keys; reports the device count of every known user.
+    void prune(Clock::time_point now, std::chrono::seconds window,
+               std::vector<std::pair<std::string, std::uint64_t>>& counts);
+
+private:
+    struct Key {
+        std::uint64_t auth_key_id{0};
+        std::int16_t dc{0};
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const noexcept {
+            return static_cast<std::size_t>(key.auth_key_id ^
+                                            (static_cast<std::uint64_t>(
+                                                 static_cast<std::uint16_t>(key.dc)) *
+                                             0x9e3779b97f4a7c15ULL));
+        }
+    };
+    struct Entry {
+        std::uint32_t open{0};
+        Clock::time_point last{};
+    };
+    using Keys = std::unordered_map<Key, Entry, KeyHash>;
+    static std::uint64_t prune_locked(Keys& keys, Clock::time_point now,
+                                      std::chrono::seconds window);
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, Keys> users_;
+};
+
 // State shared by all reactors. Hot-path relay traffic never touches this
 // object; only admission (connection/handshake reservation, replay cache,
 // unique-IP accounting) and shutdown coordination do.
@@ -415,6 +467,7 @@ struct SharedState {
     }
     // SIGHUP handler installed before run(); invoked on the signal reactor.
     std::function<void()> reload_hook;
+    DeviceTable devices;
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
@@ -677,6 +730,18 @@ struct Runtime::Impl {
         bool close_reason_set{false};
         // Signed DC < 0 (file/photo/video downloads): subject to media limits.
         bool media{false};
+        // Device accounting (max_devices): the first non-zero auth_key_id the
+        // connection presents, registered once in SharedState::devices.
+        std::uint64_t auth_key_id{0};
+        std::int16_t device_dc{0};      // signed DC
+        std::uint32_t max_devices{0};   // user's policy, 0 = unlimited
+        std::uint8_t device_scan_left{0};  // messages still inspected for a key
+        bool device_registered{false};
+        // Direct route: auth_key_id scan over the relayed padded-intermediate
+        // stream (frame length prefix, then the MTProto message).
+        std::uint32_t direct_scan_skip{0};
+        std::uint8_t direct_scan_have{0};
+        std::array<std::uint8_t, 12> direct_scan_head{};
     };
 
     struct StagedFrame {
@@ -938,6 +1003,12 @@ struct Runtime::Impl {
     void on_client_deadline(Client& client, Time now);
     void touch(Client& client, Time now) { client.last_activity = now; }
     void apply_shared_tunables();
+    // max_devices: record the connection's auth key; false = over the limit
+    // (the client is already being closed).
+    bool register_device(Client& client, std::uint64_t auth_key_id, Time now);
+    bool scan_direct_auth_key(Client& client, std::span<const std::uint8_t> plain, Time now);
+    void release_device(Client& client, Time now) noexcept;
+    void publish_devices(Time now);
     // Fair-share rate limits: recompute this connection's share, and publish
     // this reactor's active-connection counts (1 Hz, from the gauge pass).
     void recompute_rate_share(Client& client) noexcept;
@@ -1122,6 +1193,7 @@ struct Runtime::Impl {
     std::shared_ptr<const control::UserSnapshot> users_snapshot_;
     std::vector<std::uint64_t> s2c_batch_tokens_;
     std::size_t accept_burst_{1};
+    Time next_device_prune_{};
     // sweep_user_policy(): users with an expiry or quota, by name, valid for
     // policy_index_snapshot_ (held so the record pointers stay valid).
     std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;
