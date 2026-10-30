@@ -228,16 +228,24 @@ void UserMetrics::add_payload(Direction direction, uint64_t bytes) noexcept {
   } else {
     payload_s2c_.fetch_add(bytes, std::memory_order_relaxed);
   }
-  quota_used_.fetch_add(bytes, std::memory_order_relaxed);
 }
+namespace {
+int64_t payload_total(const std::atomic<uint64_t>& c2s, const std::atomic<uint64_t>& s2c) noexcept {
+  return static_cast<int64_t>(c2s.load(std::memory_order_relaxed) +
+                              s2c.load(std::memory_order_relaxed));
+}
+} // namespace
 uint64_t UserMetrics::quota_used_bytes() const noexcept {
-  return quota_used_.load(std::memory_order_relaxed);
+  const int64_t used = payload_total(payload_c2s_, payload_s2c_) -
+                       quota_base_.load(std::memory_order_relaxed);
+  return used > 0 ? static_cast<uint64_t>(used) : 0;
 }
 void UserMetrics::set_quota_used_bytes(uint64_t value) noexcept {
-  quota_used_.store(value, std::memory_order_relaxed);
+  quota_base_.store(payload_total(payload_c2s_, payload_s2c_) - static_cast<int64_t>(value),
+                    std::memory_order_relaxed);
 }
 void UserMetrics::restore_quota(uint64_t used_bytes, int64_t reset_at) noexcept {
-  quota_used_.store(used_bytes, std::memory_order_relaxed);
+  set_quota_used_bytes(used_bytes);
   quota_reset_at_.store(reset_at, std::memory_order_relaxed);
 }
 void UserMetrics::reset_quota() noexcept {
@@ -245,7 +253,7 @@ void UserMetrics::reset_quota() noexcept {
   quota_reset_at_.store(
       static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count()),
       std::memory_order_relaxed);
-  quota_used_.store(0, std::memory_order_relaxed);
+  set_quota_used_bytes(0);
 }
 int64_t UserMetrics::quota_reset_at() const noexcept {
   return quota_reset_at_.load(std::memory_order_relaxed);

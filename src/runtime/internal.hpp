@@ -1170,6 +1170,11 @@ struct Runtime::Impl {
     std::vector<std::uint64_t> s2c_batch_tokens_;
     std::size_t accept_burst_{1};
     std::vector<std::uint64_t> media_throttled_;
+    // sweep_user_policy(): users with an expiry or quota, by name, valid for
+    // policy_index_snapshot_ (held so the record pointers stay valid).
+    std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;
+    std::unordered_map<std::string, const control::UserRecord*> policy_index_;
+    std::vector<std::uint64_t> policy_doomed_;
     std::vector<std::uint64_t> media_scratch_;
     std::vector<std::pair<detail::RateBucket*, bool>> media_bucket_state_;
     Time next_media_check_{};

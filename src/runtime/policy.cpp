@@ -98,14 +98,30 @@ void Runtime::Impl::process_rate_resumes(Time now) {
 
 void Runtime::Impl::sweep_user_policy(Time now) {
     if (!users_snapshot_ || clients_.empty()) return;
+    // The snapshot's find() is a linear scan; with many users a per-client
+    // lookup made this 1 Hz sweep O(clients x users). Index the users that
+    // actually carry an expiry or a quota once per snapshot, and skip the
+    // client walk entirely when there are none.
+    if (policy_index_snapshot_ != users_snapshot_) {
+        policy_index_.clear();
+        for (const auto& user : users_snapshot_->users) {
+            if (user.policy.expires_at || user.policy.data_quota_bytes) {
+                policy_index_.emplace(user.name, &user);
+            }
+        }
+        policy_index_snapshot_ = users_snapshot_;
+    }
+    if (policy_index_.empty()) return;
     const std::int64_t now_unix = std::chrono::duration_cast<std::chrono::seconds>(
                                       std::chrono::system_clock::now().time_since_epoch())
                                       .count();
-    std::vector<std::uint64_t> doomed;
+    std::vector<std::uint64_t>& doomed = policy_doomed_;
+    doomed.clear();
     for (const auto& [token, client] : clients_) {
         if (client->user_name.empty() || !client->metrics) continue;
-        const auto* user = users_snapshot_->find(client->user_name);
-        if (user == nullptr) continue;  // apply_user_snapshot() owns removal
+        const auto indexed = policy_index_.find(client->user_name);
+        if (indexed == policy_index_.end()) continue;
+        const auto* user = indexed->second;
         const auto& policy = user->policy;
         // Quota enforcement is checked once per sweep, so a live session can
         // overshoot its quota by up to one tick of traffic; that is accepted.
@@ -116,6 +132,7 @@ void Runtime::Impl::sweep_user_policy(Time now) {
         }
     }
     for (const std::uint64_t token : doomed) close_client(token);
+    doomed.clear();
     (void)now;
 }
 

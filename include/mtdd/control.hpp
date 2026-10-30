@@ -560,7 +560,9 @@ class UserMetrics {
   std::atomic<uint64_t> qualified_ips_{0};
   std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
-  std::atomic<uint64_t> quota_used_{0};
+  // Quota usage is (c2s + s2c) - quota_base_: the hot path pays only the
+  // existing per-direction counter, and reset/restore just move the base.
+  std::atomic<int64_t> quota_base_{0};
   std::atomic<int64_t> quota_reset_at_{0};
   // Own cache line: rate buckets are written by every reactor serving the user.
   alignas(64) std::atomic<int64_t> rate_tat_[2]{};
