@@ -335,8 +335,14 @@ enum class MeResult { success, failure, timeout };
 enum class MeAnswerResult { received, delivered, dropped_unknown, dropped_other };
 // Suspicious-behaviour signals (runtime suspect table, GET /v1/suspects).
 // Order is the wire/metric order; names are stable API strings.
+// Real iOS clients open a burst of connections, send req_pq on each, get
+// resPQ and drop them without reaching req_DH, which looks exactly like a
+// checker's probe. The one thing that separates them: the auth DC. For an RF
+// audience the authorization DC is always DC2 (media DC -2); a key exchange to
+// DC1 is never a real user here. probe_session is therefore recorded only when
+// the abandoned req_pq went to DC1.
 enum class SuspectSignal : uint8_t {
-  probe_session,    // A: valid secret, key exchange started (req_pq) and abandoned
+  probe_session,    // A: req_pq to DC1 (never the RF auth DC), then abandoned
   secret_text,      // B: proxy secret sent as plain text ("ee"/"dd" + hex)
   raw_obfuscated2,  // C: raw obfuscated2 (no FakeTLS) to a FakeTLS-only proxy
   multi_mode,       // D: FakeTLS and raw obfuscated2 from one IP within seconds
@@ -346,9 +352,9 @@ enum class SuspectSignal : uint8_t {
   junk,             // H: other non-TLS bytes, foreign-SNI probe, replayed hello
   canary,           // K: authenticated with a bait (canary) user
 };
-// Signals a real client also produces now and then (connection racing,
-// proxy ping, a stale link, retries). They score nothing for an address that
-// recently brought a real MTProto key; B, C, D and K always count.
+// Signals a real client also produces now and then (a key creation on DC1 by a
+// non-RF user, proxy ping, a stale link, retries). They score nothing for an
+// address that recently brought a real MTProto key; B, C, D and K always count.
 constexpr bool suspect_signal_ambiguous(SuspectSignal signal) noexcept {
   return signal == SuspectSignal::probe_session || signal == SuspectSignal::wrong_secret ||
          signal == SuspectSignal::port_check || signal == SuspectSignal::repeat_visits ||

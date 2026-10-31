@@ -861,18 +861,22 @@ TEST(Suspects, SecretTextPortCheckAndJunkAreRecorded) {
 }
 
 TEST(Suspects, ProbeSessionAndMultiModeFromOneAddress) {
-    mtdd::test::FakeDirectDc dc(2);
+    // A checker targets DC1 (never the RF auth DC) and mixes transports.
+    mtdd::test::FakeDirectDc dc(1);
     PolicyDirectEndpointScope endpoint(dc.port());
     EchoBackend echo;
     SuspectMaskingScope masking(echo.port());
-    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        enable_policy_direct(config);
+        config.direct_fallback_dcs = {1};
+    });
     ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
     ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
     {
         TestClient checker(daemon.port(), secret_bytes());
         ASSERT_TRUE(checker.valid());
         ASSERT_TRUE(checker.send_hello());
-        ASSERT_TRUE(checker.start_obfuscation(2));
+        ASSERT_TRUE(checker.start_obfuscation(1));
         // Raw obfuscated2 from the same address while the FakeTLS session is up.
         send_raw_probe(daemon.port(), random_header());
         ASSERT_TRUE(checker.send_message(keyed_message(0)));  // key exchange starts...
@@ -1053,24 +1057,29 @@ TEST(Suspects, RealClientRacingConnectionsIsNotASuspect) {
         std::this_thread::sleep_for(100ms);
     }
     send_raw_probe(daemon.port(), {});  // and a proxy ping
-    // Both were seen as raw events...
     EXPECT_TRUE(wait_for([&] {
-        const auto snapshot = daemon.services.stats.snapshot();
-        return snapshot.suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)] >= 1U &&
-               snapshot.suspect_events_total[static_cast<std::size_t>(SuspectSignal::port_check)] >= 1U;
+        return daemon.services.stats.snapshot()
+                   .suspect_events_total[static_cast<std::size_t>(SuspectSignal::port_check)] >= 1U;
     }, 3s));
-    // ...but the address brought a real key: no suspect.
+    // The race loser abandoned req_pq on DC2, which is the RF auth DC, so it is
+    // not a probe_session at all; the proxy ping is real-filtered. No suspect.
+    EXPECT_EQ(daemon.services.stats.snapshot()
+                  .suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)], 0U);
     EXPECT_TRUE(daemon.services.stats.suspects().empty());
 }
 
 TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
-    // A brand-new client: every frame has auth_key_id 0 during key creation,
-    // so register_device never fires. The winning connection reaches
-    // req_DH_params, which must mark the address real and clear the losing
-    // connection's probe_session, even though the loser closed first.
-    mtdd::test::FakeDirectDc dc(2);
+    // A brand-new client on DC1 (so probe_session can fire): every frame has
+    // auth_key_id 0 during key creation, so register_device never fires. The
+    // winning connection reaches req_DH_params, which must mark the address
+    // real and clear the losing connection's probe_session, even though the
+    // loser closed first.
+    mtdd::test::FakeDirectDc dc(1);
     PolicyDirectEndpointScope endpoint(dc.port());
-    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        enable_policy_direct(config);
+        config.direct_fallback_dcs = {1};
+    });
     ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
     ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
 
@@ -1079,7 +1088,7 @@ TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
         TestClient loser(daemon.port(), secret_bytes());
         ASSERT_TRUE(loser.valid());
         ASSERT_TRUE(loser.send_hello());
-        ASSERT_TRUE(loser.start_obfuscation(2));
+        ASSERT_TRUE(loser.start_obfuscation(1));
         ASSERT_TRUE(loser.send_message(keyed_message(0)));  // req_pq, auth_key_id 0
         std::this_thread::sleep_for(100ms);
     }
@@ -1099,7 +1108,7 @@ TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
         TestClient winner(daemon.port(), secret_bytes());
         ASSERT_TRUE(winner.valid());
         ASSERT_TRUE(winner.send_hello(0, 1));
-        ASSERT_TRUE(winner.start_obfuscation(2));
+        ASSERT_TRUE(winner.start_obfuscation(1));
         Bytes req_dh(64, 0x11);
         std::fill_n(req_dh.begin(), 8, std::uint8_t{0});  // auth_key_id 0
         req_dh[20] = 0xbe;                                 // req_DH_params, little endian
@@ -1115,4 +1124,26 @@ TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
         const auto* row = find_suspect(rows, "127.0.0.1");
         return row != nullptr && row->real_client && row->score == 0.0;
     }, 3s));
+}
+
+TEST(Suspects, RealClientOnDc2ProbeIsNotFlagged) {
+    // The RF auth DC is DC2: a client that does req_pq on DC2 and leaves (a
+    // race loser) is never a probe_session, so it is never a suspect.
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    {
+        TestClient loser(daemon.port(), secret_bytes());
+        ASSERT_TRUE(loser.valid());
+        ASSERT_TRUE(loser.send_hello());
+        ASSERT_TRUE(loser.start_obfuscation(2));
+        ASSERT_TRUE(loser.send_message(keyed_message(0)));
+        std::this_thread::sleep_for(150ms);
+    }
+    std::this_thread::sleep_for(150ms);
+    EXPECT_EQ(daemon.services.stats.snapshot()
+                  .suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)], 0U);
+    EXPECT_TRUE(daemon.services.stats.suspects().empty());
 }

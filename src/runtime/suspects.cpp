@@ -212,7 +212,7 @@ SuspectTable::Recorded SuspectTable::record(const Context& context, Signal signa
                                             double watch_score) {
     Recorded out;
     if (context.peer == nullptr) return out;
-    // A real client's racing, pings and retries: no entry, no score.
+    // A real client's pings and retries: no entry, no score.
     if (control::suspect_signal_ambiguous(signal) && recently_real(*context.peer, now)) return out;
     const IpKey key = suspect_key(*context.peer);
     Shard& shard = shard_for(key);
@@ -471,9 +471,11 @@ void Runtime::Impl::suspect_close(Client& client, Time now) {
                              reason == control::RelayCloseReason::me_lost ||
                              reason == control::RelayCloseReason::backpressure ||
                              reason == control::RelayCloseReason::device_limit;
+    // Gated on DC1: the RF audience always authorizes on DC2, so a req_pq to
+    // DC1 that never reaches req_DH is not one of their clients racing.
     if (client.phase == Client::Phase::relay && !server_side && client.auth_key_id == 0 &&
-        !client.device_registered && client.zero_key_frames >= 1 && !client.saw_req_dh &&
-        now - client.auth_at <= kProbeSessionMax) {
+        client.device_dc == 1 && !client.device_registered && client.zero_key_frames >= 1 &&
+        !client.saw_req_dh && now - client.auth_at <= kProbeSessionMax) {
         suspect(client, control::SuspectSignal::probe_session);
     }
     // D: the same address sent raw obfuscated2 around this FakeTLS session.
