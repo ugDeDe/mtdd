@@ -459,8 +459,12 @@ void Runtime::Impl::suspect_close(Client& client, Time now) {
     }
     if (client.auth_at == Time{} || client.user_name.empty()) return;
     // A: a valid secret, then only the start of a key exchange (req_pq) and
-    // the session ends. A real client either brings an existing key or
-    // finishes the exchange. Closes the proxy caused itself do not count.
+    // the session ends, and no connection from this address ever got past
+    // req_pq (recently_real covers both an existing key and a key creation
+    // that reached req_DH_params). A real client's losing race connection
+    // stops at req_pq too, but its winning one marks the address real, which
+    // retroactively clears this. A checker never advances past req_pq. Closes
+    // the proxy caused itself do not count.
     const auto reason = client.close_reason;
     const bool server_side = reason == control::RelayCloseReason::shutdown ||
                              reason == control::RelayCloseReason::revoked ||

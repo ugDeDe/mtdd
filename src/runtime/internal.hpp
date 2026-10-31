@@ -899,7 +899,9 @@ struct Runtime::Impl {
         // stream (frame length prefix, then the MTProto message).
         std::uint32_t direct_scan_skip{0};
         std::uint8_t direct_scan_have{0};
-        std::array<std::uint8_t, 12> direct_scan_head{};
+        // 4-byte length + the first 24 payload bytes: auth_key_id(8), and for
+        // unencrypted key exchange msg_id(8) + msg_len(4) + the TL constructor.
+        std::array<std::uint8_t, 28> direct_scan_head{};
     };
 
     struct StagedFrame {

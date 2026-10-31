@@ -801,7 +801,14 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
                                               message.data[static_cast<std::size_t>(i)];
                             }
                             if (constructor == 0xd712e4beU || constructor == 0xf5045f1fU) {
-                                client.saw_req_dh = true;  // req_DH_params, set_client_DH_params
+                                // req_DH_params / set_client_DH_params: the key
+                                // exchange went past req_pq, so a genuine client
+                                // is creating a key from this address. (During
+                                // creation auth_key_id stays 0, so register_device
+                                // never marks it real — this does.) A checker
+                                // only ever sends req_pq and leaves.
+                                client.saw_req_dh = true;
+                                if (config_.suspects) shared_->suspects.mark_real(client.peer, now);
                             }
                         }
                     }

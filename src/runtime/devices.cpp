@@ -218,8 +218,17 @@ bool Runtime::Impl::scan_direct_auth_key(Client& client, std::span<const std::ui
         --client.device_scan_left;
         if (key != 0) return register_device(client, key, now);
         if (client.zero_key_frames != 255) ++client.zero_key_frames;
-        // Skip the rest of this frame (length counts payload + padding).
-        client.direct_scan_skip = length > 8 ? length - 8 : 0;
+        // Unencrypted key exchange: the TL constructor follows the 24-byte
+        // header. req_DH_params / set_client_DH_params prove a key is being
+        // created from this address (see the ME path in client.cpp).
+        std::uint32_t constructor = 0;
+        for (int i = 27; i >= 24; --i) constructor = (constructor << 8) | client.direct_scan_head[i];
+        if (constructor == 0xd712e4beU || constructor == 0xf5045f1fU) {
+            client.saw_req_dh = true;
+            shared_->suspects.mark_real(client.peer, now);
+        }
+        // Skip the rest of this frame (we already consumed 24 payload bytes).
+        client.direct_scan_skip = length > 24 ? length - 24 : 0;
     }
     return true;
 }

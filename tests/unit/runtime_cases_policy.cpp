@@ -1062,3 +1062,57 @@ TEST(Suspects, RealClientRacingConnectionsIsNotASuspect) {
     // ...but the address brought a real key: no suspect.
     EXPECT_TRUE(daemon.services.stats.suspects().empty());
 }
+
+TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
+    // A brand-new client: every frame has auth_key_id 0 during key creation,
+    // so register_device never fires. The winning connection reaches
+    // req_DH_params, which must mark the address real and clear the losing
+    // connection's probe_session, even though the loser closed first.
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+
+    // The losing race connection: req_pq only, then gone.
+    {
+        TestClient loser(daemon.port(), secret_bytes());
+        ASSERT_TRUE(loser.valid());
+        ASSERT_TRUE(loser.send_hello());
+        ASSERT_TRUE(loser.start_obfuscation(2));
+        ASSERT_TRUE(loser.send_message(keyed_message(0)));  // req_pq, auth_key_id 0
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_TRUE(wait_for([&] {
+        return daemon.services.stats.snapshot()
+                   .suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)] >= 1U;
+    }, 3s));
+    // Flagged for now (the winner has not run yet).
+    {
+        const auto rows = daemon.services.stats.suspects();
+        const auto* row = find_suspect(rows, "127.0.0.1");
+        ASSERT_NE(row, nullptr);
+        EXPECT_GT(row->score, 0.0);
+    }
+    // The winning connection reaches req_DH_params (still auth_key_id 0).
+    {
+        TestClient winner(daemon.port(), secret_bytes());
+        ASSERT_TRUE(winner.valid());
+        ASSERT_TRUE(winner.send_hello(0, 1));
+        ASSERT_TRUE(winner.start_obfuscation(2));
+        Bytes req_dh(64, 0x11);
+        std::fill_n(req_dh.begin(), 8, std::uint8_t{0});  // auth_key_id 0
+        req_dh[20] = 0xbe;                                 // req_DH_params, little endian
+        req_dh[21] = 0xe4;
+        req_dh[22] = 0x12;
+        req_dh[23] = 0xd7;
+        ASSERT_TRUE(winner.send_message(req_dh));
+        std::this_thread::sleep_for(150ms);
+    }
+    // The address is now known real: probe_session scores nothing.
+    EXPECT_TRUE(wait_for([&] {
+        const auto rows = daemon.services.stats.suspects();
+        const auto* row = find_suspect(rows, "127.0.0.1");
+        return row != nullptr && row->real_client && row->score == 0.0;
+    }, 3s));
+}
