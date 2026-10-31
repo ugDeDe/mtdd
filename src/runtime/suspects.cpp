@@ -8,6 +8,12 @@
 // coming back stays high. `matches` (distinct signals) is the primary sort key
 // of GET /v1/suspects: two unrelated signals from one address say more than
 // one signal repeated many times.
+//
+// Real clients race connections (several key exchanges, keep the fastest),
+// ping proxies with a bare TCP connect, keep stale links and retry hellos, so
+// A, E, F, G and H are ambiguous: an address that recently brought a real
+// MTProto key (non-zero auth_key_id) neither gets an entry for them nor scores
+// them. A checker never brings a key. B, C, D and K always count.
 #include "internal.hpp"
 
 #include <arpa/inet.h>
@@ -28,6 +34,15 @@ constexpr auto kMultiModeWindow = std::chrono::seconds(3);
 // flagged for repeated short visits.
 constexpr auto kLongSession = std::chrono::seconds(60);
 constexpr std::uint32_t kRepeatVisits = 3;
+// A real session keeps its address "real" this long.
+constexpr std::int64_t kRealMinutes = 60;
+// On a full shard the lowest-scoring of this many oldest entries is evicted,
+// so a flood of one-off junk cannot push out a real suspect.
+constexpr std::size_t kEvictWindow = 8;
+
+std::int64_t steady_minutes(SuspectTable::Clock::time_point now) {
+    return std::chrono::duration_cast<std::chrono::minutes>(now.time_since_epoch()).count();
+}
 
 std::string ip_text(const protocol::Endpoint& peer) {
     char text[INET6_ADDRSTRLEN] = {};
@@ -137,18 +152,55 @@ bool domain_covers(std::string_view name, std::string_view domain) {
 }
 
 SuspectTable::SuspectTable(std::size_t capacity)
-    : per_shard_(std::max<std::size_t>(capacity / kShards, 16)) {}
+    : per_shard_(std::max<std::size_t>(capacity / kShards, 16)),
+      real_(std::make_unique<std::atomic<std::uint64_t>[]>(kRealSlots)) {
+    for (std::size_t i = 0; i < kRealSlots; ++i) real_[i].store(0, std::memory_order_relaxed);
+}
+
+void SuspectTable::mark_real(const protocol::Endpoint& peer, Clock::time_point now) {
+    const IpKey key = suspect_key(peer);
+    const std::uint64_t hash = IpKeyHash{}(key);
+    const std::uint64_t tag = (hash >> 32) | 1U;
+    const auto minute = static_cast<std::uint32_t>(steady_minutes(now));
+    real_[hash & (kRealSlots - 1)].store((tag << 32) | minute, std::memory_order_relaxed);
+    Shard& shard = shard_for(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (const auto found = shard.entries.find(key); found != shard.entries.end()) {
+        found->second.real = true;
+    }
+}
+
+bool SuspectTable::recently_real(const protocol::Endpoint& peer, Clock::time_point now) const noexcept {
+    const std::uint64_t hash = IpKeyHash{}(suspect_key(peer));
+    const std::uint64_t slot = real_[hash & (kRealSlots - 1)].load(std::memory_order_relaxed);
+    if (slot == 0 || (slot >> 32) != ((hash >> 32) | 1U)) return false;
+    const auto minute = static_cast<std::uint32_t>(slot);
+    const auto now_minute = static_cast<std::uint32_t>(steady_minutes(now));
+    return static_cast<std::uint32_t>(now_minute - minute) <= kRealMinutes;
+}
+
+bool SuspectTable::watch_budget(Clock::time_point now) noexcept {
+    const std::int64_t minute = steady_minutes(now);
+    std::int64_t current = watch_minute_.load(std::memory_order_relaxed);
+    if (current != minute &&
+        watch_minute_.compare_exchange_strong(current, minute, std::memory_order_relaxed)) {
+        watch_used_.store(0, std::memory_order_relaxed);
+    }
+    return watch_used_.fetch_add(1, std::memory_order_relaxed) < kWatchPerMinute;
+}
 
 SuspectTable::Shard& SuspectTable::shard_for(const IpKey& key) noexcept {
     return shards_[IpKeyHash{}(key) % kShards];
 }
 
 double SuspectTable::score_of(const std::array<std::uint32_t, control::kSuspectSignals>& hits,
-                              double age_hours) noexcept {
+                              double age_hours, bool real) noexcept {
     double score = 0;
     for (std::size_t i = 0; i < hits.size(); ++i) {
         if (hits[i] == 0) continue;
-        const double weight = control::suspect_signal_weight(static_cast<control::SuspectSignal>(i));
+        const auto signal = static_cast<control::SuspectSignal>(i);
+        if (real && control::suspect_signal_ambiguous(signal)) continue;
+        const double weight = control::suspect_signal_weight(signal);
         score += weight * (1.0 + 0.25 * std::min<std::uint32_t>(hits[i] - 1, 4));
     }
     score = std::min(score, 100.0);
@@ -160,20 +212,37 @@ SuspectTable::Recorded SuspectTable::record(const Context& context, Signal signa
                                             double watch_score) {
     Recorded out;
     if (context.peer == nullptr) return out;
+    // A real client's racing, pings and retries: no entry, no score.
+    if (control::suspect_signal_ambiguous(signal) && recently_real(*context.peer, now)) return out;
     const IpKey key = suspect_key(*context.peer);
     Shard& shard = shard_for(key);
     std::lock_guard<std::mutex> lock(shard.mutex);
     auto found = shard.entries.find(key);
     if (found == shard.entries.end()) {
-        // FIFO eviction; stale queue items (re-inserted keys) are skipped by
-        // their sequence number.
+        // Eviction: drop stale queue items (re-inserted or pruned keys, told
+        // apart by sequence), then the lowest-scoring of the oldest entries.
         while (shard.entries.size() >= per_shard_ && !shard.order.empty()) {
-            const auto [old_key, sequence] = shard.order.front();
-            shard.order.pop_front();
-            const auto old = shard.entries.find(old_key);
-            if (old != shard.entries.end() && old->second.sequence == sequence) {
-                shard.entries.erase(old);
+            for (std::size_t i = 0; i < shard.order.size() && i < kEvictWindow;) {
+                const auto old = shard.entries.find(shard.order[i].first);
+                if (old == shard.entries.end() || old->second.sequence != shard.order[i].second) {
+                    shard.order.erase(shard.order.begin() + static_cast<std::ptrdiff_t>(i));
+                } else {
+                    ++i;
+                }
             }
+            if (shard.order.empty()) break;
+            std::size_t victim = 0;
+            double lowest = 0;
+            for (std::size_t i = 0; i < shard.order.size() && i < kEvictWindow; ++i) {
+                const Entry& old = shard.entries.find(shard.order[i].first)->second;
+                const double score = score_of(old.hits, hours_between(old.last, now), old.real);
+                if (i == 0 || score < lowest) {
+                    victim = i;
+                    lowest = score;
+                }
+            }
+            shard.entries.erase(shard.order[victim].first);
+            shard.order.erase(shard.order.begin() + static_cast<std::ptrdiff_t>(victim));
         }
         Entry entry;
         entry.first = now;
@@ -203,7 +272,7 @@ SuspectTable::Recorded SuspectTable::record(const Context& context, Signal signa
     if (!context.user.empty()) entry.user = std::string(context.user);
     if (!context.sni.empty()) entry.sni = std::string(context.sni.substr(0, 255));
     if (signal == Signal::raw_obfuscated2) entry.last_raw = now;
-    out.score = score_of(entry.hits, 0.0);
+    out.score = score_of(entry.hits, 0.0, entry.real);
     out.matches = matches_of(entry.hits);
     if (watch_score > 0 && out.score >= watch_score && !entry.watch_reported) {
         entry.watch_reported = true;
@@ -227,7 +296,7 @@ SuspectTable::Seen SuspectTable::accept(const protocol::Endpoint& peer, Clock::t
         out.repeat_visit = entry.visits >= kRepeatVisits && entry.longest_session < kLongSession;
     }
     entry.last_visit = now;
-    out.score = score_of(entry.hits, hours_between(entry.last, now));
+    out.score = score_of(entry.hits, hours_between(entry.last, now), entry.real);
     return out;
 }
 
@@ -237,7 +306,7 @@ double SuspectTable::score(const protocol::Endpoint& peer, Clock::time_point now
     std::lock_guard<std::mutex> lock(shard.mutex);
     const auto found = shard.entries.find(key);
     if (found == shard.entries.end()) return 0;
-    return score_of(found->second.hits, hours_between(found->second.last, now));
+    return score_of(found->second.hits, hours_between(found->second.last, now), found->second.real);
 }
 
 bool SuspectTable::close_session(const protocol::Endpoint& peer, Clock::time_point auth_at,
@@ -268,7 +337,8 @@ std::vector<control::Statistics::SuspectInfo> SuspectTable::list(Clock::time_poi
             info.ip = ip_text(entry.peer);
             info.hits = entry.hits;
             info.matches = matches_of(entry.hits);
-            info.score = score_of(entry.hits, hours_between(entry.last, now));
+            info.score = score_of(entry.hits, hours_between(entry.last, now), entry.real);
+            info.real_client = entry.real;
             info.first_seen = entry.first_unix;
             info.last_seen = entry.last_unix;
             info.visits = entry.visits;
@@ -335,7 +405,7 @@ void Runtime::Impl::suspect(Client& client, control::SuspectSignal signal, std::
                       " score=" + std::to_string(static_cast<int>(recorded.score)) +
                       " matches=" + std::to_string(recorded.matches));
     }
-    if (recorded.crossed_watch) {
+    if (recorded.crossed_watch && shared_->suspects.watch_budget(Clock::now())) {
         char ip[INET6_ADDRSTRLEN] = {};
         ::inet_ntop(client.peer.ipv6 ? AF_INET6 : AF_INET, client.peer.address.data(), ip, sizeof(ip));
         std::string line = std::string("mtdd suspect: ip=") + ip +

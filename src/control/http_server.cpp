@@ -680,7 +680,8 @@ struct ControlServer::Impl {
            {"syn", {{"ttl", row.ttl}, {"window", row.window}, {"mss", row.mss},
                     {"wscale", row.wscale}, {"layout", row.layout}}},
            {"watched", row.watched},
-           {"shadow_banned", row.shadow_banned}});
+           {"shadow_banned", row.shadow_banned},
+           {"real_client", row.real_client}});
     }
     json summary = json::object();
     for (size_t m = 1; m <= kSuspectSignals; ++m) {

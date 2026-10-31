@@ -600,7 +600,7 @@ const char* to_string(SuspectSignal signal) noexcept {
 }
 
 unsigned suspect_signal_weight(SuspectSignal signal) noexcept {
-  static constexpr std::array<unsigned, kSuspectSignals> kWeights{40, 40, 15, 30, 20,
+  static constexpr std::array<unsigned, kSuspectSignals> kWeights{40, 40, 15, 50, 20,
                                                                   10, 20, 5,  60};
   const auto index = static_cast<size_t>(signal);
   return index < kSuspectSignals ? kWeights[index] : 0;

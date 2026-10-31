@@ -982,7 +982,8 @@ for row in rows:
     signals = row.get("signals") or {}
     marks = "".join(codes.get(name, "?") + ("" if count == 1 else str(min(count, 99)))
                     for name, count in sorted(signals.items(), key=lambda kv: codes.get(kv[0], "Z")))
-    flags = (" !бан" if row.get("shadow_banned") else "") + (" ·лог" if row.get("watched") else "")
+    flags = ((" !бан" if row.get("shadow_banned") else "") + (" ·лог" if row.get("watched") else "")
+             + (" ·клиент" if row.get("real_client") else ""))
     print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {}{}".format(
         row.get("matches", 0), round(row.get("score", 0)), row.get("ip", "?"), marks[:16],
         row.get("hits", 0), ago(row.get("last_seen", "")), row.get("platform", ""),
@@ -991,7 +992,7 @@ print()
 print("  A сессия-зонд (req_pq и уход) · B секрет текстом · C obfuscated2 без FakeTLS")
 print("  D FakeTLS + obfuscated2 разом · E наш домен, неверный секрет · F connect без данных")
 print("  G повторные короткие визиты · H мусор/чужой SNI/replay · K ловушка (canary)")
-print("  Цифра после буквы — число повторов")
+print("  Цифра после буквы — число повторов · ·клиент — с адреса были и настоящие сессии (A/E/F/G/H не считаются)")
 ' || { err 'Не удалось разобрать список'; return 1; } ;;
         json)
             api GET "/v1/suspects?limit=100000" ;;

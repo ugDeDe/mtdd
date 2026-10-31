@@ -447,6 +447,13 @@ public:
     };
 
     explicit SuspectTable(std::size_t capacity = 65536);
+    // A connection from `peer` presented a non-zero auth_key_id: a real
+    // client. Lock-free hashed slot, plus a flag on an existing entry.
+    void mark_real(const protocol::Endpoint& peer, Clock::time_point now);
+    bool recently_real(const protocol::Endpoint& peer, Clock::time_point now) const noexcept;
+    // Global budget for automatic per-stage logging: false once
+    // kWatchPerMinute connections were put under watch this minute.
+    bool watch_budget(Clock::time_point now) noexcept;
     Recorded record(const Context& context, Signal signal, Clock::time_point now,
                     std::int64_t unix_now, double watch_score);
     // An accepted connection: counts visits of known addresses, returns the
@@ -463,7 +470,9 @@ public:
                                                        double watch_score, double ban_score);
     void prune(Clock::time_point now, std::chrono::hours ttl);
     static double score_of(const std::array<std::uint32_t, control::kSuspectSignals>& hits,
-                           double age_hours) noexcept;
+                           double age_hours, bool real = false) noexcept;
+    static constexpr std::uint32_t kWatchPerMinute = 30;
+    static constexpr std::size_t kRealSlots = 1U << 16;
 
 private:
     struct Entry {
@@ -478,6 +487,7 @@ private:
         std::chrono::seconds longest_session{0};
         std::uint64_t sequence{0};
         bool watch_reported{false};
+        bool real{false};
         protocol::Endpoint peer{};
         SynPrint syn{};
         Platform platform{Platform::undefined};
@@ -495,6 +505,10 @@ private:
     Shard& shard_for(const IpKey& key) noexcept;
     std::size_t per_shard_;
     std::array<Shard, kShards> shards_;
+    // (32-bit address tag << 32) | minute of the last real session.
+    std::unique_ptr<std::atomic<std::uint64_t>[]> real_;
+    std::atomic<std::int64_t> watch_minute_{0};
+    std::atomic<std::uint32_t> watch_used_{0};
 };
 IpKey suspect_key(const protocol::Endpoint& peer) noexcept;
 

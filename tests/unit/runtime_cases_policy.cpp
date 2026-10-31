@@ -965,3 +965,100 @@ TEST(Suspects, CrossingTheWatchScoreLogsAndDisabledDetectionRecordsNothing) {
     std::this_thread::sleep_for(200ms);
     EXPECT_TRUE(off.services.stats.suspects().empty());
 }
+
+TEST(Suspects, RealClientsDoNotScoreAmbiguousSignals) {
+    using Table = mtdd::detail::SuspectTable;
+    std::array<std::uint32_t, mtdd::control::kSuspectSignals> hits{};
+    hits[static_cast<std::size_t>(SuspectSignal::probe_session)] = 1;
+    hits[static_cast<std::size_t>(SuspectSignal::port_check)] = 1;
+    hits[static_cast<std::size_t>(SuspectSignal::multi_mode)] = 1;
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0, false), 100.0);  // 40 + 10 + 50
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0, true), 50.0);    // only D counts
+
+    Table table(256);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto client = mtdd::protocol::Endpoint::v4({100, 64, 0, 1}, 1);
+    table.mark_real(client, t0);
+    EXPECT_TRUE(table.recently_real(client, t0 + std::chrono::minutes(59)));
+    // Racing and proxy pings of a real client: no entry at all.
+    table.record(suspect_context(client), SuspectSignal::probe_session, t0, 1, 60);
+    table.record(suspect_context(client), SuspectSignal::port_check, t0, 1, 60);
+    EXPECT_TRUE(table.list(t0, 1, 60, 0).empty());
+    // B still counts.
+    table.record(suspect_context(client), SuspectSignal::secret_text, t0, 1, 60);
+    ASSERT_EQ(table.list(t0, 1, 60, 0).size(), 1U);
+    // The mark expires; a checker that never brings a key is unaffected.
+    EXPECT_FALSE(table.recently_real(client, t0 + std::chrono::minutes(62)));
+    const auto checker = mtdd::protocol::Endpoint::v4({100, 64, 0, 2}, 1);
+    EXPECT_FALSE(table.recently_real(checker, t0));
+    table.record(suspect_context(checker), SuspectSignal::probe_session, t0, 1, 60);
+    // A real session after the probe neutralises it too.
+    const auto later = mtdd::protocol::Endpoint::v4({100, 64, 0, 3}, 1);
+    table.record(suspect_context(later), SuspectSignal::probe_session, t0, 1, 60);
+    table.mark_real(later, t0 + std::chrono::seconds(5));
+    for (const auto& row : table.list(t0, 1, 60, 0)) {
+        if (row.ip == "100.64.0.3") {
+            EXPECT_TRUE(row.real_client);
+            EXPECT_DOUBLE_EQ(row.score, 0.0);
+        }
+        if (row.ip == "100.64.0.2") {
+            EXPECT_FALSE(row.real_client);
+            EXPECT_DOUBLE_EQ(row.score, 40.0);
+        }
+    }
+}
+
+TEST(Suspects, WatchBudgetAndScoreAwareEviction) {
+    using Table = mtdd::detail::SuspectTable;
+    Table table(256);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::uint32_t allowed = 0;
+    for (int i = 0; i < 100; ++i) allowed += table.watch_budget(t0) ? 1U : 0U;
+    EXPECT_EQ(allowed, Table::kWatchPerMinute);
+    EXPECT_TRUE(table.watch_budget(t0 + std::chrono::minutes(1)));
+
+    // A real suspect recorded first survives a flood of one-off junk.
+    const auto suspect = mtdd::protocol::Endpoint::v4({192, 0, 2, 200}, 1);
+    table.record(suspect_context(suspect), SuspectSignal::multi_mode, t0, 1, 60);
+    for (std::uint32_t i = 0; i < 20000; ++i) {
+        const auto junk = mtdd::protocol::Endpoint::v4(
+            {10, static_cast<std::uint8_t>(i >> 16), static_cast<std::uint8_t>(i >> 8),
+             static_cast<std::uint8_t>(i)}, 1);
+        table.record(suspect_context(junk), SuspectSignal::junk, t0, 2, 60);
+    }
+    const auto rows = table.list(t0, 3, 60, 0);
+    EXPECT_LE(rows.size(), 256U);
+    EXPECT_NE(find_suspect(rows, "192.0.2.200"), nullptr);
+}
+
+TEST(Suspects, RealClientRacingConnectionsIsNotASuspect) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    TestClient winner(daemon.port(), secret_bytes());
+    ASSERT_TRUE(winner.valid());
+    ASSERT_TRUE(winner.send_hello());
+    ASSERT_TRUE(winner.start_obfuscation(2));
+    ASSERT_TRUE(winner.send_message(keyed_message(0x1111)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.user("alice")->devices() == 1U; }, 3s));
+    {
+        // The losing race connection: key exchange started, then dropped.
+        TestClient loser(daemon.port(), secret_bytes());
+        ASSERT_TRUE(loser.valid());
+        ASSERT_TRUE(loser.send_hello(0, 1));
+        ASSERT_TRUE(loser.start_obfuscation(2));
+        ASSERT_TRUE(loser.send_message(keyed_message(0)));
+        std::this_thread::sleep_for(100ms);
+    }
+    send_raw_probe(daemon.port(), {});  // and a proxy ping
+    // Both were seen as raw events...
+    EXPECT_TRUE(wait_for([&] {
+        const auto snapshot = daemon.services.stats.snapshot();
+        return snapshot.suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)] >= 1U &&
+               snapshot.suspect_events_total[static_cast<std::size_t>(SuspectSignal::port_check)] >= 1U;
+    }, 3s));
+    // ...but the address brought a real key: no suspect.
+    EXPECT_TRUE(daemon.services.stats.suspects().empty());
+}

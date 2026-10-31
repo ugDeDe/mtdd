@@ -146,6 +146,8 @@ bool Runtime::Impl::register_device(Client& client, std::uint64_t auth_key_id, T
     client.device_scan_left = 0;
     client.direct_scan_skip = 0;
     if (client.device_registered || auth_key_id == 0 || client.user_name.empty()) return true;
+    // A real key: this address hosts a real client (suspect detection).
+    if (config_.suspects) shared_->suspects.mark_real(client.peer, now);
     detail::DeviceTable::Count devices;
     const auto result = shared_->devices.admit(client.user_name, client.device_dc, auth_key_id,
                                                client.peer, client.platform, client.max_devices, now, config_.device_window,

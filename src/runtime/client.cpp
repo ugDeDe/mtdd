@@ -275,8 +275,9 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     if (config_.suspects) {
         const auto seen = shared_->suspects.accept(owned->peer, now);
         if (seen.known && config_.suspect_watch_score != 0 &&
-            seen.score >= static_cast<double>(config_.suspect_watch_score)) {
-            owned->watched = true;  // known suspect: per-stage log
+            seen.score >= static_cast<double>(config_.suspect_watch_score) &&
+            shared_->suspects.watch_budget(now)) {
+            owned->watched = true;  // known suspect: per-stage log (rate-limited)
         }
         repeat_visit = seen.repeat_visit;
     }

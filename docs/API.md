@@ -141,11 +141,13 @@ allowlist, включены ли маскировка и FakeTLS, глобаль
 `watched`, `shadow_banned` и `suspects[]`: `ip`, `matches`, `score`,
 `signals` (`{"probe_session": 2, ...}`), `hits`, `first_seen`, `last_seen`,
 `visits`, `user`, `sni`, `platform`, `tls`, `syn` (`ttl`, `window`, `mss`,
-`wscale`, `layout`), `watched`, `shadow_banned`. Признаки и веса описаны в
+`wscale`, `layout`), `watched`, `shadow_banned`, `real_client` (с адреса были и
+настоящие сессии: неоднозначные признаки A, E, F, G, H не дают очков). Признаки и веса описаны в
 README («Подозрительные адреса и fraud score»).
 
 Поле политики `canary` (bool): пользователь-ловушка, каждое его подключение
-записывается как признак `canary`.
+записывается как признак `canary`. Ставить только на секрет, который не
+выдаётся людям.
 
 ## Пользователи и политика
 

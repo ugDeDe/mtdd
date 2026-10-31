@@ -346,6 +346,14 @@ enum class SuspectSignal : uint8_t {
   junk,             // H: other non-TLS bytes, foreign-SNI probe, replayed hello
   canary,           // K: authenticated with a bait (canary) user
 };
+// Signals a real client also produces now and then (connection racing,
+// proxy ping, a stale link, retries). They score nothing for an address that
+// recently brought a real MTProto key; B, C, D and K always count.
+constexpr bool suspect_signal_ambiguous(SuspectSignal signal) noexcept {
+  return signal == SuspectSignal::probe_session || signal == SuspectSignal::wrong_secret ||
+         signal == SuspectSignal::port_check || signal == SuspectSignal::repeat_visits ||
+         signal == SuspectSignal::junk;
+}
 inline constexpr std::size_t kSuspectSignals = 9;
 const char* to_string(SuspectSignal signal) noexcept;
 // Fraud-score weight of the first hit; repeats add up to the same again.
@@ -676,6 +684,7 @@ class Statistics {
     std::string layout{"other"};
     bool watched{false};      // above suspect_watch_score: per-stage log
     bool shadow_banned{false};  // above suspect_ban_score: sent to masking
+    bool real_client{false};    // also had real sessions (a non-zero auth key)
   };
   using SuspectLister = std::function<std::vector<SuspectInfo>()>;
   void set_suspect_lister(SuspectLister lister);
