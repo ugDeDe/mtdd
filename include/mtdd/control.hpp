@@ -140,11 +140,14 @@ struct UserPolicy {
   std::optional<uint64_t> rate_limit_up_bytes_per_sec;
   std::optional<uint64_t> rate_limit_down_bytes_per_sec;
   std::string note;  // admin free text, <= kMaxNoteBytes of printable UTF-8
+  // Bait user: its link is published on purpose, so every connection that
+  // authenticates with it is reported as a suspect (signal "canary").
+  bool canary{false};
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           note.empty();
+           note.empty() && !canary;
   }
   bool operator==(const UserPolicy&) const = default;
 };
@@ -161,11 +164,12 @@ struct UserPolicyPatch {
   Patch<uint64_t> rate_limit_up_bytes_per_sec;
   Patch<uint64_t> rate_limit_down_bytes_per_sec;
   std::optional<std::string> note;  // "" clears
+  std::optional<bool> canary;
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           !note;
+           !note && !canary;
   }
 };
 
@@ -329,6 +333,24 @@ enum class MeResult { success, failure, timeout };
 // Outcome of one RPC_PROXY_ANS received from the signed-DC peer. "received" is
 // counted at the callback, so it stays distinct from delivery to a client.
 enum class MeAnswerResult { received, delivered, dropped_unknown, dropped_other };
+// Suspicious-behaviour signals (runtime suspect table, GET /v1/suspects).
+// Order is the wire/metric order; names are stable API strings.
+enum class SuspectSignal : uint8_t {
+  probe_session,    // A: valid secret, key exchange started (req_pq) and abandoned
+  secret_text,      // B: proxy secret sent as plain text ("ee"/"dd" + hex)
+  raw_obfuscated2,  // C: raw obfuscated2 (no FakeTLS) to a FakeTLS-only proxy
+  multi_mode,       // D: FakeTLS and raw obfuscated2 from one IP within seconds
+  wrong_secret,     // E: ClientHello for our domain with a wrong secret
+  port_check,       // F: connected and closed without sending anything
+  repeat_visits,    // G: repeated short visits, never a long session
+  junk,             // H: other non-TLS bytes, foreign-SNI probe, replayed hello
+  canary,           // K: authenticated with a bait (canary) user
+};
+inline constexpr std::size_t kSuspectSignals = 9;
+const char* to_string(SuspectSignal signal) noexcept;
+// Fraud-score weight of the first hit; repeats add up to the same again.
+unsigned suspect_signal_weight(SuspectSignal signal) noexcept;
+
 enum class ApiRoute {
   health,
   ready,
@@ -349,6 +371,7 @@ enum class ApiRoute {
   user_disable,
   user_reset_quota,
   user_devices,
+  suspects,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -505,6 +528,8 @@ struct StatisticsSnapshot {
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
+  std::array<uint64_t, kSuspectSignals> suspect_events_total{};
+  uint64_t suspect_shadow_bans_total{0};
   uint64_t media_throttled_total{0};
   uint64_t replay_cache_entries{0};
   uint64_t api_requests_total{0};
@@ -630,6 +655,33 @@ class Statistics {
   using DeviceLister = std::function<std::vector<DeviceInfo>(const std::string& user)>;
   void set_device_lister(DeviceLister lister);
   std::vector<DeviceInfo> devices(const std::string& user) const;
+
+  // Runtime suspect table (GET /v1/suspects), provided by the runtime.
+  struct SuspectInfo {
+    std::string ip;
+    std::array<uint32_t, kSuspectSignals> hits{};
+    uint32_t matches{0};      // distinct signals seen
+    double score{0};          // fraud score 0..100, decayed
+    int64_t first_seen{0};    // Unix seconds
+    int64_t last_seen{0};
+    uint32_t visits{0};
+    std::string user;         // last authenticated user, if any
+    std::string sni;          // last ClientHello SNI, if any
+    std::string platform{"Undefined"};
+    std::string tls{"other"};
+    uint8_t ttl{0};
+    uint16_t window{0};
+    uint16_t mss{0};
+    int8_t wscale{-1};
+    std::string layout{"other"};
+    bool watched{false};      // above suspect_watch_score: per-stage log
+    bool shadow_banned{false};  // above suspect_ban_score: sent to masking
+  };
+  using SuspectLister = std::function<std::vector<SuspectInfo>()>;
+  void set_suspect_lister(SuspectLister lister);
+  std::vector<SuspectInfo> suspects() const;
+  void suspect_event(SuspectSignal signal) noexcept;
+  void suspect_shadow_banned() noexcept;
 
   // Global connection counters.
   void connection_accepted() noexcept;

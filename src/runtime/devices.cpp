@@ -215,6 +215,7 @@ bool Runtime::Impl::scan_direct_auth_key(Client& client, std::span<const std::ui
         client.direct_scan_have = 0;
         --client.device_scan_left;
         if (key != 0) return register_device(client, key, now);
+        if (client.zero_key_frames != 255) ++client.zero_key_frames;
         // Skip the rest of this frame (length counts payload + padding).
         client.direct_scan_skip = length > 8 ? length - 8 : 0;
     }

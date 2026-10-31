@@ -77,6 +77,15 @@ struct Config {
     // first bytes, ClientHello, auth result, masking, DC, auth_key_id,
     // MTProto frames, close reason and kernel byte counts. Empty = off.
     std::vector<std::string> watch_ips;
+    // Suspicious-behaviour detection (GET /v1/suspects, mtdd-ctl suspects).
+    // Addresses at or above suspect_watch_score get the watch_ips log
+    // automatically (0 = never). At or above suspect_ban_score their
+    // connections go to masking even with a valid secret (0 = off). Idle
+    // entries are dropped after suspect_ttl.
+    bool suspects{true};
+    std::uint32_t suspect_watch_score{60};
+    std::uint32_t suspect_ban_score{0};
+    std::chrono::hours suspect_ttl{168};
     std::chrono::seconds metadata_refresh{3600};
     // Opt-in Direct Telegram DC fallback. Disabled by default; only the listed
     // signed DCs use the trusted official direct address table.

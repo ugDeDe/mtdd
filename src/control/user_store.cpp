@@ -507,6 +507,7 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
   if (patch.data_quota_bytes) policy.data_quota_bytes = *patch.data_quota_bytes;
   if (patch.max_unique_ips) policy.max_unique_ips = *patch.max_unique_ips;
   if (patch.max_devices) policy.max_devices = *patch.max_devices;
+  if (patch.canary) policy.canary = *patch.canary;
   if (patch.rate_limit_up_bytes_per_sec) {
     policy.rate_limit_up_bytes_per_sec = *patch.rate_limit_up_bytes_per_sec;
   }

@@ -377,6 +377,7 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     const auto found = clients_.find(token);
     if (found == clients_.end()) return;
     Client& client = *found->second;
+    suspect_close(client, Clock::now());
     if (client.watched) watch_close(client);
     if (client.phase == Client::Phase::relay) stats_.relay_closed(client.close_reason);
 

@@ -95,7 +95,8 @@ RouteInfo classify_route(evhttp_request* request) {
       {"/v1/stats/summary", ApiRoute::stats_summary},
       {"/v1/stats/me", ApiRoute::stats_me},
       {"/v1/stats/users", ApiRoute::stats_users},
-      {"/v1/events", ApiRoute::events}};
+      {"/v1/events", ApiRoute::events},
+      {"/v1/suspects", ApiRoute::suspects}};
   for (const auto& [fixed, route] : kFixed) {
     if (path == fixed) {
       info.route = route;
@@ -146,6 +147,7 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
     case ApiRoute::stats_me:
     case ApiRoute::stats_users:
     case ApiRoute::events:
+    case ApiRoute::suspects:
       return method == ApiMethod::get;
     case ApiRoute::users:
       return method == ApiMethod::get || method == ApiMethod::post;
@@ -429,6 +431,12 @@ std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& o
     }
     out.note = body["note"].get<std::string>();
   }
+  if (body.contains("canary")) {
+    if (!body["canary"].is_boolean()) {
+      return HttpError{400, "invalid_field", "canary must be a boolean"};
+    }
+    out.canary = body["canary"].get<bool>();
+  }
   return std::nullopt;
 }
 
@@ -445,6 +453,7 @@ UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
     policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
   }
   if (patch.note) policy.note = *patch.note;
+  if (patch.canary) policy.canary = *patch.canary;
   return policy;
 }
 
@@ -461,6 +470,7 @@ json policy_json(const UserPolicy& policy) {
   out["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
   out["rate_limit_down_bytes_per_sec"] = nullable(policy.rate_limit_down_bytes_per_sec);
   out["note"] = policy.note;
+  out["canary"] = policy.canary;
   return out;
 }
 

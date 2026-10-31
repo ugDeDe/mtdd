@@ -874,6 +874,13 @@ class UserPolicyTest(PolicyShellCase):
             with self.subTest(raw=raw):
                 self.assertRejected("max_unique_ips", raw)
 
+    def test_canary_is_boolean(self):
+        self.assertBody("canary", "true", True)
+        self.assertBody("canary", "да", True)
+        self.assertBody("canary", "false", False)
+        self.assertBody("canary", "none", False)
+        self.assertRejected("canary", "maybe")
+
     def test_device_limit_bounds(self):
         self.assertBody("max_devices", "2", 2)
         self.assertBody("max_devices", "1000000", 1000000)
@@ -989,6 +996,21 @@ class UserPolicyApiTest(PolicyShellCase):
         for text in ("2030-01-01 23:59:59 UTC", "1.0 GiB / 10.0 GiB (10%)", "2.0 MiB/s",
                      "friend", "без лимита"):
             self.assertIn(text, result.stdout)
+
+    def test_suspects_lists_matches_signals_and_legend(self):
+        rows = [{"ip": "203.0.113.9", "matches": 3, "score": 85.4, "hits": 5,
+                 "signals": {"probe_session": 2, "raw_obfuscated2": 2, "multi_mode": 1},
+                 "last_seen": "2030-01-01T00:00:00Z", "platform": "Linux", "user": "dd",
+                 "watched": True, "shadow_banned": True}]
+        seen = self.start_api({("GET", "/v1/suspects"): (200, {"ok": True, "request_id": 6,
+                               "data": {"total": 1, "by_matches": {"3": 1}, "watched": 1,
+                                        "shadow_banned": 1, "suspects": rows}})})
+        result = self.sh("NO_COLOR=1; cmd_suspects list 2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text in ("по числу совпадений: 3×1", "203.0.113.9", "A2C2D", "85", "Linux", "dd",
+                     "!бан", "A сессия-зонд"):
+            self.assertIn(text, result.stdout)
+        self.assertIn("min_matches=2", seen[0][1])
 
     def test_devices_lists_platform_state_and_ip(self):
         keys = [{"id": "0000beef", "dc": 2, "connections": 3, "connected": True,

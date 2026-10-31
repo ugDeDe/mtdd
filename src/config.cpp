@@ -140,6 +140,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
         "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds", "watch_ips",
+        "suspects", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
         "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
@@ -191,6 +192,10 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         throw std::invalid_argument("token variables must be distinct environment variable names");
     config.control_allow = networks(value, "control_allow", {});
     config.watch_ips = networks(value, "watch_ips", {});
+    config.suspects = boolean(value, "suspects", true);
+    config.suspect_watch_score = static_cast<std::uint32_t>(number(value, "suspect_watch_score", 60, 0, 100));
+    config.suspect_ban_score = static_cast<std::uint32_t>(number(value, "suspect_ban_score", 0, 0, 100));
+    config.suspect_ttl = std::chrono::hours(number(value, "suspect_ttl_hours", 168, 1, 720));
     config.metrics_host = text(value, "metrics_host", config.metrics_host);
     if (!numeric_ip(config.metrics_host)) throw std::invalid_argument("metrics_host must be a numeric IP address");
     config.metrics_port = static_cast<std::uint16_t>(number(value, "metrics_port", config.metrics_port, 0, 65535));

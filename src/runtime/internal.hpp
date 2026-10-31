@@ -419,6 +419,91 @@ struct WatchNet {
 std::optional<WatchNet> parse_watch_net(std::string_view text);
 bool watch_net_contains(const WatchNet& net, const protocol::Endpoint& peer) noexcept;
 
+// Per-IP suspicious-behaviour table (suspects.cpp), shared by all reactors.
+// Touched on connection events only (accept, handshake outcome, close), never
+// per packet. Sharded by address; bounded with FIFO eviction.
+class SuspectTable {
+public:
+    using Clock = std::chrono::steady_clock;
+    using Signal = control::SuspectSignal;
+    struct Context {
+        const protocol::Endpoint* peer{nullptr};
+        const SynPrint* syn{nullptr};
+        Platform platform{Platform::undefined};
+        TlsTemplate tls{TlsTemplate::other};
+        std::string_view user;
+        std::string_view sni;
+    };
+    struct Recorded {
+        double score{0};
+        std::uint32_t matches{0};
+        bool crossed_watch{false};  // first time at or above the watch score
+        std::string signals;        // "probe_session,raw_obfuscated2"
+    };
+    struct Seen {
+        bool known{false};
+        double score{0};
+        bool repeat_visit{false};  // this accept starts another short visit (G)
+    };
+
+    explicit SuspectTable(std::size_t capacity = 65536);
+    Recorded record(const Context& context, Signal signal, Clock::time_point now,
+                    std::int64_t unix_now, double watch_score);
+    // An accepted connection: counts visits of known addresses, returns the
+    // current score. Never creates an entry.
+    Seen accept(const protocol::Endpoint& peer, Clock::time_point now);
+    double score(const protocol::Endpoint& peer, Clock::time_point now);
+    // Multi-mode correlation (D): a FakeTLS session authenticated at
+    // `auth_at` and closing now; true when the same address sent raw
+    // obfuscated2 within 3 s of it. Also records the session length (G).
+    bool close_session(const protocol::Endpoint& peer, Clock::time_point auth_at,
+                       Clock::time_point now);
+    std::vector<control::Statistics::SuspectInfo> list(Clock::time_point now,
+                                                       std::int64_t unix_now,
+                                                       double watch_score, double ban_score);
+    void prune(Clock::time_point now, std::chrono::hours ttl);
+    static double score_of(const std::array<std::uint32_t, control::kSuspectSignals>& hits,
+                           double age_hours) noexcept;
+
+private:
+    struct Entry {
+        std::array<std::uint32_t, control::kSuspectSignals> hits{};
+        Clock::time_point first{};
+        Clock::time_point last{};
+        Clock::time_point last_visit{};
+        Clock::time_point last_raw{};       // last raw obfuscated2 (C)
+        std::int64_t first_unix{0};
+        std::int64_t last_unix{0};
+        std::uint32_t visits{0};
+        std::chrono::seconds longest_session{0};
+        std::uint64_t sequence{0};
+        bool watch_reported{false};
+        protocol::Endpoint peer{};
+        SynPrint syn{};
+        Platform platform{Platform::undefined};
+        TlsTemplate tls{TlsTemplate::other};
+        std::string user;
+        std::string sni;
+    };
+    struct Shard {
+        std::mutex mutex;
+        std::unordered_map<IpKey, Entry, IpKeyHash> entries;
+        std::deque<std::pair<IpKey, std::uint64_t>> order;
+        std::uint64_t sequence{0};
+    };
+    static constexpr std::size_t kShards = 16;
+    Shard& shard_for(const IpKey& key) noexcept;
+    std::size_t per_shard_;
+    std::array<Shard, kShards> shards_;
+};
+IpKey suspect_key(const protocol::Endpoint& peer) noexcept;
+
+// What a non-TLS first segment looks like (B, C or H).
+enum class RawProbe : std::uint8_t { secret_text, raw_obfuscated2, junk };
+RawProbe classify_raw_probe(std::span<const std::uint8_t> bytes) noexcept;
+// `name` is `domain` or a subdomain of it (case-insensitive, trailing dot ok).
+bool domain_covers(std::string_view name, std::string_view domain);
+
 // Leading client frames inspected for a non-zero auth_key_id. Key exchange
 // (auth_key_id 0) takes a few frames; nothing after the first key is read.
 inline constexpr std::uint8_t kDeviceScanFrames = 16;
@@ -513,6 +598,7 @@ struct SharedState {
     // SIGHUP handler installed before run(); invoked on the signal reactor.
     std::function<void()> reload_hook;
     DeviceTable devices;
+    SuspectTable suspects;
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
@@ -781,6 +867,13 @@ struct Runtime::Impl {
         detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
         // Config::watch_ips: this connection is logged stage by stage.
         bool watched{false};
+        // Suspect detection (suspects.cpp): connection timeline and what the
+        // first MTProto frames looked like.
+        Time accepted_at{};
+        Time auth_at{};            // FakeTLS authenticated, Time{} otherwise
+        bool canary{false};        // authenticated as a bait user
+        std::uint8_t zero_key_frames{0};  // frames with auth_key_id 0 (key exchange)
+        bool saw_req_dh{false};    // key exchange went past req_pq
         std::uint8_t watch_frames{0};
         Time watch_start{};
         detail::Platform platform{detail::Platform::undefined};
@@ -1067,6 +1160,12 @@ struct Runtime::Impl {
     void watch_hello(const Client& client, std::span<const std::uint8_t> record);
     void watch_frame(Client& client, std::span<const std::uint8_t> payload, std::size_t length);
     void watch_close(const Client& client);
+    // Records a suspect signal for this connection's address (suspects.cpp).
+    void suspect(Client& client, control::SuspectSignal signal, std::string_view sni = {});
+    void suspect_first_bytes(Client& client);
+    void suspect_close(Client& client, Time now);
+    bool suspect_shadow_ban(Client& client, Time now);
+    Time next_suspect_prune_{};
     // Fair-share rate limits: recompute this connection's share, and publish
     // this reactor's active-connection counts (1 Hz, from the gauge pass).
     void recompute_rate_share(Client& client) noexcept;

@@ -112,7 +112,7 @@ HttpError map_store_error(const Error& error);
 
 inline constexpr std::initializer_list<std::string_view> kPolicyFields = {
     "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
-    "rate_limit_up_bytes_per_sec", "rate_limit_down_bytes_per_sec", "note"};
+    "rate_limit_up_bytes_per_sec", "rate_limit_down_bytes_per_sec", "note", "canary"};
 
 // RFC 3339 with Z or a numeric offset; fractional seconds are truncated.
 std::optional<int64_t> parse_rfc3339(std::string_view text);

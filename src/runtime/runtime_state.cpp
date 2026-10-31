@@ -106,10 +106,30 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
             }
             return out;
         });
+    if (config.suspects) {
+        statistics.set_suspect_lister(
+            [weak = std::weak_ptr<detail::SharedState>(shared),
+             watch = static_cast<double>(config.suspect_watch_score),
+             ban = static_cast<double>(config.suspect_ban_score)]() {
+                std::vector<control::Statistics::SuspectInfo> out;
+                if (const auto state = weak.lock()) {
+                    out = state->suspects.list(
+                        std::chrono::steady_clock::now(),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count(),
+                        watch, ban);
+                }
+                return out;
+            });
+    }
 }
 
 Runtime::RuntimeState::~RuntimeState() {
-    if (statistics_) statistics_->set_device_lister({});
+    if (statistics_) {
+        statistics_->set_device_lister({});
+        statistics_->set_suspect_lister({});
+    }
     request_stop();
     {
         std::unique_lock lock{run_mutex_};

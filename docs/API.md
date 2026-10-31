@@ -129,6 +129,24 @@ allowlist, включены ли маскировка и FakeTLS, глобаль
 | `GET /v1/stats/users` | `sort=traffic\|connections\|unique_ips\|name` (по умолчанию `traffic`; `unique_ips` — по seen), `limit` 1..1000 (50), `offset`. Ответ: `users` (с `quota_used_bytes` и `data_quota_bytes`), `total` |
 | `GET /v1/events` | `after=ID`, `limit` 1..256 (50). Ответ: `events`, `next_after`, `oldest_id`, `capacity` |
 
+## Подозрительные адреса
+
+`GET /v1/suspects` (доступен read-токену) — таблица подозреваемых из
+рантайма. Параметры: `sort=matches` (по умолчанию: число разных признаков,
+затем счёт) `| score | hits | last_seen`, `min_matches` 0..9, `min_score`
+0..100, `limit` 1..100000 (100), `offset`, `format=json|ips` (`ips` — текст,
+адрес на строку, для наборов файрвола).
+
+Ответ: `total`, `filtered`, `by_matches` (сколько адресов с 1, 2, … совпадениями),
+`watched`, `shadow_banned` и `suspects[]`: `ip`, `matches`, `score`,
+`signals` (`{"probe_session": 2, ...}`), `hits`, `first_seen`, `last_seen`,
+`visits`, `user`, `sni`, `platform`, `tls`, `syn` (`ttl`, `window`, `mss`,
+`wscale`, `layout`), `watched`, `shadow_banned`. Признаки и веса описаны в
+README («Подозрительные адреса и fraud score»).
+
+Поле политики `canary` (bool): пользователь-ловушка, каждое его подключение
+записывается как признак `canary`.
+
 ## Пользователи и политика
 
 ```json

@@ -270,6 +270,16 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
             }
         }
     }
+    owned->accepted_at = now;
+    bool repeat_visit = false;
+    if (config_.suspects) {
+        const auto seen = shared_->suspects.accept(owned->peer, now);
+        if (seen.known && config_.suspect_watch_score != 0 &&
+            seen.score >= static_cast<double>(config_.suspect_watch_score)) {
+            owned->watched = true;  // known suspect: per-stage log
+        }
+        repeat_visit = seen.repeat_visit;
+    }
     owned->phase = Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
     owned->last_activity = now;
@@ -296,6 +306,7 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         reaccount(*raw);
         update_client_interest(*raw);
         if (raw->watched) watch_accept(*raw, now);
+        if (repeat_visit) suspect(*raw, control::SuspectSignal::repeat_visits);
     } catch (...) {
         // close_client() is safe here: handshake accounting is still pending and
         // no user metrics have been attached yet.
@@ -431,6 +442,11 @@ void Runtime::Impl::consume_client_bytes(Client& client,
             if (!tls || record_length < 100 ||
                 record_length > protocol::kFakeTlsMaxClientHello) {
                 if (client.watched) watch_hello(client, client.hello);
+                if (tls) {
+                    suspect(client, control::SuspectSignal::junk);  // bad record length
+                } else {
+                    suspect_first_bytes(client);
+                }
                 if (masking_enabled()) {
                     start_fallback(client, client.hello, now);
                     return;
@@ -483,6 +499,25 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     const control::UserRecord* user = nullptr;
     if (!authenticate_hello(client, record, now, info, user)) {
         if (client.watched) watch_log(client, "auth", "result=bad_secret");
+        if (config_.suspects) {
+            // E: someone who knows our domain but not a valid secret.
+            const auto sni = protocol::client_hello_sni(record);
+            const bool ours = sni && detail::domain_covers(*sni, config_.tls_domain);
+            client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+            suspect(client, ours ? control::SuspectSignal::wrong_secret : control::SuspectSignal::junk,
+                    sni ? std::string_view(*sni) : std::string_view{});
+        }
+        if (masking_enabled()) {
+            start_fallback(client, record, now);
+            return;
+        }
+        reject_close(client, control::RejectReason::auth_failed,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    // Shadow ban: a known checker gets what any unauthenticated visitor gets
+    // (the real site), so its list marks this proxy dead. No RST, no refusal.
+    if (suspect_shadow_ban(client, now)) {
         if (masking_enabled()) {
             start_fallback(client, record, now);
             return;
@@ -500,6 +535,9 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
     if (client.watched && outcome != detail::ReplayCache::Outcome::accepted) {
         watch_log(client, "auth", "result=replay");
+    }
+    if (outcome == detail::ReplayCache::Outcome::duplicate) {
+        suspect(client, control::SuspectSignal::junk);
     }
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
@@ -521,6 +559,13 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (client.phase != Client::Phase::tls_hello) return;
     client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
     client.user_name = user->name;
+    client.auth_at = now;
+    client.canary = user->policy.canary;
+    if (client.canary) {
+        const auto sni = protocol::client_hello_sni(record);
+        suspect(client, control::SuspectSignal::canary,
+                sni ? std::string_view(*sni) : std::string_view{});
+    }
     if (client.watched) {
         watch_log(client, "auth", "result=ok user=" + user->name +
                                       " platform=" + detail::platform_name(client.platform));
@@ -744,6 +789,21 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
                         key = (key << 8) | message.data[static_cast<std::size_t>(i)];
                     }
                     if (key != 0 && !register_device(client, key, now)) return;
+                    if (key == 0) {
+                        // Unencrypted key exchange: the TL constructor follows
+                        // msg_id (8) and length (4).
+                        if (client.zero_key_frames != 255) ++client.zero_key_frames;
+                        if (message.data.size() >= 24) {
+                            std::uint32_t constructor = 0;
+                            for (int i = 23; i >= 20; --i) {
+                                constructor = (constructor << 8) |
+                                              message.data[static_cast<std::size_t>(i)];
+                            }
+                            if (constructor == 0xd712e4beU || constructor == 0xf5045f1fU) {
+                                client.saw_req_dh = true;  // req_DH_params, set_client_DH_params
+                            }
+                        }
+                    }
                 }
             }
             const std::size_t bytes = message.data.capacity();

@@ -317,6 +317,47 @@ sudo bash install.sh     # то же меню через сам установщ
 перенаправлении вывода в файл или пайп escape-последовательности не пишутся,
 поэтому `sudo mtdd-ctl status | tee log` остаётся читаемым.
 
+### Подозрительные адреса и fraud score
+
+mtdd сам отмечает адреса с поведением чекеров, сканеров и проб. Признаки
+проверяются только на событиях соединения (приём, рукопожатие, закрытие), на
+горячий путь они не влияют:
+
+| Код | Признак | Вес |
+| --- | --- | --- |
+| A `probe_session` | верный секрет, начат обмен ключами (`req_pq`), и сессия закончилась, не дойдя до `req_DH_params` | 40 |
+| B `secret_text` | секрет прокси отправлен текстом (`ee`/`dd` + hex) | 40 |
+| C `raw_obfuscated2` | obfuscated2 без FakeTLS на прокси, который принимает только FakeTLS | 15 |
+| D `multi_mode` | FakeTLS и obfuscated2 с одного адреса в пределах нескольких секунд | 30 |
+| E `wrong_secret` | ClientHello на наш домен с неверным секретом | 20 |
+| F `port_check` | подключился и закрыл, ничего не отправив | 10 |
+| G `repeat_visits` | повторные короткие визиты (3+ с паузой 5+ мин), ни одной длинной сессии | 20 |
+| H `junk` | прочий не-TLS, чужой SNI, повтор (replay) ClientHello | 5 |
+| K `canary` | вход под пользователем-ловушкой (`canary: true`) | 60 |
+
+**Fraud score** (0–100): сумма весов показанных признаков, каждый повтор
+добавляет четверть веса (не больше удвоения); счёт уменьшается вдвое за
+каждые 24 часа с последнего появления. **Совпадения** — число разных
+признаков; список сортируется сначала по ним, потом по счёту.
+
+Настройки (`/etc/mtdd/config.json`): `suspects` (вкл., по умолчанию `true`),
+`suspect_watch_score` (60: выше — подробный лог как у `watch_ips` и строка
+`mtdd suspect:` в журнале, 0 — выкл.), `suspect_ban_score` (0 — выкл.: выше —
+теневой бан, верный секрет уходит в маскировку, и чекер видит обычный сайт),
+`suspect_ttl_hours` (168).
+
+```sh
+sudo mtdd-ctl suspects          # таблица: совпадения, score, признаки, отпечаток
+sudo mtdd-ctl suspects 2        # только 2+ совпадения
+sudo mtdd-ctl users set bait canary true   # пользователь-ловушка
+sudo mtdd-ctl suspects block 80 # nftables-блок адресов со score ≥ 80 (unblock — снять)
+tools/suspects_merge.py ssh:HOST1 ssh:HOST2  # общий список с нескольких серверов
+```
+
+API: `GET /v1/suspects?sort=matches|score|hits|last_seen&min_matches=&min_score=&format=json|ips`;
+метрики `mtdd_suspect_events_total{signal}`, `mtdd_suspects{matches}`,
+`mtdd_suspect_shadow_bans_total`.
+
 ### Наблюдение за адресами
 
 `watch_ips` в конфигурации — список IP или CIDR (до 64). Для подключений с

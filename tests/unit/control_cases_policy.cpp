@@ -6,6 +6,7 @@ namespace {
 
 using mtdd::control::UserPolicy;
 using mtdd::control::UserPolicyPatch;
+using mtdd::control::SuspectSignal;
 
 UserPolicy full_policy() {
   UserPolicy policy;
@@ -13,6 +14,7 @@ UserPolicy full_policy() {
   policy.data_quota_bytes = 10ull << 30;
   policy.max_unique_ips = 3;
   policy.max_devices = 2;
+  policy.canary = true;
   policy.rate_limit_up_bytes_per_sec = 1 << 20;
   policy.rate_limit_down_bytes_per_sec = 4 << 20;
   policy.note = "семья · laptop";
@@ -237,4 +239,72 @@ TEST(UserPolicyHttpTest, DevicesRouteListsConnectedFirst) {
   EXPECT_EQ(data["keys"][1]["ip"], "10.0.0.1");
   EXPECT_EQ(h.req("POST", "/v1/users/alice/devices").status, 405);
   h.stats().set_device_lister({});
+}
+
+TEST(UserPolicyHttpTest, CanaryFlagIsABoolean) {
+  Harness h;
+  const auto created = h.req("POST", "/v1/users", R"({"name":"bait","canary":true})");
+  ASSERT_EQ(created.status, 201) << created.body;
+  EXPECT_EQ(parse_json(created)["data"]["user"]["canary"], true);
+  EXPECT_EQ(h.req("PATCH", "/v1/users/bait", R"({"canary":"yes"})").status, 400);
+  const auto cleared = h.req("PATCH", "/v1/users/bait", R"({"canary":false})");
+  ASSERT_EQ(cleared.status, 200) << cleared.body;
+  EXPECT_EQ(parse_json(cleared)["data"]["user"]["canary"], false);
+}
+
+TEST(SuspectsHttpTest, SortsByMatchesFiltersAndExportsIps) {
+  Harness h;
+  auto empty = h.req("GET", "/v1/suspects");
+  ASSERT_EQ(empty.status, 200) << empty.body;
+  EXPECT_TRUE(parse_json(empty)["data"]["suspects"].empty());
+
+  h.stats().set_suspect_lister([] {
+    std::vector<Statistics::SuspectInfo> rows(3);
+    rows[0].ip = "198.51.100.1";  // one signal, high score
+    rows[0].hits[static_cast<size_t>(SuspectSignal::canary)] = 5;
+    rows[0].matches = 1;
+    rows[0].score = 100;
+    rows[0].last_seen = 1893456000;
+    rows[1].ip = "203.0.113.9";  // three signals, lower score
+    rows[1].hits[static_cast<size_t>(SuspectSignal::probe_session)] = 2;
+    rows[1].hits[static_cast<size_t>(SuspectSignal::raw_obfuscated2)] = 2;
+    rows[1].hits[static_cast<size_t>(SuspectSignal::multi_mode)] = 1;
+    rows[1].matches = 3;
+    rows[1].score = 85.4;
+    rows[1].user = "dd";
+    rows[1].platform = "Linux";
+    rows[1].shadow_banned = true;
+    rows[2].ip = "192.0.2.4";
+    rows[2].hits[static_cast<size_t>(SuspectSignal::junk)] = 1;
+    rows[2].matches = 1;
+    rows[2].score = 5;
+    return rows;
+  });
+  const auto listed = h.req("GET", "/v1/suspects");
+  ASSERT_EQ(listed.status, 200) << listed.body;
+  const auto data = parse_json(listed)["data"];
+  EXPECT_EQ(data["total"], 3);
+  EXPECT_EQ(data["by_matches"]["1"], 2);
+  EXPECT_EQ(data["by_matches"]["3"], 1);
+  EXPECT_EQ(data["shadow_banned"], 1);
+  ASSERT_EQ(data["suspects"].size(), 3u);
+  EXPECT_EQ(data["suspects"][0]["ip"], "203.0.113.9");  // most matches first
+  EXPECT_EQ(data["suspects"][0]["signals"]["probe_session"], 2);
+  EXPECT_EQ(data["suspects"][0]["hits"], 5);
+  EXPECT_EQ(data["suspects"][0]["user"], "dd");
+  EXPECT_EQ(data["suspects"][1]["ip"], "198.51.100.1");
+  EXPECT_TRUE(data["suspects"][2]["user"].is_null());
+
+  const auto by_score = parse_json(h.req("GET", "/v1/suspects?sort=score"))["data"];
+  EXPECT_EQ(by_score["suspects"][0]["ip"], "198.51.100.1");
+  const auto filtered = parse_json(h.req("GET", "/v1/suspects?min_matches=2"))["data"];
+  EXPECT_EQ(filtered["filtered"], 1);
+  const auto ips = h.req("GET", "/v1/suspects?format=ips&min_score=50");
+  ASSERT_EQ(ips.status, 200);
+  EXPECT_EQ(ips.body, "203.0.113.9\n198.51.100.1\n");
+  EXPECT_EQ(h.req("GET", "/v1/suspects?sort=bogus").status, 400);
+  EXPECT_EQ(h.req("GET", "/v1/suspects?min_matches=10").status, 400);
+  EXPECT_EQ(h.req("POST", "/v1/suspects").status, 405);
+  EXPECT_NE(h.req("GET", "/metrics").body.find("mtdd_suspects{matches=\"3\"} 1"), std::string::npos);
+  h.stats().set_suspect_lister({});
 }

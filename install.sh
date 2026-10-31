@@ -194,10 +194,14 @@ mtdd — установка и управление MTProto-прокси
   users rotate ИМЯ                Заменить секрет и показать новую ссылку
   users show ИМЯ                  Политики и статистика пользователя
   users devices ИМЯ               Устройства: платформа, DC, IP, подключено ли
-  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости, заметка (none — снять)
+  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости/устройств, canary, заметка (none — снять)
   users reset-quota ИМЯ           Сбросить использованную квоту
   users audit [N]                 Последние N событий журнала аудита
   links [ИМЯ]                     Ссылки подключения (все или одного)
+  suspects [МИН_СОВПАДЕНИЙ]       Подозрительные адреса: признаки, fraud score, отпечаток
+  suspects json                   То же в JSON (для сбора с нескольких серверов)
+  suspects block [МИН_SCORE]      Заблокировать в nftables адреса со score ≥ МИН_SCORE (по умолчанию 60)
+  suspects unblock                Снять блокировку nftables
   rotate ИМЯ                      То же, что users rotate
   metrics [--watch]               Дашборд: соединения, буферы, ME/DC, RTT, IP, графики
   metrics all|ФИЛЬТР              Сырые метрики Prometheus (по умолчанию mtdd_)
@@ -232,7 +236,7 @@ EOF
 
 # Разбор аргументов: первый позиционный токен — подкоманда управления,
 # остальные позиционные — её аргументы; флаги принадлежат установщику.
-SUBCOMMANDS=" status service start stop restart logs users links rotate metrics host check-config update uninstall menu help "
+SUBCOMMANDS=" status service start stop restart logs users links suspects rotate metrics host check-config update uninstall menu help "
 positional=()
 while (($#)); do
     case $1 in
@@ -663,6 +667,14 @@ elif field == "max_unique_ips":
         if not re.fullmatch(r"\d{1,10}", raw) or not 1 <= int(raw) <= 2 ** 32 - 1:
             fail("Лимит IP: целое число от 1 до 4294967295 или none")
         value = int(raw)
+elif field == "canary":
+    lowered = raw.lower()
+    if lowered in ("true", "yes", "on", "1", "да"):
+        value = True
+    elif lowered in ("false", "no", "off", "0", "нет") or lowered in CLEAR:
+        value = False
+    else:
+        fail("canary: true или false")
 elif field == "max_devices":
     if raw.lower() in CLEAR:
         value = None
@@ -786,6 +798,7 @@ rows = [
     ("Квота трафика", quota(user.get("data_quota_bytes"), used)),
     ("Лимит IP", "без лимита" if user.get("max_unique_ips") is None else str(user["max_unique_ips"])),
     ("Лимит устройств", "без лимита" if user.get("max_devices") is None else str(user["max_devices"])),
+    ("Ловушка (canary)", "да — каждое подключение считается подозрительным" if user.get("canary") else "нет"),
     ("Скорость ↑", rate(user.get("rate_limit_up_bytes_per_sec"))),
     ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
     ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
@@ -908,7 +921,7 @@ cmd_users() {
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users devices ИМЯ'; return 1; }
             cmd_users_devices "${cargs[1]}" ;;
         set)
-            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
         reset-quota)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
@@ -917,6 +930,106 @@ cmd_users() {
             cmd_audit "${cargs[1]-}" ;;
         *)
             err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate|show|devices|set|reset-quota|audit)"
+            return 1 ;;
+    esac
+}
+
+cmd_suspects() { # cmd_suspects [list [МИН]|json|block [МИН_SCORE]|unblock]
+    local action=${1:-list} arg=${2-} response
+    case $action in
+        ''|list|[0-9]*)
+            [[ $action =~ ^[0-9]+$ ]] && arg=$action
+            [[ -z $arg || $arg =~ ^[0-9]$ ]] || { err 'Использование: suspects [МИН_СОВПАДЕНИЙ 0–9]'; return 1; }
+            response=$(api_try GET "/v1/suspects?limit=200&min_matches=${arg:-0}" 2>&1) \
+                || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+            api_check "$response" 2>/dev/null || { err "Не удалось получить список:$(api_check "$response" 2>&1 || true)"; return 1; }
+            section 'Подозрительные адреса'
+            printf '%s' "$response" | python3 -c '
+import datetime, json, sys
+data = json.load(sys.stdin).get("data") or {}
+rows = data.get("suspects") or []
+codes = {"probe_session": "A", "secret_text": "B", "raw_obfuscated2": "C", "multi_mode": "D",
+         "wrong_secret": "E", "port_check": "F", "repeat_visits": "G", "junk": "H", "canary": "K"}
+by = data.get("by_matches") or {}
+print()
+print("  Всего: {} · по числу совпадений: {} · под наблюдением: {} · теневой бан: {}".format(
+    data.get("total", 0),
+    ", ".join("{}×{}".format(k, by[k]) for k in sorted(by, key=int, reverse=True)) or "—",
+    data.get("watched", 0), data.get("shadow_banned", 0)))
+if not rows:
+    print("  Подозрительных адресов нет")
+    sys.exit(0)
+
+
+def ago(text):
+    try:
+        then = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return text
+    seconds = int((datetime.datetime.now(datetime.timezone.utc) - then).total_seconds())
+    if seconds < 60:
+        return "{} с".format(seconds)
+    if seconds < 3600:
+        return "{} мин".format(seconds // 60)
+    if seconds < 86400:
+        return "{} ч".format(seconds // 3600)
+    return "{} д".format(seconds // 86400)
+
+
+print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {}".format(
+    "Сов", "Score", "IP", "Признаки", "Хиты", "Был", "Платф.", "Пользователь"))
+for row in rows:
+    signals = row.get("signals") or {}
+    marks = "".join(codes.get(name, "?") + ("" if count == 1 else str(min(count, 99)))
+                    for name, count in sorted(signals.items(), key=lambda kv: codes.get(kv[0], "Z")))
+    flags = (" !бан" if row.get("shadow_banned") else "") + (" ·лог" if row.get("watched") else "")
+    print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {}{}".format(
+        row.get("matches", 0), round(row.get("score", 0)), row.get("ip", "?"), marks[:16],
+        row.get("hits", 0), ago(row.get("last_seen", "")), row.get("platform", ""),
+        row.get("user") or "—", flags))
+print()
+print("  A сессия-зонд (req_pq и уход) · B секрет текстом · C obfuscated2 без FakeTLS")
+print("  D FakeTLS + obfuscated2 разом · E наш домен, неверный секрет · F connect без данных")
+print("  G повторные короткие визиты · H мусор/чужой SNI/replay · K ловушка (canary)")
+print("  Цифра после буквы — число повторов")
+' || { err 'Не удалось разобрать список'; return 1; } ;;
+        json)
+            api GET "/v1/suspects?limit=100000" ;;
+        block)
+            arg=${arg:-60}
+            [[ $arg =~ ^[0-9]+$ ]] && ((10#$arg >= 1 && 10#$arg <= 100)) || { err 'Использование: suspects block [МИН_SCORE 1–100]'; return 1; }
+            need nft
+            response=$(api GET "/v1/suspects?format=ips&limit=100000&min_score=$((10#$arg))") || { err 'Не удалось получить адреса'; return 1; }
+            local v4=() v6=() ip
+            while IFS= read -r ip; do
+                [[ -z $ip ]] && continue
+                if [[ $ip == *:* ]]; then v6+=("$ip"); else v4+=("$ip"); fi
+            done <<<"$response"
+            {
+                printf 'table inet mtdd_suspects
+delete table inet mtdd_suspects
+'
+                printf 'table inet mtdd_suspects {
+'
+                printf '  set v4 { type ipv4_addr; %s}
+' "$( ((${#v4[@]})) && printf 'elements = { %s }; ' "$(IFS=,; echo "${v4[*]}")")"
+                printf '  set v6 { type ipv6_addr; %s}
+' "$( ((${#v6[@]})) && printf 'elements = { %s }; ' "$(IFS=,; echo "${v6[*]}")")"
+                printf '  chain input { type filter hook input priority -5; policy accept;
+'
+                printf '    ip saddr @v4 drop
+    ip6 saddr @v6 drop
+  }
+}
+'
+            } | nft -f - || { err 'nft не применил правила'; return 1; }
+            ok "Заблокировано адресов: $(( ${#v4[@]} + ${#v6[@]} )) (score ≥ $((10#$arg))). Снять: mtdd-ctl suspects unblock"
+            warn 'Блокировка до перезагрузки; мгновенный отказ сам по себе заметен — мягче suspect_ban_score в конфиге' ;;
+        unblock)
+            need nft
+            nft delete table inet mtdd_suspects 2>/dev/null && ok 'Блокировка снята' || warn 'Блокировки не было' ;;
+        *)
+            err 'Использование: suspects [МИН_СОВПАДЕНИЙ] | json | block [МИН_SCORE] | unblock'
             return 1 ;;
     esac
 }
@@ -2203,7 +2316,8 @@ cmd_menu() {
         menu_row 2 'Пользователи' 7 'Обновить бинарник'
         menu_row 3 'Ссылки' 8 'Публичный адрес'
         menu_row 4 'Журнал' 9 'Проверить конфигурацию'
-        menu_row 5 'Перезапуск службы' 0 'Выход'
+        menu_row 5 'Перезапуск службы' 10 'Подозрительные адреса'
+        menu_row 0 'Выход'
         menu_footer
         printf '  %sРаздел — цифра · q — выход%s\n\n' "$dim" "$reset" >/dev/tty
         menu_read choice '  › ' || break
@@ -2214,6 +2328,9 @@ cmd_menu() {
             2) menu_users ;;
             3)
                 menu_run cmd_links
+                menu_pause ;;
+            10)
+                menu_run cmd_suspects list
                 menu_pause ;;
             4)
                 menu_run cmd_logs 50
@@ -2859,6 +2976,7 @@ if [[ -n $command ]]; then
         logs) mg_require_root && mg_require_install && mg_require_tools && cmd_logs "${cargs[0]-}" ;;
         users) mg_require_root && mg_require_install && mg_require_tools && cmd_users "${cargs[@]}" ;;
         links) mg_require_root && mg_require_install && mg_require_tools && cmd_links "${cargs[@]}" ;;
+        suspects) mg_require_root && mg_require_install && mg_require_tools && cmd_suspects "${cargs[@]}" ;;
         rotate) mg_require_root && mg_require_install && mg_require_tools && cmd_rotate "${cargs[@]}" ;;
         metrics) mg_require_root && mg_require_install && mg_require_tools && cmd_metrics "${cargs[@]}" ;;
         host) mg_require_root && mg_require_install && mg_require_tools && cmd_host "${cargs[@]}" ;;

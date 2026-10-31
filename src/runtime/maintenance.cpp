@@ -66,6 +66,13 @@ void Runtime::Impl::housekeeping(Time now) {
     }
     shared_->replay.evict(now);
     refresh_ip_history();
+    if (worker_index_ == 0 && config_.suspects && now >= next_suspect_prune_) {
+        next_suspect_prune_ = now + std::chrono::seconds(60);
+        try {
+            shared_->suspects.prune(now, config_.suspect_ttl);
+        } catch (...) {
+        }
+    }
     if (worker_index_ == 0 && now >= next_device_prune_) {
         next_device_prune_ = now + std::chrono::seconds(10);
         try {

@@ -680,3 +680,288 @@ TEST(Watch, LogsEveryStageOfAWatchedConnection) {
     }
     EXPECT_EQ(log.find("peer=127.0.0.2"), std::string::npos) << log;
 }
+
+// ---------------------------------------------------------------------------
+// Suspicious-behaviour detection
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using mtdd::control::SuspectSignal;
+
+mtdd::detail::SuspectTable::Context suspect_context(const mtdd::protocol::Endpoint& peer) {
+    mtdd::detail::SuspectTable::Context context;
+    context.peer = &peer;
+    return context;
+}
+
+std::uint32_t suspect_hits(const mtdd::control::Statistics::SuspectInfo& info, SuspectSignal signal) {
+    return info.hits[static_cast<std::size_t>(signal)];
+}
+
+const mtdd::control::Statistics::SuspectInfo* find_suspect(
+    const std::vector<mtdd::control::Statistics::SuspectInfo>& rows, const std::string& ip) {
+    for (const auto& row : rows) {
+        if (row.ip == ip) return &row;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+TEST(Suspects, RawProbeClassification) {
+    using mtdd::detail::RawProbe;
+    using mtdd::detail::classify_raw_probe;
+    const std::string secret = "eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275";
+    EXPECT_EQ(classify_raw_probe(Bytes(secret.begin(), secret.end())), RawProbe::secret_text);
+    const std::string dd = "dd0123456789abcdef0123456789abcdef";
+    EXPECT_EQ(classify_raw_probe(Bytes(dd.begin(), dd.end())), RawProbe::secret_text);
+    Bytes random(96);
+    for (std::size_t i = 0; i < random.size(); ++i) {
+        random[i] = static_cast<std::uint8_t>((i * 167U + 13U) ^ (i * i));
+    }
+    EXPECT_EQ(classify_raw_probe(random), RawProbe::raw_obfuscated2);
+    const std::string http = "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8\r\nAccept: */*\r\n\r\n";
+    EXPECT_EQ(classify_raw_probe(Bytes(http.begin(), http.end())), RawProbe::junk);
+    EXPECT_EQ(classify_raw_probe(Bytes{0x05, 0x01, 0x00}), RawProbe::junk);
+    EXPECT_TRUE(mtdd::detail::domain_covers("M.Beboo.ru.", "m.beboo.ru"));
+    EXPECT_TRUE(mtdd::detail::domain_covers("cdn.m.beboo.ru", "m.beboo.ru"));
+    EXPECT_FALSE(mtdd::detail::domain_covers("evilm.beboo.ru", "m.beboo.ru"));
+}
+
+TEST(Suspects, ScoreWeightsRepeatsDecayAndMatches) {
+    using Table = mtdd::detail::SuspectTable;
+    std::array<std::uint32_t, mtdd::control::kSuspectSignals> hits{};
+    hits[static_cast<std::size_t>(SuspectSignal::port_check)] = 1;
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0), 10.0);
+    hits[static_cast<std::size_t>(SuspectSignal::port_check)] = 3;  // +2 repeats
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0), 15.0);
+    hits[static_cast<std::size_t>(SuspectSignal::port_check)] = 50;  // capped at double
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0), 20.0);
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 24), 10.0);  // half-life 24 h
+    hits[static_cast<std::size_t>(SuspectSignal::canary)] = 9;
+    hits[static_cast<std::size_t>(SuspectSignal::probe_session)] = 1;
+    EXPECT_DOUBLE_EQ(Table::score_of(hits, 0), 100.0);  // capped
+
+    Table table(256);
+    const auto now = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({203, 0, 113, 7}, 5000);
+    auto first = table.record(suspect_context(peer), SuspectSignal::junk, now, 1000, 60);
+    EXPECT_EQ(first.matches, 1U);
+    EXPECT_FALSE(first.crossed_watch);
+    table.record(suspect_context(peer), SuspectSignal::port_check, now, 1001, 60);
+    auto crossed = table.record(suspect_context(peer), SuspectSignal::probe_session, now, 1002, 50);
+    EXPECT_EQ(crossed.matches, 3U);
+    EXPECT_TRUE(crossed.crossed_watch);
+    EXPECT_EQ(crossed.signals, "probe_session,port_check,junk");
+    EXPECT_FALSE(table.record(suspect_context(peer), SuspectSignal::junk, now, 1003, 50).crossed_watch);
+    // Another port of the same address is the same suspect.
+    const auto same = mtdd::protocol::Endpoint::v4({203, 0, 113, 7}, 6000);
+    EXPECT_GT(table.score(same, now), 50.0);
+    const auto rows = table.list(now, 1004, 50, 0);
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0].ip, "203.0.113.7");
+    EXPECT_EQ(suspect_hits(rows[0], SuspectSignal::junk), 2U);
+    EXPECT_TRUE(rows[0].watched);
+    EXPECT_FALSE(rows[0].shadow_banned);
+    EXPECT_EQ(rows[0].first_seen, 1000);
+    EXPECT_EQ(rows[0].last_seen, 1003);
+    table.prune(now + std::chrono::hours(200), std::chrono::hours(168));
+    EXPECT_TRUE(table.list(now, 0, 0, 0).empty());
+}
+
+TEST(Suspects, VisitsMultiModeAndEviction) {
+    using Table = mtdd::detail::SuspectTable;
+    Table table(256);  // 16 shards x 16
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({198, 51, 100, 1}, 1);
+    EXPECT_FALSE(table.accept(peer, t0).known);  // unknown address: no entry
+    table.record(suspect_context(peer), SuspectSignal::secret_text, t0, 1, 60);
+    EXPECT_FALSE(table.accept(peer, t0 + std::chrono::minutes(1)).repeat_visit);
+    EXPECT_FALSE(table.accept(peer, t0 + std::chrono::minutes(10)).repeat_visit);  // visit 2
+    const auto third = table.accept(peer, t0 + std::chrono::minutes(20));        // visit 3
+    EXPECT_TRUE(third.known);
+    EXPECT_TRUE(third.repeat_visit);
+    // A long session clears the short-visit pattern.
+    EXPECT_FALSE(table.close_session(peer, t0 + std::chrono::minutes(20),
+                                     t0 + std::chrono::minutes(25)));
+    EXPECT_FALSE(table.accept(peer, t0 + std::chrono::minutes(40)).repeat_visit);
+    // D: raw obfuscated2 right around a FakeTLS session from the same address.
+    const auto t1 = t0 + std::chrono::hours(1);
+    table.record(suspect_context(peer), SuspectSignal::raw_obfuscated2, t1 + std::chrono::milliseconds(700), 2, 60);
+    EXPECT_TRUE(table.close_session(peer, t1, t1 + std::chrono::milliseconds(2500)));
+    EXPECT_FALSE(table.close_session(peer, t1 + std::chrono::seconds(30), t1 + std::chrono::seconds(31)));
+    // Bounded: far more addresses than capacity keeps at most capacity entries.
+    for (std::uint32_t i = 0; i < 1000; ++i) {
+        const auto other = mtdd::protocol::Endpoint::v4(
+            {10, static_cast<std::uint8_t>(i >> 8), static_cast<std::uint8_t>(i), 1}, 1);
+        table.record(suspect_context(other), SuspectSignal::junk, t1, 3, 60);
+    }
+    EXPECT_LE(table.list(t1, 0, 0, 0).size(), 256U);
+}
+
+namespace {
+
+struct SuspectMaskingScope {
+    explicit SuspectMaskingScope(std::uint16_t port) {
+        mtdd::detail::set_masking_endpoint_override(
+            mtdd::detail::DirectEndpointOverride{"127.0.0.1", port});
+    }
+    ~SuspectMaskingScope() { mtdd::detail::set_masking_endpoint_override(std::nullopt); }
+    SuspectMaskingScope(const SuspectMaskingScope&) = delete;
+    SuspectMaskingScope& operator=(const SuspectMaskingScope&) = delete;
+};
+
+// Opens a raw connection, sends `bytes`, waits for the proxy to finish with it.
+void send_raw_probe(std::uint16_t port, const Bytes& bytes) {
+    const int fd = connect_loopback(port);
+    ASSERT_GE(fd, 0);
+    if (!bytes.empty()) {
+        ASSERT_TRUE(send_all(fd, bytes));
+    }
+    std::this_thread::sleep_for(150ms);
+    ::close(fd);
+}
+
+bool suspect_has(Daemon& daemon, SuspectSignal signal) {
+    const auto rows = daemon.services.stats.suspects();
+    const auto* row = find_suspect(rows, "127.0.0.1");
+    return row != nullptr && suspect_hits(*row, signal) != 0;
+}
+
+Bytes random_header() {
+    Bytes bytes(96);
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<std::uint8_t>((i * 167U + 13U) ^ (i * i * 7U));
+    }
+    return bytes;
+}
+
+} // namespace
+
+TEST(Suspects, SecretTextPortCheckAndJunkAreRecorded) {
+    EchoBackend echo;
+    SuspectMaskingScope masking(echo.port());
+    Daemon daemon(1, false);
+    const std::string secret = "eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275";
+    send_raw_probe(daemon.port(), Bytes(secret.begin(), secret.end()));
+    EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::secret_text); }, 3s));
+    send_raw_probe(daemon.port(), {});
+    EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::port_check); }, 3s));
+    const std::string http = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_raw_probe(daemon.port(), Bytes(http.begin(), http.end()));
+    EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::junk); }, 3s));
+    const auto rows = daemon.services.stats.suspects();
+    const auto* row = find_suspect(rows, "127.0.0.1");
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(row->matches, 3U);
+    EXPECT_EQ(row->layout, "linux");  // loopback SYN, kept by TCP_SAVE_SYN
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_GE(snapshot.suspect_events_total[static_cast<std::size_t>(SuspectSignal::secret_text)], 1U);
+}
+
+TEST(Suspects, ProbeSessionAndMultiModeFromOneAddress) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    EchoBackend echo;
+    SuspectMaskingScope masking(echo.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    {
+        TestClient checker(daemon.port(), secret_bytes());
+        ASSERT_TRUE(checker.valid());
+        ASSERT_TRUE(checker.send_hello());
+        ASSERT_TRUE(checker.start_obfuscation(2));
+        // Raw obfuscated2 from the same address while the FakeTLS session is up.
+        send_raw_probe(daemon.port(), random_header());
+        ASSERT_TRUE(checker.send_message(keyed_message(0)));  // key exchange starts...
+        std::this_thread::sleep_for(100ms);
+    }                                                          // ...and the client leaves
+    EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::probe_session); }, 3s));
+    EXPECT_TRUE(suspect_has(daemon, SuspectSignal::raw_obfuscated2));
+    EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::multi_mode); }, 3s));
+    const auto rows = daemon.services.stats.suspects();
+    const auto* row = find_suspect(rows, "127.0.0.1");
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(row->user, "alice");
+    EXPECT_GE(row->score, 60.0);
+
+    // A real client brings a key: no probe_session for it.
+    Daemon clean(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    ASSERT_TRUE(add_policy_user(clean, mtdd::control::UserPolicy{}));
+    ASSERT_TRUE(wait_for([&] { return clean.services.metadata->snapshot() != nullptr; }, 3s));
+    {
+        TestClient client(clean.port(), secret_bytes());
+        ASSERT_TRUE(client.valid());
+        ASSERT_TRUE(client.send_hello());
+        ASSERT_TRUE(client.start_obfuscation(2));
+        ASSERT_TRUE(client.send_message(keyed_message(0x1111)));
+        ASSERT_TRUE(wait_for([&] { return clean.services.stats.user("alice")->devices() == 1U; }, 3s));
+    }
+    ASSERT_TRUE(wait_for([&] {
+        return clean.services.stats.snapshot().users.at("alice").active_connections == 0U;
+    }, 3s));
+    EXPECT_TRUE(clean.services.stats.suspects().empty());
+}
+
+TEST(Suspects, CanaryUserThenShadowBanSendsValidSecretToMasking) {
+    mtdd::test::FakeDirectDc dc(2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    EchoBackend echo;
+    SuspectMaskingScope masking(echo.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        enable_policy_direct(config);
+        config.masking = true;
+        config.suspect_ban_score = 50;
+    });
+    mtdd::control::UserPolicy policy;
+    policy.canary = true;
+    ASSERT_TRUE(add_policy_user(daemon, policy));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    {
+        TestClient bait(daemon.port(), secret_bytes());
+        ASSERT_TRUE(bait.valid());
+        ASSERT_TRUE(bait.send_hello());  // authenticates: the score was 0
+    }
+    ASSERT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::canary); }, 3s));
+    EXPECT_EQ(echo.accepted(), 0U);
+    TestClient again(daemon.port(), secret_bytes());
+    ASSERT_TRUE(again.valid());
+    EXPECT_FALSE(again.send_hello(0, 1));  // the real site answers, not FakeTLS
+    EXPECT_TRUE(wait_for([&] { return echo.accepted() >= 1U; }, 3s));
+    EXPECT_GE(daemon.services.stats.snapshot().suspect_shadow_bans_total, 1U);
+    const auto rows = daemon.services.stats.suspects();
+    const auto* row = find_suspect(rows, "127.0.0.1");
+    ASSERT_NE(row, nullptr);
+    EXPECT_TRUE(row->shadow_banned);
+}
+
+TEST(Suspects, CrossingTheWatchScoreLogsAndDisabledDetectionRecordsNothing) {
+    EchoBackend echo;
+    SuspectMaskingScope masking(echo.port());
+    const std::string secret = "eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275";
+    testing::internal::CaptureStderr();
+    {
+        Daemon daemon(1, false, [](mtdd::Config& config) { config.suspect_watch_score = 30; });
+        send_raw_probe(daemon.port(), Bytes(secret.begin(), secret.end()));
+        ASSERT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::secret_text); }, 3s));
+        // Known now: the next connection is logged stage by stage.
+        send_raw_probe(daemon.port(), Bytes(secret.begin(), secret.end()));
+        ASSERT_TRUE(wait_for([&] {
+            const auto rows = daemon.services.stats.suspects();
+            const auto* row = find_suspect(rows, "127.0.0.1");
+            return row != nullptr && suspect_hits(*row, SuspectSignal::secret_text) >= 2U;
+        }, 3s));
+    }
+    const std::string log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find("mtdd suspect: ip=127.0.0.1 score=40 matches=1 signals=secret_text"),
+              std::string::npos) << log;
+    EXPECT_NE(log.find(" accept syn="), std::string::npos) << log;
+    EXPECT_NE(log.find(" suspect signal=secret_text"), std::string::npos) << log;
+
+    Daemon off(1, false, [](mtdd::Config& config) { config.suspects = false; });
+    send_raw_probe(off.port(), Bytes(secret.begin(), secret.end()));
+    std::this_thread::sleep_for(200ms);
+    EXPECT_TRUE(off.services.stats.suspects().empty());
+}

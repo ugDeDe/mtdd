@@ -289,6 +289,7 @@ struct ControlServer::Impl {
       case ApiRoute::user: handle_user(request, method, route.name, status); break;
       case ApiRoute::user_links: handle_links(request, route.name, status); break;
       case ApiRoute::user_devices: handle_devices(request, route.name, status); break;
+      case ApiRoute::suspects: handle_suspects(request, status); break;
       case ApiRoute::rotate_secret:
         handle_rotate(request, route.name, status);
         break;
@@ -567,6 +568,135 @@ struct ControlServer::Impl {
                              {"limit", limit},
                              {"users", std::move(array)}}}},
               users->revision);
+  }
+
+  // GET /v1/suspects: the runtime suspect table, most suspicious first.
+  // sort=matches (distinct signals, then score; default) | score | hits |
+  // last_seen; min_matches, min_score filter; format=ips returns plain text,
+  // one address per line, for firewall sets.
+  void handle_suspects(evhttp_request* request, int& status) {
+    Query query;
+    if (reply_query_error(request,
+                          parse_query(request,
+                                      {"sort", "limit", "offset", "min_matches", "min_score",
+                                       "format"},
+                                      query),
+                          status)) {
+      return;
+    }
+    uint64_t limit = 100;
+    uint64_t offset = 0;
+    uint64_t min_matches = 0;
+    uint64_t min_score = 0;
+    if (reply_query_error(request, query_uint(query, "limit", 1, 100000, limit), status) ||
+        reply_query_error(request, query_uint(query, "offset", 0, UINT32_MAX, offset), status) ||
+        reply_query_error(request,
+                          query_uint(query, "min_matches", 0, kSuspectSignals, min_matches),
+                          status) ||
+        reply_query_error(request, query_uint(query, "min_score", 0, 100, min_score), status)) {
+      return;
+    }
+    const std::string* sort_value = query_value(query, "sort");
+    const std::string sort = sort_value != nullptr ? *sort_value : "matches";
+    if (sort != "matches" && sort != "score" && sort != "hits" && sort != "last_seen") {
+      status = 400;
+      send_error(request, status, "invalid_query",
+                 "sort must be matches, score, hits or last_seen");
+      return;
+    }
+    const std::string* format_value = query_value(query, "format");
+    const std::string format = format_value != nullptr ? *format_value : "json";
+    if (format != "json" && format != "ips") {
+      status = 400;
+      send_error(request, status, "invalid_query", "format must be json or ips");
+      return;
+    }
+    auto all = stats.suspects();
+    std::array<uint64_t, kSuspectSignals + 1> by_matches{};
+    uint64_t watched = 0;
+    uint64_t banned = 0;
+    for (const auto& entry : all) {
+      by_matches[std::min<size_t>(entry.matches, kSuspectSignals)] += 1;
+      watched += entry.watched ? 1U : 0U;
+      banned += entry.shadow_banned ? 1U : 0U;
+    }
+    std::vector<Statistics::SuspectInfo> rows;
+    for (auto& entry : all) {
+      if (entry.matches < min_matches || entry.score < static_cast<double>(min_score)) continue;
+      rows.push_back(std::move(entry));
+    }
+    const auto total_hits = [](const Statistics::SuspectInfo& entry) {
+      uint64_t sum = 0;
+      for (const auto value : entry.hits) sum += value;
+      return sum;
+    };
+    std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) {
+      if (sort == "score") {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.matches != b.matches) return a.matches > b.matches;
+      } else if (sort == "hits") {
+        const uint64_t ha = total_hits(a);
+        const uint64_t hb = total_hits(b);
+        if (ha != hb) return ha > hb;
+      } else if (sort == "last_seen") {
+        if (a.last_seen != b.last_seen) return a.last_seen > b.last_seen;
+      } else {
+        if (a.matches != b.matches) return a.matches > b.matches;
+        if (a.score != b.score) return a.score > b.score;
+      }
+      if (a.last_seen != b.last_seen) return a.last_seen > b.last_seen;
+      return a.ip < b.ip;
+    });
+    if (format == "ips") {
+      std::string text;
+      for (size_t i = static_cast<size_t>(offset); i < rows.size() && i - offset < limit; ++i) {
+        text += rows[i].ip;
+        text.push_back('\n');
+      }
+      status = 200;
+      send_text(request, status, text, "text/plain; charset=utf-8");
+      return;
+    }
+    json array = json::array();
+    for (size_t i = static_cast<size_t>(offset); i < rows.size() && array.size() < limit; ++i) {
+      const auto& row = rows[i];
+      json signals = json::object();
+      for (size_t s = 0; s < kSuspectSignals; ++s) {
+        if (row.hits[s] != 0) signals[to_string(static_cast<SuspectSignal>(s))] = row.hits[s];
+      }
+      array.push_back(
+          {{"ip", row.ip},
+           {"matches", row.matches},
+           {"score", std::round(row.score * 10.0) / 10.0},
+           {"signals", std::move(signals)},
+           {"hits", total_hits(row)},
+           {"first_seen", format_rfc3339(row.first_seen)},
+           {"last_seen", format_rfc3339(row.last_seen)},
+           {"visits", row.visits},
+           {"user", row.user.empty() ? json(nullptr) : json(row.user)},
+           {"sni", row.sni.empty() ? json(nullptr) : json(row.sni)},
+           {"platform", row.platform},
+           {"tls", row.tls},
+           {"syn", {{"ttl", row.ttl}, {"window", row.window}, {"mss", row.mss},
+                    {"wscale", row.wscale}, {"layout", row.layout}}},
+           {"watched", row.watched},
+           {"shadow_banned", row.shadow_banned}});
+    }
+    json summary = json::object();
+    for (size_t m = 1; m <= kSuspectSignals; ++m) {
+      if (by_matches[m] != 0) summary[std::to_string(m)] = by_matches[m];
+    }
+    status = 200;
+    send_json(request, status,
+              json{{"data", {{"sort", sort},
+                             {"total", all.size()},
+                             {"filtered", rows.size()},
+                             {"offset", offset},
+                             {"limit", limit},
+                             {"by_matches", std::move(summary)},
+                             {"watched", watched},
+                             {"shadow_banned", banned},
+                             {"suspects", std::move(array)}}}});
   }
 
   void handle_events(evhttp_request* request, int& status) {
@@ -848,7 +978,7 @@ struct ControlServer::Impl {
                                  {"name", "secret", "enabled", "max_connections",
                                   "expires_at", "data_quota_bytes",
                                   "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                  "rate_limit_down_bytes_per_sec", "note"})) {
+                                  "rate_limit_down_bytes_per_sec", "note", "canary"})) {
       status = error->status;
       send_error(request, status, error->type, error->message);
       return;
@@ -955,7 +1085,7 @@ struct ControlServer::Impl {
                                             {"enabled", "max_connections",
                                              "expires_at", "data_quota_bytes",
                                              "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                             "rate_limit_down_bytes_per_sec", "note"})) {
+                                             "rate_limit_down_bytes_per_sec", "note", "canary"})) {
         status = error->status;
         send_error(request, status, error->type, error->message);
         return;

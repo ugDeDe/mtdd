@@ -197,6 +197,12 @@ std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
     }
     out.note = j["note"].get<std::string>();
   }
+  if (j.contains("canary")) {
+    if (!j["canary"].is_boolean()) {
+      return Error{ErrorCode::invalid_field, "user.canary must be a boolean"};
+    }
+    out.canary = j["canary"].get<bool>();
+  }
   if (auto reason = UserStore::validate_policy(out)) {
     return Error{ErrorCode::invalid_field, "user: " + *reason};
   }
@@ -217,7 +223,7 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
                  j, {"name", "secret", "enabled", "max_connections", "generation",
                      "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
                      "rate_limit_up_bytes_per_sec",
-                     "rate_limit_down_bytes_per_sec", "note"})) {
+                     "rate_limit_down_bytes_per_sec", "note", "canary"})) {
     return error;
   }
   if (!j.contains("name") || !j["name"].is_string()) {
@@ -384,6 +390,7 @@ std::string serialize_snapshot(uint64_t revision,
       entry["rate_limit_down_bytes_per_sec"] =
           nullable(policy.rate_limit_down_bytes_per_sec);
       entry["note"] = policy.note;
+      if (policy.canary) entry["canary"] = true;
     }
     array.push_back(std::move(entry));
   }

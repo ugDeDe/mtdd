@@ -20,7 +20,7 @@ namespace {
 constexpr size_t kRejectReasonCount = 10;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 19;
+constexpr size_t kApiRouteCount = 20;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
@@ -43,7 +43,7 @@ constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/users/{name}/links", "/v1/system/info", "/v1/config",
     "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
     "/v1/users/{name}/enable", "/v1/users/{name}/disable",
-    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices"};
+    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -115,6 +115,7 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::user_disable: return 16;
     case ApiRoute::user_reset_quota: return 17;
     case ApiRoute::user_devices: return 18;
+    case ApiRoute::suspects: return 19;
   }
   return 7;
 }
@@ -490,6 +491,9 @@ struct Statistics::Impl {
   mutable std::mutex build_mutex;
   mutable std::mutex device_mutex;
   Statistics::DeviceLister device_lister;
+  Statistics::SuspectLister suspect_lister;
+  std::array<std::atomic<uint64_t>, kSuspectSignals> suspect_events{};
+  std::atomic<uint64_t> suspect_shadow_bans{0};
   std::string build_version;
   std::atomic<uint64_t> accepted{0};
   std::atomic<uint64_t> active{0};
@@ -565,6 +569,41 @@ std::vector<Statistics::DeviceInfo> Statistics::devices(const std::string& user)
   std::lock_guard<std::mutex> lock(impl_->device_mutex);
   if (!impl_->device_lister) return {};
   return impl_->device_lister(user);
+}
+
+void Statistics::set_suspect_lister(SuspectLister lister) {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  impl_->suspect_lister = std::move(lister);
+}
+
+std::vector<Statistics::SuspectInfo> Statistics::suspects() const {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  if (!impl_->suspect_lister) return {};
+  return impl_->suspect_lister();
+}
+
+void Statistics::suspect_event(SuspectSignal signal) noexcept {
+  const auto index = static_cast<size_t>(signal);
+  if (index < kSuspectSignals) impl_->suspect_events[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Statistics::suspect_shadow_banned() noexcept {
+  impl_->suspect_shadow_bans.fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* to_string(SuspectSignal signal) noexcept {
+  static constexpr std::array<const char*, kSuspectSignals> kNames{
+      "probe_session", "secret_text", "raw_obfuscated2", "multi_mode", "wrong_secret",
+      "port_check",    "repeat_visits", "junk",          "canary"};
+  const auto index = static_cast<size_t>(signal);
+  return index < kSuspectSignals ? kNames[index] : "unknown";
+}
+
+unsigned suspect_signal_weight(SuspectSignal signal) noexcept {
+  static constexpr std::array<unsigned, kSuspectSignals> kWeights{40, 40, 15, 30, 20,
+                                                                  10, 20, 5,  60};
+  const auto index = static_cast<size_t>(signal);
+  return index < kSuspectSignals ? kWeights[index] : 0;
 }
 
 void Statistics::connection_accepted() noexcept {
@@ -1158,6 +1197,10 @@ StatisticsSnapshot Statistics::snapshot() const {
   for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
     out.relay_closes_total[index] = impl_->relay_closes[index].load(std::memory_order_relaxed);
   }
+  for (size_t index = 0; index < kSuspectSignals; ++index) {
+    out.suspect_events_total[index] = impl_->suspect_events[index].load(std::memory_order_relaxed);
+  }
+  out.suspect_shadow_bans_total = impl_->suspect_shadow_bans.load(std::memory_order_relaxed);
   out.media_throttled_total = impl_->media_throttled.load(std::memory_order_relaxed);
   out.replay_cache_entries = replay_entries;
   out.api_requests_total = impl_->api_total.load(std::memory_order_relaxed);
@@ -1393,6 +1436,23 @@ std::string Statistics::prometheus_text() const {
                     snapshot.relay_closes_total[index]);
     }
   }
+  for (std::size_t index = 0; index < kSuspectSignals; ++index) {
+    append_metric(out, "mtdd_suspect_events_total",
+                  std::string("signal=\"") + to_string(static_cast<SuspectSignal>(index)) + "\"",
+                  snapshot.suspect_events_total[index]);
+  }
+  append_metric(out, "mtdd_suspect_shadow_bans_total", "", snapshot.suspect_shadow_bans_total);
+  {
+    // Current suspects grouped by how many distinct signals they matched.
+    std::array<uint64_t, kSuspectSignals + 1> by_matches{};
+    for (const auto& entry : suspects()) {
+      by_matches[std::min<size_t>(entry.matches, kSuspectSignals)] += 1;
+    }
+    for (size_t m = 1; m <= kSuspectSignals; ++m) {
+      append_metric(out, "mtdd_suspects", "matches=\"" + std::to_string(m) + "\"", by_matches[m]);
+    }
+  }
+
   append_metric(out, "mtdd_media_throttled_total", "", snapshot.media_throttled_total);
   if (snapshot.backpressure_c2s_total != 0) {
     append_metric(out, "mtdd_backpressure_events_total", "direction=\"c2s\"",
