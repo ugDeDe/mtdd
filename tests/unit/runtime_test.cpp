@@ -1069,6 +1069,37 @@ TEST(Runtime, MaskingRelaysForeignServerNameToTheMaskDomain) {
     EXPECT_GE(stat_counter(daemon.services.stats, "handshakes", "failure"), 1U);
 }
 
+TEST(Runtime, PersonalTlsDomainAuthenticatesOnlyOnItsOwnSni) {
+    // alice has a personal tls_domain: her ClientHello is accepted on that SNI
+    // and refused on the global one (masking off: plain close). bob has none.
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = false; });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    mtdd::control::UpdateUserRequest update;
+    update.name = "alice";
+    update.policy.tls_domain = std::string("front.test");
+    ASSERT_TRUE(daemon.services.store->update_user(update).ok());
+
+    const auto timestamp = static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const auto secret = secret_bytes();
+
+    const int own = connect_loopback(daemon.port());
+    ASSERT_GE(own, 0);
+    ASSERT_TRUE(send_all(own, make_client_hello(secret, timestamp, "front.test", 0)));
+    Bytes header(5);
+    ASSERT_TRUE(recv_exact(own, header.data(), header.size(), 3000));
+    EXPECT_EQ(header[0], 0x16);  // ServerHello record: authenticated
+    ::close(own);
+
+    const int global = connect_loopback(daemon.port());
+    ASSERT_GE(global, 0);
+    ASSERT_TRUE(send_all(global, make_client_hello(secret, timestamp + 1, "example.com", 0)));
+    EXPECT_TRUE(wait_closed(global, 3000));
+    ::close(global);
+}
+
 TEST(Runtime, MaskingRelaysNonTlsProbeToTheMaskDomain) {
     // Plain text (an HTTP request, or a proxy secret sent as text by a crude
     // scanner) reaches the real site too.

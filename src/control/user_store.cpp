@@ -255,6 +255,9 @@ std::optional<std::string> UserStore::validate_policy(const UserPolicy& policy) 
     return "note must be at most " + std::to_string(kMaxNoteBytes) +
            " bytes of printable UTF-8";
   }
+  if (!policy.tls_domain.empty() && !valid_tls_domain(policy.tls_domain)) {
+    return "tls_domain must be a lowercase DNS hostname";
+  }
   return std::nullopt;
 }
 
@@ -515,6 +518,7 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
     policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
   }
   if (patch.note) policy.note = *patch.note;
+  if (patch.tls_domain) policy.tls_domain = lower_ascii(*patch.tls_domain);
   if (auto reason = validate_policy(policy)) {
     return Error{ErrorCode::invalid_field, *reason};
   }

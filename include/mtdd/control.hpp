@@ -119,6 +119,7 @@ class Result {
 // max_connections == nullopt means "unlimited"; 0 is rejected so null is the
 // only unlimited spelling.
 inline constexpr size_t kMaxNoteBytes = 256;
+inline constexpr size_t kMaxTlsDomainBytes = 253;
 inline constexpr uint64_t kMaxQuotaBytes = 1ull << 60;
 inline constexpr uint32_t kMaxUniqueIpsLimit = 1'000'000;
 inline constexpr uint32_t kMaxDevicesLimit = 1'000'000;
@@ -143,11 +144,16 @@ struct UserPolicy {
   // Bait user: its link is published on purpose, so every connection that
   // authenticates with it is reported as a suspect (signal "canary").
   bool canary{false};
+  // Personal FakeTLS domain (lowercase DNS name; empty = the global
+  // tls_domain). The user's link carries it, and only a ClientHello whose SNI
+  // equals it authenticates this user. Masking relays probes for any
+  // configured domain (global or personal) to that domain's real site.
+  std::string tls_domain;
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           note.empty() && !canary;
+           note.empty() && !canary && tls_domain.empty();
   }
   bool operator==(const UserPolicy&) const = default;
 };
@@ -165,11 +171,12 @@ struct UserPolicyPatch {
   Patch<uint64_t> rate_limit_down_bytes_per_sec;
   std::optional<std::string> note;  // "" clears
   std::optional<bool> canary;
+  std::optional<std::string> tls_domain;  // "" clears (back to the global domain)
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           !note && !canary;
+           !note && !canary && !tls_domain;
   }
 };
 

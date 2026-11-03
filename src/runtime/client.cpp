@@ -503,7 +503,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         if (config_.suspects) {
             // E: someone who knows our domain but not a valid secret.
             const auto sni = protocol::client_hello_sni(record);
-            const bool ours = sni && detail::domain_covers(*sni, config_.tls_domain);
+            const bool ours = sni && !domain_for_sni(*sni).empty();
             client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
             suspect(client, ours ? control::SuspectSignal::wrong_secret : control::SuspectSignal::junk,
                     sni ? std::string_view(*sni) : std::string_view{});
@@ -642,11 +642,17 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
     const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, unix_now(),
                                                         120, found, matched);
     if (status != protocol::HelloStatus::Ok || matched >= hello_key_users_.size()) return false;
-    if (!config_.tls_domain.empty() && !ascii_iequals(found.server_name, config_.tls_domain)) {
+    // A user with a personal tls_domain authenticates only on that SNI; the
+    // others on the global one (when configured).
+    const control::UserRecord* matched_user = hello_key_users_[matched];
+    const std::string& expected_sni = matched_user->policy.tls_domain.empty()
+                                          ? config_.tls_domain
+                                          : matched_user->policy.tls_domain;
+    if (!expected_sni.empty() && !ascii_iequals(found.server_name, expected_sni)) {
         return false;
     }
     info = std::move(found);
-    user = hello_key_users_[matched];
+    user = matched_user;
     return true;
 }
 
@@ -660,7 +666,11 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     tls_config.max_client_hello = protocol::kFakeTlsMaxClientHello;
     tls_config.max_record_body = protocol::kFakeTlsMaxRecordBody;
     tls_config.max_pending_plaintext = detail::kReadBatch + 2U * protocol::kFakeTlsMaxRecordBody;
-    if (!config_.tls_domain.empty()) tls_config.expected_server_name = config_.tls_domain;
+    if (!user.policy.tls_domain.empty()) {
+        tls_config.expected_server_name = user.policy.tls_domain;
+    } else if (!config_.tls_domain.empty()) {
+        tls_config.expected_server_name = config_.tls_domain;
+    }
     client.tls.emplace(std::move(tls_config));
 
     wire_buffer_.clear();

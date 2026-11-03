@@ -39,6 +39,26 @@ std::string lower_ascii(std::string value) {
   return value;
 }
 
+bool valid_tls_domain(std::string_view domain) {
+  if (domain.empty() || domain.size() > kMaxTlsDomainBytes) return false;
+  size_t start = 0;
+  while (start < domain.size()) {
+    const size_t end = domain.find('.', start);
+    const size_t length = (end == std::string_view::npos ? domain.size() : end) - start;
+    if (length == 0 || length > 63 || domain[start] == '-' ||
+        domain[start + length - 1] == '-') {
+      return false;
+    }
+    for (size_t i = start; i < start + length; ++i) {
+      const char c = domain[i];
+      if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-') return false;
+    }
+    if (end == std::string_view::npos) return true;
+    start = end + 1;
+  }
+  return false;  // trailing dot
+}
+
 bool is_hex_digit(char c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
          (c >= 'A' && c <= 'F');
@@ -203,6 +223,12 @@ std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
     }
     out.canary = j["canary"].get<bool>();
   }
+  if (j.contains("tls_domain")) {
+    if (!j["tls_domain"].is_string()) {
+      return Error{ErrorCode::invalid_field, "user.tls_domain must be a string"};
+    }
+    out.tls_domain = j["tls_domain"].get<std::string>();
+  }
   if (auto reason = UserStore::validate_policy(out)) {
     return Error{ErrorCode::invalid_field, "user: " + *reason};
   }
@@ -223,7 +249,7 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
                  j, {"name", "secret", "enabled", "max_connections", "generation",
                      "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
                      "rate_limit_up_bytes_per_sec",
-                     "rate_limit_down_bytes_per_sec", "note", "canary"})) {
+                     "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
     return error;
   }
   if (!j.contains("name") || !j["name"].is_string()) {
@@ -391,6 +417,7 @@ std::string serialize_snapshot(uint64_t revision,
           nullable(policy.rate_limit_down_bytes_per_sec);
       entry["note"] = policy.note;
       if (policy.canary) entry["canary"] = true;
+      if (!policy.tls_domain.empty()) entry["tls_domain"] = policy.tls_domain;
     }
     array.push_back(std::move(entry));
   }

@@ -437,6 +437,12 @@ std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& o
     }
     out.canary = body["canary"].get<bool>();
   }
+  if (body.contains("tls_domain")) {
+    if (!body["tls_domain"].is_string()) {
+      return HttpError{400, "invalid_field", "tls_domain must be a string"};
+    }
+    out.tls_domain = body["tls_domain"].get<std::string>();
+  }
   return std::nullopt;
 }
 
@@ -454,6 +460,12 @@ UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
   }
   if (patch.note) policy.note = *patch.note;
   if (patch.canary) policy.canary = *patch.canary;
+  if (patch.tls_domain) {
+    policy.tls_domain = *patch.tls_domain;
+    for (char& c : policy.tls_domain) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
   return policy;
 }
 
@@ -471,6 +483,7 @@ json policy_json(const UserPolicy& policy) {
   out["rate_limit_down_bytes_per_sec"] = nullable(policy.rate_limit_down_bytes_per_sec);
   out["note"] = policy.note;
   out["canary"] = policy.canary;
+  out["tls_domain"] = policy.tls_domain.empty() ? json(nullptr) : json(policy.tls_domain);
   return out;
 }
 

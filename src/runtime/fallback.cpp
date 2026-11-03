@@ -92,6 +92,32 @@ bool Runtime::Impl::append_fallback_bytes(Client& client, io::ByteQueue& queue,
     return true;
 }
 
+void Runtime::Impl::refresh_personal_domains() {
+    const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
+    if (!snapshot || snapshot == domains_snapshot_) return;
+    personal_domains_.clear();
+    for (const auto& user : snapshot->users) {
+        const auto& domain = user.policy.tls_domain;
+        if (domain.empty()) continue;
+        if (std::find(personal_domains_.begin(), personal_domains_.end(), domain) ==
+            personal_domains_.end()) {
+            personal_domains_.push_back(domain);
+        }
+    }
+    domains_snapshot_ = snapshot;
+}
+
+std::string Runtime::Impl::domain_for_sni(std::string_view sni) {
+    if (!config_.tls_domain.empty() && sni_domain_matches(sni, config_.tls_domain)) {
+        return config_.tls_domain;
+    }
+    refresh_personal_domains();
+    for (const auto& domain : personal_domains_) {
+        if (sni_domain_matches(sni, domain)) return domain;
+    }
+    return {};
+}
+
 std::string Runtime::Impl::ensure_fallback_address(Time now, std::string_view host) {
     // Literal addresses (the historical loopback backend) bypass DNS entirely.
     if (io::is_numeric_address(host)) return std::string(host);
@@ -147,10 +173,11 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
                              config_.fallback_port);
     } else if (config_.masking && !config_.tls_domain.empty()) {
         const auto sni = protocol::client_hello_sni(prefetched);
-        if (sni && sni_domain_matches(*sni, config_.tls_domain)) {
+        const std::string ours = sni ? domain_for_sni(*sni) : std::string{};
+        if (!ours.empty()) {
             targets.emplace_back(*sni, 443U);
-            if (to_lower(*sni) != to_lower(config_.tls_domain)) {
-                targets.emplace_back(config_.tls_domain, 443U);
+            if (to_lower(*sni) != to_lower(ours)) {
+                targets.emplace_back(ours, 443U);
             }
         } else {
             // A foreign or missing SNI, or bytes that are not TLS at all: the

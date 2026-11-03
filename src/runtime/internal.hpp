@@ -1136,6 +1136,10 @@ struct Runtime::Impl {
     void read_client(Client& client, Time now);
     void consume_client_bytes(Client& client, std::span<const std::uint8_t> wire, Time now);
     void process_client_hello(Client& client, Time now);
+    void refresh_personal_domains();
+    /// The configured domain (global first, then personal) that covers `sni`
+    /// (equal or a subdomain); empty when the name is not ours.
+    std::string domain_for_sni(std::string_view sni);
     bool authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                             Time now, protocol::ClientHelloInfo& info,
                             const control::UserRecord*& user);
@@ -1380,6 +1384,11 @@ struct Runtime::Impl {
     std::vector<protocol::crypto::HmacSha256Key> hello_keys_;
     std::vector<const protocol::crypto::HmacSha256Key*> hello_key_ptrs_;
     std::vector<const control::UserRecord*> hello_key_users_;
+    // Distinct personal tls_domain values of domains_snapshot_ (users with a
+    // personal FakeTLS domain). Rebuilt on snapshot change; masking and the
+    // suspect "ours" test accept any configured domain, not only the global.
+    std::shared_ptr<const control::UserSnapshot> domains_snapshot_;
+    std::vector<std::string> personal_domains_;
     std::shared_ptr<const MeMetadata> metadata_snapshot_;
     std::size_t enabled_users_{0};
     bool warming_{false};

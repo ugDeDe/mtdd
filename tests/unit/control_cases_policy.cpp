@@ -308,3 +308,59 @@ TEST(SuspectsHttpTest, SortsByMatchesFiltersAndExportsIps) {
   EXPECT_NE(h.req("GET", "/metrics").body.find("mtdd_suspects{matches=\"3\"} 1"), std::string::npos);
   h.stats().set_suspect_lister({});
 }
+
+TEST(UserPolicyHttpTest, PersonalTlsDomainIsValidatedNormalisedAndClearable) {
+  HttpOptions options;
+  options.public_host = "203.0.113.7";
+  options.public_port = 443;
+  options.tls_domain = "global.example";
+  Harness h(StoreOptions{}, options);
+  const auto created = h.req("POST", "/v1/users",
+                             R"({"name":"alice","secret":"00112233445566778899aabbccddeeff",)"
+                             R"("tls_domain":"Front.Example.ORG"})");
+  ASSERT_EQ(created.status, 201) << created.body;
+  EXPECT_EQ(parse_json(created)["data"]["user"]["tls_domain"], "front.example.org");
+
+  // The link carries the personal domain, not the global one.
+  const auto links = h.req("GET", "/v1/users/alice/links");
+  ASSERT_EQ(links.status, 200) << links.body;
+  EXPECT_NE(links.body.find("00112233445566778899aabbccddeeff"
+                            "66726f6e742e6578616d706c652e6f7267"),
+            std::string::npos) << links.body;
+
+  for (const char* body : {R"({"tls_domain":5})", R"({"tls_domain":null})",
+                           R"({"tls_domain":"-bad.example"})", R"({"tls_domain":"a..b"})",
+                           R"({"tls_domain":"exa mple.org"})", R"({"tls_domain":"x.org."})",
+                           R"({"tls_domain":"https://x.org"})"}) {
+    const auto response = h.req("PATCH", "/v1/users/alice", body);
+    EXPECT_EQ(response.status, 400) << body << " -> " << response.body;
+  }
+
+  const auto cleared = h.req("PATCH", "/v1/users/alice", R"({"tls_domain":""})");
+  ASSERT_EQ(cleared.status, 200) << cleared.body;
+  EXPECT_TRUE(parse_json(cleared)["data"]["user"]["tls_domain"].is_null());
+  // Back to the global domain in the link.
+  EXPECT_NE(h.req("GET", "/v1/users/alice/links").body.find("676c6f62616c2e6578616d706c65"),
+            std::string::npos);
+}
+
+TEST(UserPolicyStoreTest, PersonalTlsDomainPersistsInVersionTwo) {
+  TempDir dir;
+  const auto path = dir.file("users.json");
+  {
+    auto store = open_store_or_throw(path);
+    CreateUserRequest request;
+    request.name = "alice";
+    request.policy.tls_domain = "front.example.org";
+    ASSERT_TRUE(store.create_user(request).ok());
+    CreateUserRequest bad;
+    bad.name = "bob";
+    bad.policy.tls_domain = "Not Valid";
+    EXPECT_FALSE(store.create_user(bad).ok());
+  }
+  const auto file = nlohmann::json::parse(read_text_file(path));
+  EXPECT_EQ(file["version"], 2);
+  EXPECT_EQ(file["users"][0]["tls_domain"], "front.example.org");
+  auto reopened = open_store_or_throw(path);
+  EXPECT_EQ(reopened.snapshot()->users[0].policy.tls_domain, "front.example.org");
+}

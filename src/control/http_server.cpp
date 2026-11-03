@@ -979,7 +979,7 @@ struct ControlServer::Impl {
                                  {"name", "secret", "enabled", "max_connections",
                                   "expires_at", "data_quota_bytes",
                                   "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                  "rate_limit_down_bytes_per_sec", "note", "canary"})) {
+                                  "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
       status = error->status;
       send_error(request, status, error->type, error->message);
       return;
@@ -1086,7 +1086,7 @@ struct ControlServer::Impl {
                                             {"enabled", "max_connections",
                                              "expires_at", "data_quota_bytes",
                                              "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                             "rate_limit_down_bytes_per_sec", "note", "canary"})) {
+                                             "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
         status = error->status;
         send_error(request, status, error->type, error->message);
         return;
@@ -1174,14 +1174,16 @@ struct ControlServer::Impl {
       send_error(request, status, "not_found", "user not found", users->revision);
       return;
     }
-    if (options.public_host.empty() || options.public_port == 0 || options.tls_domain.empty()) {
+    const std::string& link_domain =
+        user->policy.tls_domain.empty() ? options.tls_domain : user->policy.tls_domain;
+    if (options.public_host.empty() || options.public_port == 0 || link_domain.empty()) {
       status = 503;
       send_error(request, status, "public_address_unconfigured", "configure public_host to generate links");
       return;
     }
     const std::string query = "server=" + percent_encode(options.public_host) +
         "&port=" + std::to_string(options.public_port) + "&secret=ee" +
-        user->secret_hex + hex_encode(options.tls_domain);
+        user->secret_hex + hex_encode(link_domain);
     status = 200;
     send_json(request, status, json{{"data", {{"name", user->name}, {"enabled", user->enabled},
         {"links", {{"telegram", "https://t.me/proxy?" + query}, {"native", "tg://proxy?" + query}}}}}}, users->revision);
