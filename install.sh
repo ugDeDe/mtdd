@@ -976,23 +976,28 @@ def ago(text):
     return "{} д".format(seconds // 86400)
 
 
-print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {}".format(
-    "Сов", "Score", "IP", "Признаки", "Хиты", "Был", "Платф.", "Пользователь"))
+# ОС по отпечатку SYN: видна и у тех, кто не похож на клиента Telegram
+# (платформа у них Undefined — её определяют TLS и SYN вместе).
+syn_os = {"linux": "Linux", "windows": "Windows", "apple": "Apple"}
+print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {:<8} {}".format(
+    "Сов", "Score", "IP", "Признаки", "Хиты", "Был", "Платф.", "ОС(SYN)", "Пользователь"))
 for row in rows:
     signals = row.get("signals") or {}
     marks = "".join(codes.get(name, "?") + ("" if count == 1 else str(min(count, 99)))
                     for name, count in sorted(signals.items(), key=lambda kv: codes.get(kv[0], "Z")))
     flags = ((" !бан" if row.get("shadow_banned") else "") + (" ·лог" if row.get("watched") else "")
              + (" ·клиент" if row.get("real_client") else ""))
-    print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {}{}".format(
+    syn = row.get("syn") or {}
+    print("  {:>3} {:>5}  {:<39} {:<16} {:>5} {:>7}  {:<9} {:<8} {}{}".format(
         row.get("matches", 0), round(row.get("score", 0)), row.get("ip", "?"), marks[:16],
         row.get("hits", 0), ago(row.get("last_seen", "")), row.get("platform", ""),
-        row.get("user") or "—", flags))
+        syn_os.get(syn.get("layout", ""), "—"), row.get("user") or "—", flags))
 print()
 print("  A сессия-зонд (req_pq и уход) · B секрет текстом · C obfuscated2 без FakeTLS")
 print("  D FakeTLS + obfuscated2 разом · E наш домен, неверный секрет · F connect без данных")
 print("  G повторные короткие визиты · H мусор/чужой SNI/replay · K ловушка (canary)")
 print("  Цифра после буквы — число повторов · ·клиент — с адреса были и настоящие сессии (A/E/F/G/H не считаются)")
+print("  Платф. — клиент Telegram (TLS и SYN вместе); Undefined — рукопожатие не как у Telegram · ОС(SYN) — система по TCP-стеку")
 ' || { err 'Не удалось разобрать список'; return 1; } ;;
         json)
             api GET "/v1/suspects?limit=100000" ;;

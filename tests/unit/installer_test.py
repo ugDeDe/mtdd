@@ -1001,15 +1001,27 @@ class UserPolicyApiTest(PolicyShellCase):
         rows = [{"ip": "203.0.113.9", "matches": 3, "score": 85.4, "hits": 5,
                  "signals": {"probe_session": 2, "raw_obfuscated2": 2, "multi_mode": 1},
                  "last_seen": "2030-01-01T00:00:00Z", "platform": "Linux", "user": "dd",
-                 "watched": True, "shadow_banned": True}]
+                 "watched": True, "shadow_banned": True},
+                {"ip": "198.51.100.7", "matches": 1, "score": 40, "hits": 2,
+                 "signals": {"wrong_secret": 2}, "last_seen": "2030-01-01T00:00:00Z",
+                 "platform": "Undefined", "syn": {"layout": "windows", "ttl": 114}},
+                {"ip": "198.51.100.8", "matches": 1, "score": 20, "hits": 1,
+                 "signals": {"junk": 1}, "last_seen": "2030-01-01T00:00:00Z",
+                 "platform": "Undefined"}]
         seen = self.start_api({("GET", "/v1/suspects"): (200, {"ok": True, "request_id": 6,
-                               "data": {"total": 1, "by_matches": {"3": 1}, "watched": 1,
+                               "data": {"total": 3, "by_matches": {"3": 1, "1": 2}, "watched": 1,
                                         "shadow_banned": 1, "suspects": rows}})})
         result = self.sh("NO_COLOR=1; cmd_suspects list 2")
         self.assertEqual(result.returncode, 0, result.stderr)
         for text in ("по числу совпадений: 3×1", "203.0.113.9", "A2C2D", "85", "Linux", "dd",
-                     "!бан", "A сессия-зонд"):
+                     "!бан", "A сессия-зонд", "ОС(SYN)", "ОС(SYN) — система по TCP-стеку"):
             self.assertIn(text, result.stdout)
+        # Не клиент Telegram (Undefined), но ОС по SYN видна; без SYN — прочерк.
+        windows_row = next(line for line in result.stdout.splitlines() if "198.51.100.7" in line)
+        self.assertIn("Undefined", windows_row)
+        self.assertIn("Windows", windows_row)
+        bare_row = next(line for line in result.stdout.splitlines() if "198.51.100.8" in line)
+        self.assertIn("—", bare_row.split("Undefined", 1)[1])
         self.assertIn("min_matches=2", seen[0][1])
 
     def test_devices_lists_platform_state_and_ip(self):
