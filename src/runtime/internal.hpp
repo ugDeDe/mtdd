@@ -577,11 +577,22 @@ private:
         Platform platform{Platform::undefined};
     };
     using Keys = std::unordered_map<Key, Entry, KeyHash>;
-    static Count prune_locked(Keys& keys, Clock::time_point now,
-                                      std::chrono::seconds window);
+    // Keys of one user plus per-DC counts kept incrementally: admit/release
+    // run on every connection and must not scan all keys of the user (a
+    // shared pool user holds tens of thousands of them). Expired idle keys
+    // are dropped by the periodic prune() (and list()); between prunes the
+    // "recent" count may still include keys expired since the last pass.
+    struct UserKeys {
+        Keys keys;
+        std::unordered_map<std::int16_t, Count> per_dc;
+    };
+    static void account(UserKeys& user, std::int16_t dc, const Entry& entry, bool add);
+    static void erase_key(UserKeys& user, Keys::iterator it);
+    static Count total(const UserKeys& user);
+    static Count prune_locked(UserKeys& user, Clock::time_point now, std::chrono::seconds window);
 
     std::mutex mutex_;
-    std::unordered_map<std::string, Keys> users_;
+    std::unordered_map<std::string, UserKeys> users_;
 };
 
 // State shared by all reactors. Hot-path relay traffic never touches this

@@ -12,21 +12,26 @@
 namespace mtdd {
 namespace detail {
 
-DeviceTable::Count DeviceTable::prune_locked(Keys& keys, Clock::time_point now,
-                                             std::chrono::seconds window) {
-    std::unordered_map<std::int16_t, Count> per_dc;
-    for (auto it = keys.begin(); it != keys.end();) {
-        if (it->second.open == 0 && now - it->second.last > window) {
-            it = keys.erase(it);
-            continue;
-        }
-        Count& dc = per_dc[it->first.dc];
-        ++dc.recent;
-        if (it->second.open != 0) ++dc.connected;
-        ++it;
+void DeviceTable::account(UserKeys& user, std::int16_t dc, const Entry& entry, bool add) {
+    Count& count = user.per_dc[dc];
+    if (add) {
+        ++count.recent;
+        if (entry.open != 0) ++count.connected;
+        return;
     }
+    if (count.recent > 0) --count.recent;
+    if (entry.open != 0 && count.connected > 0) --count.connected;
+    if (count.recent == 0 && count.connected == 0) user.per_dc.erase(dc);
+}
+
+void DeviceTable::erase_key(UserKeys& user, Keys::iterator it) {
+    account(user, it->first.dc, it->second, false);
+    user.keys.erase(it);
+}
+
+DeviceTable::Count DeviceTable::total(const UserKeys& user) {
     Count devices;
-    for (const auto& [dc, count] : per_dc) {
+    for (const auto& [dc, count] : user.per_dc) {
         (void)dc;
         devices.recent = std::max(devices.recent, count.recent);
         devices.connected = std::max(devices.connected, count.connected);
@@ -34,63 +39,93 @@ DeviceTable::Count DeviceTable::prune_locked(Keys& keys, Clock::time_point now,
     return devices;
 }
 
-DeviceTable::Admit DeviceTable::admit(const std::string& user, std::int16_t dc,
+DeviceTable::Count DeviceTable::prune_locked(UserKeys& user, Clock::time_point now,
+                                             std::chrono::seconds window) {
+    for (auto it = user.keys.begin(); it != user.keys.end();) {
+        if (it->second.open == 0 && now - it->second.last > window) {
+            auto expired = it++;
+            erase_key(user, expired);
+            continue;
+        }
+        ++it;
+    }
+    return total(user);
+}
+
+DeviceTable::Admit DeviceTable::admit(const std::string& user_name, std::int16_t dc,
                                       std::uint64_t key, const protocol::Endpoint& peer,
                                       Platform platform, std::uint32_t max_devices,
                                       Clock::time_point now, std::chrono::seconds window,
                                       Count& devices) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Keys& keys = users_[user];
-    prune_locked(keys, now, window);
+    UserKeys& user = users_[user_name];
     const Key id{key, dc};
-    if (const auto found = keys.find(id); found != keys.end()) {
-        ++found->second.open;
+    if (const auto found = user.keys.find(id); found != user.keys.end()) {
+        if (found->second.open++ == 0) ++user.per_dc[dc].connected;
         found->second.last = now;
         found->second.peer = peer;
         if (platform != Platform::undefined) found->second.platform = platform;
-        devices = prune_locked(keys, now, window);
+        devices = total(user);
         return Admit::ok;
     }
     if (max_devices != 0) {
+        // The limit counts keys of this DC within the window: expired idle
+        // keys found on the way are dropped, so they never hold a slot.
         std::uint64_t on_dc = 0;
-        auto idle = keys.end();
-        for (auto it = keys.begin(); it != keys.end(); ++it) {
-            if (it->first.dc != dc) continue;
+        auto idle = user.keys.end();
+        for (auto it = user.keys.begin(); it != user.keys.end();) {
+            if (it->first.dc != dc) {
+                ++it;
+                continue;
+            }
+            if (it->second.open == 0 && now - it->second.last > window) {
+                auto expired = it++;
+                erase_key(user, expired);
+                continue;
+            }
             ++on_dc;
-            if (it->second.open == 0 && (idle == keys.end() || it->second.last < idle->second.last)) {
+            if (it->second.open == 0 && (idle == user.keys.end() || it->second.last < idle->second.last)) {
                 idle = it;
             }
+            ++it;
         }
         if (on_dc >= max_devices) {
             // Only devices with an open connection hold a slot: the least
             // recently seen idle key gives way (a switched device, or the
             // previous temporary key of the same one).
-            if (idle == keys.end()) {
-                devices = prune_locked(keys, now, window);
+            if (idle == user.keys.end()) {
+                devices = total(user);
                 return Admit::limit;
             }
-            keys.erase(idle);
+            erase_key(user, idle);
         }
     }
-    keys.emplace(id, Entry{1, now, peer, platform});
-    devices = prune_locked(keys, now, window);
+    const Entry entry{1, now, peer, platform};
+    user.keys.emplace(id, entry);
+    account(user, dc, entry, true);
+    devices = total(user);
     return Admit::ok;
 }
 
-void DeviceTable::release(const std::string& user, std::int16_t dc, std::uint64_t key,
+void DeviceTable::release(const std::string& user_name, std::int16_t dc, std::uint64_t key,
                           Clock::time_point now, std::chrono::seconds window,
                           Count& devices) {
+    (void)window; // expiry is the periodic prune's job; release stays O(1)
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto user_it = users_.find(user);
+    const auto user_it = users_.find(user_name);
     if (user_it == users_.end()) {
         devices = Count{};
         return;
     }
-    if (const auto found = user_it->second.find(Key{key, dc}); found != user_it->second.end()) {
-        if (found->second.open > 0) --found->second.open;
+    UserKeys& user = user_it->second;
+    if (const auto found = user.keys.find(Key{key, dc}); found != user.keys.end()) {
+        if (found->second.open > 0 && --found->second.open == 0) {
+            Count& count = user.per_dc[dc];
+            if (count.connected > 0) --count.connected;
+        }
         found->second.last = now;
     }
-    devices = prune_locked(user_it->second, now, window);
+    devices = total(user);
 }
 
 std::vector<control::Statistics::DeviceInfo> DeviceTable::list(const std::string& user,
@@ -101,8 +136,8 @@ std::vector<control::Statistics::DeviceInfo> DeviceTable::list(const std::string
     const auto found = users_.find(user);
     if (found == users_.end()) return out;
     prune_locked(found->second, now, window);
-    out.reserve(found->second.size());
-    for (const auto& [id, entry] : found->second) {
+    out.reserve(found->second.keys.size());
+    for (const auto& [id, entry] : found->second.keys) {
         control::Statistics::DeviceInfo info;
         // A short stable tag, not the key itself.
         info.id = static_cast<std::uint32_t>((id.auth_key_id * 0x9E3779B97F4A7C15ULL) >> 32);
@@ -132,7 +167,7 @@ void DeviceTable::prune(Clock::time_point now, std::chrono::seconds window,
     for (auto it = users_.begin(); it != users_.end();) {
         const Count devices = prune_locked(it->second, now, window);
         counts.emplace_back(it->first, devices);
-        if (it->second.empty()) {
+        if (it->second.keys.empty()) {
             it = users_.erase(it);
         } else {
             ++it;

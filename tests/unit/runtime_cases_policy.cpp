@@ -1147,3 +1147,67 @@ TEST(Suspects, RealClientOnDc2ProbeIsNotFlagged) {
                   .suspect_events_total[static_cast<std::size_t>(SuspectSignal::probe_session)], 0U);
     EXPECT_TRUE(daemon.services.stats.suspects().empty());
 }
+
+// Incremental per-DC counts must equal a full recount over the listed keys
+// after any mix of admits, releases and prunes.
+TEST(DeviceTable, IncrementalCountsMatchFullRecount) {
+    mtdd::detail::DeviceTable table;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({10, 0, 0, 7}, 4000);
+    constexpr auto kPlatform = mtdd::detail::Platform::android;
+    mtdd::detail::DeviceTable::Count devices;
+    std::uint64_t seed = 12345;
+    auto next = [&seed] { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return seed >> 33; };
+    for (int step = 0; step < 4000; ++step) {
+        const auto now = t0 + std::chrono::seconds(step / 20);
+        const std::uint64_t key = 1 + next() % 300;
+        const std::int16_t dc = static_cast<std::int16_t>(next() % 2 == 0 ? 2 : -2);
+        if (next() % 3 != 0) {
+            (void)table.admit("u", dc, key, peer, kPlatform, 0, now, 60s, devices);
+        } else {
+            table.release("u", dc, key, now, 60s, devices);
+        }
+        if (step % 500 == 499) {
+            std::vector<std::pair<std::string, mtdd::detail::DeviceTable::Count>> counts;
+            table.prune(now, 60s, counts);
+        }
+        // list() prunes too, then reports every key: recount by DC.
+        const auto listed = table.list("u", now, 60s);
+        std::map<std::int16_t, std::pair<std::uint64_t, std::uint64_t>> per_dc;
+        for (const auto& d : listed) {
+            ++per_dc[static_cast<std::int16_t>(d.dc)].first;
+            if (d.connections != 0) ++per_dc[static_cast<std::int16_t>(d.dc)].second;
+        }
+        std::uint64_t recent = 0, connected = 0;
+        for (const auto& [dc_key, c] : per_dc) {
+            (void)dc_key;
+            recent = std::max(recent, c.first);
+            connected = std::max(connected, c.second);
+        }
+        table.release("u", 99, 0, now, 60s, devices);  // unknown key: just reports counts
+        ASSERT_EQ(devices.recent, recent) << "step " << step;
+        ASSERT_EQ(devices.connected, connected) << "step " << step;
+    }
+}
+
+// A shared user with tens of thousands of keys: admit/release must not scan
+// them all (this used to be ~86% of a busy proxy's CPU).
+TEST(DeviceTable, AdmitAndReleaseStayCheapWithManyKeys) {
+    mtdd::detail::DeviceTable table;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({10, 0, 0, 7}, 4000);
+    mtdd::detail::DeviceTable::Count devices;
+    for (std::uint64_t key = 1; key <= 20000; ++key) {
+        (void)table.admit("pool", 2, key, peer, mtdd::detail::Platform::android, 0, t0, 900s, devices);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    for (std::uint64_t key = 1; key <= 20000; ++key) {
+        table.release("pool", 2, key, t0, 900s, devices);
+        (void)table.admit("pool", 2, key, peer, mtdd::detail::Platform::android, 0, t0, 900s, devices);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_EQ(devices.recent, 20000U);
+    EXPECT_EQ(devices.connected, 20000U);
+    // 40k operations; a full scan per operation took tens of seconds here.
+    EXPECT_LT(elapsed, 2s);
+}
