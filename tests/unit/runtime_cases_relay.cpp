@@ -412,6 +412,35 @@ TEST(Runtime, FullRelayThroughFakeMiddleEnd) {
     EXPECT_GE(snapshot.me_dcs.at("2").requests_success, 1U);
 }
 
+// Live ad-tag override: an ME session already open when the override arrives
+// carries the new tag in its next RPC_PROXY_REQ, without a reconnect.
+TEST(Runtime, LiveAdTagOverrideReachesOpenMiddleEndSession) {
+    // Idle timeout well above the housekeeping wait below.
+    FakeMe me{me_secret(), 1, 0ms, 1, 0ms, 0ms, false, 0, 10000};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    std::array<std::uint8_t, 16> pool_tag{};
+    for (std::size_t i = 0; i < pool_tag.size(); ++i) pool_tag[i] = static_cast<std::uint8_t>(0xc0 + i);
+    ASSERT_NE(pool_tag, daemon.services.config.ad_tag);
+    EXPECT_THROW(daemon.set_ad_tag(std::array<std::uint8_t, 16>{}), std::invalid_argument);
+    daemon.set_ad_tag(pool_tag);
+    // The reactor picks the override up on its housekeeping tick.
+    std::this_thread::sleep_for(1500ms);
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+    ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+    const auto observation = me.future().get();
+    ASSERT_TRUE(observation.ok);
+    EXPECT_EQ(observation.ad_tag, pool_tag);
+}
+
 // Late answers for conn ids no client owns must release the remote mapping with
 // RPC_CLOSE_CONN, without touching the shared transport or live sessions.
 TEST(Runtime, OrphanMiddleEndAnswersSendRemoteClose) {

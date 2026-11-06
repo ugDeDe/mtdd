@@ -290,6 +290,7 @@ struct ControlServer::Impl {
       case ApiRoute::user_links: handle_links(request, route.name, status); break;
       case ApiRoute::user_devices: handle_devices(request, route.name, status); break;
       case ApiRoute::suspects: handle_suspects(request, status); break;
+      case ApiRoute::ad_tag: handle_ad_tag(request, method, status); break;
       case ApiRoute::rotate_secret:
         handle_rotate(request, route.name, status);
         break;
@@ -363,6 +364,92 @@ struct ControlServer::Impl {
     data["revision"] = users->revision;
     status = 200;
     send_json(request, status, json{{"data", std::move(data)}}, users->revision);
+  }
+
+  // Live ad-tag override; only the event thread touches it. Not persisted:
+  // the runtime returns to config.ad_tag on restart, and so does this view.
+  std::optional<std::array<uint8_t, 16>> ad_tag_override;
+
+  static std::string hex_tag(const std::array<uint8_t, 16>& tag) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    for (uint8_t byte : tag) {
+      out.push_back(kHex[byte >> 4]);
+      out.push_back(kHex[byte & 0x0f]);
+    }
+    return out;
+  }
+
+  static std::optional<std::array<uint8_t, 16>> parse_tag(const std::string& text) {
+    if (text.size() != 32) return std::nullopt;
+    std::array<uint8_t, 16> tag{};
+    bool nonzero = false;
+    for (size_t i = 0; i < tag.size(); ++i) {
+      int value = 0;
+      for (char c : {text[i * 2], text[i * 2 + 1]}) {
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        if (digit < 0) return std::nullopt;
+        value = value * 16 + digit;
+      }
+      tag[i] = static_cast<uint8_t>(value);
+      nonzero = nonzero || tag[i] != 0;
+    }
+    if (!nonzero) return std::nullopt;
+    return tag;
+  }
+
+  json ad_tag_view() const {
+    return json{{"override", ad_tag_override.has_value()},
+                {"ad_tag", ad_tag_override ? json(hex_tag(*ad_tag_override)) : json(nullptr)}};
+  }
+
+  void handle_ad_tag(evhttp_request* request, ApiMethod method, int& status) {
+    if (!options.ad_tag_hook) {
+      status = 404;
+      send_error(request, status, "not_found", "ad-tag override is not available");
+      return;
+    }
+    if (method == ApiMethod::get) {
+      status = 200;
+      send_json(request, status, json{{"data", ad_tag_view()}});
+      return;
+    }
+    std::optional<std::array<uint8_t, 16>> tag;
+    if (method == ApiMethod::post) {
+      BodyRead body = read_body(request, options.max_body_bytes, false);
+      if (body.error) {
+        status = body.error->status;
+        send_error(request, status, body.error->type, body.error->message);
+        return;
+      }
+      if (auto error = check_allowed_fields(body.value, {"ad_tag"})) {
+        status = error->status;
+        send_error(request, status, error->type, error->message);
+        return;
+      }
+      const auto field = body.value.find("ad_tag");
+      if (field != body.value.end() && field->is_string()) tag = parse_tag(field->get<std::string>());
+      if (!tag) {
+        status = 400;
+        send_error(request, status, "invalid_field",
+                   "ad_tag must be 32 hexadecimal characters and not all zero");
+        return;
+      }
+    }
+    if (!options.ad_tag_hook(tag)) {
+      status = 500;
+      send_error(request, status, "runtime_rejected", "the data plane rejected the ad tag");
+      return;
+    }
+    ad_tag_override = tag;
+    MutationOutcome outcome;
+    outcome.applied = true;
+    audit(request, tag ? "ad_tag.override" : "ad_tag.reset", outcome, "", {"ad_tag"});
+    status = 200;
+    send_json(request, status, json{{"data", ad_tag_view()}});
   }
 
   void handle_config(evhttp_request* request, int& status) {

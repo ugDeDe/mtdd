@@ -393,6 +393,7 @@ enum class ApiRoute {
   user_reset_quota,
   user_devices,
   suspects,
+  ad_tag,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -910,6 +911,11 @@ struct HttpOptions {
   // and the ad_tag left out; empty means "{}".
   std::string config_json;
   std::string system_info_json;
+  // api role, optional: live ad-tag override (GET/POST/DELETE /v1/ad-tag).
+  // Applies a tag to the running data plane (nullopt = back to the configured
+  // one) and returns false when the runtime rejected it. Nothing is persisted:
+  // a restart returns to config.ad_tag. Without a hook the route answers 404.
+  std::function<bool(const std::optional<std::array<uint8_t, 16>>&)> ad_tag_hook;
 };
 
 class ControlServer {

@@ -115,6 +115,17 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
     http.system_info_json =
         nlohmann::json{{"workers_configured", config.workers},
                        {"security", config.security_posture()}}.dump();
+    // Live ad-tag override (POST/DELETE /v1/ad-tag): reset returns to the
+    // configured tag; nothing is written to the config file.
+    http.ad_tag_hook = [&runtime, configured = config.ad_tag](
+                           const std::optional<std::array<std::uint8_t, 16>>& tag) {
+        try {
+            runtime.set_ad_tag(tag ? *tag : configured);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
     mtdd::control::ControlServer management{users, stats, std::move(http)};
     const auto listening = management.start();
     if (!listening) throw std::runtime_error("cannot start management listener");

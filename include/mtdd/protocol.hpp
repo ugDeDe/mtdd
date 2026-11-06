@@ -551,6 +551,9 @@ class MiddleEndSession {
   Status encode_close(const ConnId& conn_id, std::vector<std::uint8_t>& to_me);
   // RPC_PING (0x5730a2df) + ping_id for connection keepalive; transport stays up.
   Status encode_ping(std::int64_t ping_id, std::vector<std::uint8_t>& to_me);
+  // Replaces the ad tag carried by every later RPC_PROXY_REQ (live ad-tag
+  // override). Throws std::invalid_argument for an all-zero tag.
+  void set_ad_tag(const AdTag& tag);
 
   State state() const;
   bool ready() const { return state() == State::Ready; }

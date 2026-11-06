@@ -650,6 +650,28 @@ TEST(MiddleEnd, AdTagExactLayoutAndQuickAckFlag) {
   EXPECT_EQ(rd32(std::span<const std::uint8_t>(out2).subspan(8), 4), 0xa8021008u);
 }
 
+TEST(MiddleEnd, LiveAdTagOverrideAppliesToNextRequest) {
+  auto r = make_ready();
+  const std::array<std::uint8_t, 16> other{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
+                                           0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0};
+  AdTag tag;
+  tag.bytes = other;
+  r.session->set_ad_tag(tag);
+  Bytes payload = from_hex("0102030405060708090a0b0c");
+  Bytes out;
+  ASSERT_EQ(r.session->encode_client_message(payload, kPeer, ProtoTag::Secure, false, out), Status::Ok);
+  r.write_dec->decrypt(out);
+  auto p = std::span<const std::uint8_t>(out).subspan(8, rd32(out) - 12);
+  expect_bytes(p.subspan(65, 16), other);
+
+  AdTag zero;
+  EXPECT_THROW(r.session->set_ad_tag(zero), std::invalid_argument);
+  Bytes again;
+  ASSERT_EQ(r.session->encode_client_message(payload, kPeer, ProtoTag::Secure, false, again), Status::Ok);
+  r.write_dec->decrypt(again);
+  expect_bytes(std::span<const std::uint8_t>(again).subspan(8, rd32(again) - 12).subspan(65, 16), other);
+}
+
 // RPC_PROXY_REQ carries two distinct 20-byte endpoints: the client's address
 // and this proxy's own listener address. The listener port must be the one
 // clients connect to; the ME socket's ephemeral source port belongs ONLY to the

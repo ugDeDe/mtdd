@@ -598,6 +598,11 @@ struct SharedState {
     std::atomic<std::uint32_t> me_clients_per_writer{0};
     std::atomic<std::uint32_t> me_connections_per_dc{0};
     std::atomic<std::uint64_t> tunables_generation{0};
+    // Live ad-tag override (Runtime::set_ad_tag). The value is read under the
+    // mutex only when the generation changed, never per relayed packet.
+    std::mutex ad_tag_mutex;
+    std::array<std::uint8_t, 16> ad_tag{};
+    std::atomic<std::uint64_t> ad_tag_generation{0};
     // Media shaping (signed DC < 0, server-to-client bytes), bytes/s; 0 = off.
     // A limit is split evenly over the currently active media connections
     // (per user, and process-wide for the total cap).
@@ -1077,6 +1082,7 @@ struct Runtime::Impl {
     void process_deadlines(Time now);
     int wait_timeout_ms(Time now) const;
     void housekeeping(Time now);
+    void apply_shared_ad_tag();
 
     std::uint64_t add_target(const Target& target);
     Target* find_target(std::uint64_t token);
@@ -1378,6 +1384,7 @@ struct Runtime::Impl {
     std::unordered_map<std::string, const control::UserRecord*> policy_index_;
     std::vector<std::uint64_t> policy_doomed_;
     std::uint64_t tunables_seen_{0};
+    std::uint64_t ad_tag_seen_{0};
     // Pre-keyed ClientHello HMAC per enabled user of hello_keys_snapshot_
     // (held so the UserRecord pointers stay valid). Rebuilt on snapshot change.
     std::shared_ptr<const control::UserSnapshot> hello_keys_snapshot_;
@@ -1475,6 +1482,7 @@ struct Runtime::RuntimeState {
     std::vector<std::uint64_t> replay_rejections_per_worker() const;
     void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
     void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+    void set_ad_tag(const std::array<std::uint8_t, 16>& tag);
     void on_reload(std::function<void()> hook);
 
 private:

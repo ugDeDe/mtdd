@@ -164,3 +164,52 @@ TEST(IpNetworkTest, ParsesAndRejects) {
 }
 
 }  // namespace
+
+TEST(HttpAdTagTest, OverrideAppliesThroughHookAndResets) {
+  std::vector<std::optional<std::array<uint8_t, 16>>> calls;
+  HttpOptions options = read_options();
+  options.ad_tag_hook = [&calls](const std::optional<std::array<uint8_t, 16>>& tag) {
+    calls.push_back(tag);
+    return true;
+  };
+  Harness h(StoreOptions{}, options);
+
+  auto view = h.req("GET", "/v1/ad-tag");
+  ASSERT_EQ(view.status, 200);
+  EXPECT_EQ(parse_json(view)["data"]["override"], false);
+
+  const std::string tag = "00112233445566778899aabbccddeeff";
+  ASSERT_EQ(h.req("POST", "/v1/ad-tag", R"({"ad_tag":")" + tag + R"("})").status, 200);
+  ASSERT_EQ(calls.size(), 1u);
+  ASSERT_TRUE(calls[0].has_value());
+  EXPECT_EQ((*calls[0])[1], 0x11);
+  view = h.req("GET", "/v1/ad-tag", {}, kReadToken);
+  ASSERT_EQ(view.status, 200);
+  EXPECT_EQ(parse_json(view)["data"]["override"], true);
+  EXPECT_EQ(parse_json(view)["data"]["ad_tag"], tag);
+
+  for (const char* bad : {R"({"ad_tag":"00000000000000000000000000000000"})",
+                          R"({"ad_tag":"zz112233445566778899aabbccddeeff"})",
+                          R"({"ad_tag":"0011"})", R"({})", R"({"ad_tag":"x","extra":1})"}) {
+    EXPECT_EQ(h.req("POST", "/v1/ad-tag", bad).status, 400) << bad;
+  }
+  EXPECT_EQ(h.req("POST", "/v1/ad-tag", R"({"ad_tag":")" + tag + R"("})", kReadToken).status, 403);
+  EXPECT_EQ(calls.size(), 1u);
+
+  ASSERT_EQ(h.req("DELETE", "/v1/ad-tag").status, 200);
+  ASSERT_EQ(calls.size(), 2u);
+  EXPECT_FALSE(calls[1].has_value());
+  EXPECT_EQ(parse_json(h.req("GET", "/v1/ad-tag"))["data"]["override"], false);
+  EXPECT_NE(h.req("GET", "/v1/events").body.find("ad_tag.override"), std::string::npos);
+}
+
+TEST(HttpAdTagTest, RuntimeRejectionAndMissingHook) {
+  HttpOptions options = read_options();
+  options.ad_tag_hook = [](const std::optional<std::array<uint8_t, 16>>&) { return false; };
+  Harness rejecting(StoreOptions{}, options);
+  EXPECT_EQ(rejecting.req("POST", "/v1/ad-tag", R"({"ad_tag":"00112233445566778899aabbccddeeff"})").status, 500);
+  EXPECT_EQ(parse_json(rejecting.req("GET", "/v1/ad-tag"))["data"]["override"], false);
+
+  Harness plain(StoreOptions{}, read_options());
+  EXPECT_EQ(plain.req("GET", "/v1/ad-tag").status, 404);
+}

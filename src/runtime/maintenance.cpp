@@ -57,11 +57,35 @@ void Runtime::Impl::apply_shared_tunables() {
     recompute_ready();
 }
 
+void Runtime::Impl::apply_shared_ad_tag() {
+    const std::uint64_t generation =
+        shared_->ad_tag_generation.load(std::memory_order_acquire);
+    if (generation == ad_tag_seen_) return;
+    ad_tag_seen_ = generation;
+    {
+        std::lock_guard lock(shared_->ad_tag_mutex);
+        config_.ad_tag = shared_->ad_tag;
+    }
+    // New ME sessions start from config_.ad_tag; live ones switch on their next
+    // RPC_PROXY_REQ, so existing clients are neither dropped nor re-handshaked.
+    protocol::AdTag tag;
+    tag.bytes = config_.ad_tag;
+    for (auto& [dc, pool] : me_pool_) {
+        for (auto& connection : pool.conns) {
+            if (connection && connection->session) connection->session->set_ad_tag(tag);
+        }
+    }
+}
+
 void Runtime::Impl::housekeeping(Time now) {
     // A reload must never become a reactor failure; on allocation failure the
     // generation is already consumed and the next reload retries.
     try {
         apply_shared_tunables();
+    } catch (...) {
+    }
+    try {
+        apply_shared_ad_tag();
     } catch (...) {
     }
     shared_->replay.evict(now);

@@ -96,7 +96,8 @@ RouteInfo classify_route(evhttp_request* request) {
       {"/v1/stats/me", ApiRoute::stats_me},
       {"/v1/stats/users", ApiRoute::stats_users},
       {"/v1/events", ApiRoute::events},
-      {"/v1/suspects", ApiRoute::suspects}};
+      {"/v1/suspects", ApiRoute::suspects},
+      {"/v1/ad-tag", ApiRoute::ad_tag}};
   for (const auto& [fixed, route] : kFixed) {
     if (path == fixed) {
       info.route = route;
@@ -159,6 +160,9 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
     case ApiRoute::user_disable:
     case ApiRoute::user_reset_quota:
       return method == ApiMethod::post;
+    case ApiRoute::ad_tag:
+      return method == ApiMethod::get || method == ApiMethod::post ||
+             method == ApiMethod::delete_;
     case ApiRoute::unknown:
       return false;
   }

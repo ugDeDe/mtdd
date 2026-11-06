@@ -770,6 +770,13 @@ Status MiddleEndSession::encode_ping(std::int64_t ping_id, std::vector<std::uint
   return Status::Ok;
 }
 
+void MiddleEndSession::set_ad_tag(const AdTag& tag) {
+  if (std::all_of(tag.bytes.begin(), tag.bytes.end(), [](std::uint8_t b) { return b == 0; })) {
+    throw std::invalid_argument("ME ad tag is required (16 non-zero bytes)");
+  }
+  impl_->cfg.ad_tag = tag;
+}
+
 MiddleEndSession::State MiddleEndSession::state() const { return impl_->state; }
 const MiddleEndSession::ControlCounters& MiddleEndSession::control_counters() const {
   return impl_->control;

@@ -267,6 +267,18 @@ void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
     shared->set_media_rates(user_kbps * 125U, total_kbps * 125U);
 }
 
+void Runtime::RuntimeState::set_ad_tag(const std::array<std::uint8_t, 16>& tag) {
+    if (std::all_of(tag.begin(), tag.end(), [](std::uint8_t byte) { return byte == 0; })) {
+        throw std::invalid_argument("ad_tag must not be all zero");
+    }
+    {
+        std::lock_guard lock(shared->ad_tag_mutex);
+        shared->ad_tag = tag;
+    }
+    // Release pairs with the reactors' acquire load of the generation.
+    shared->ad_tag_generation.fetch_add(1, std::memory_order_release);
+}
+
 void Runtime::RuntimeState::on_reload(std::function<void()> hook) {
     shared->reload_hook = std::move(hook);
 }
@@ -289,6 +301,8 @@ void Runtime::set_tunables(std::uint32_t me_clients_per_writer,
 }
 
 void Runtime::on_reload(std::function<void()> hook) { state_->on_reload(std::move(hook)); }
+
+void Runtime::set_ad_tag(const std::array<std::uint8_t, 16>& tag) { state_->set_ad_tag(tag); }
 
 void Runtime::set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept {
     state_->set_media_limits(user_kbps, total_kbps);

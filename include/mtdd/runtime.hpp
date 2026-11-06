@@ -31,6 +31,7 @@
 // the mandatory ad-tag unless Direct fallback is explicitly configured.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -86,6 +87,12 @@ public:
     /// Thread-safe. Media shaping limits in kbit/s (0 = unlimited): per proxy
     /// user across its media (signed DC < 0) connections, and process-wide.
     void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+
+    /// Thread-safe. Replaces the ad tag of every reactor: live ME sessions
+    /// carry it in their next RPC_PROXY_REQ, new sessions start with it.
+    /// Reactors apply it within one housekeeping tick; nothing is persisted
+    /// (a restart returns to config.ad_tag). Throws for an all-zero tag.
+    void set_ad_tag(const std::array<std::uint8_t, 16>& tag);
 
     /// Installs a SIGHUP handler (call before run()). It runs on the reactor
     /// that owns the process signals; a throwing hook is ignored.

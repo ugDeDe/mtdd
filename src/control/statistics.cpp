@@ -20,7 +20,7 @@ namespace {
 constexpr size_t kRejectReasonCount = 10;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 20;
+constexpr size_t kApiRouteCount = 21;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
@@ -43,7 +43,8 @@ constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/users/{name}/links", "/v1/system/info", "/v1/config",
     "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
     "/v1/users/{name}/enable", "/v1/users/{name}/disable",
-    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects"};
+    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects",
+    "/v1/ad-tag"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -116,6 +117,7 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::user_reset_quota: return 17;
     case ApiRoute::user_devices: return 18;
     case ApiRoute::suspects: return 19;
+    case ApiRoute::ad_tag: return 20;
   }
   return 7;
 }
