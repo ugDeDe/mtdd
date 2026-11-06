@@ -12,7 +12,9 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
+// tcp_info from the kernel UAPI header: glibc's <netinet/tcp.h> (2.39, Ubuntu
+// 24.04 / CI) lacks tcpi_bytes_received / tcpi_bytes_acked.
+#include <linux/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
