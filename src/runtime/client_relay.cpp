@@ -266,12 +266,15 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
             return;
         }
         try {
-            me.frames.emplace_back();
+            // Encoded into a reused buffer and staged straight into the ME
+            // output queue: no vector per request, and the socket write is
+            // deferred to flush_pending_me() (one sendmsg per ME socket per
+            // reactor iteration instead of one per request).
+            me_encode_buffer_.clear();
             const auto status = me.session->encode_client_message(
                 client.conn_id, message.data, client.peer, protocol::ProtoTag::Secure,
-                message.quick_ack, me.frames.back().bytes);
+                message.quick_ack, me_encode_buffer_);
             if (status != protocol::Status::Ok) {
-                me.frames.pop_back();
                 if (me.session->state() == protocol::MiddleEndSession::State::Failed) {
                     fail_me(me, now);
                 } else {
@@ -280,11 +283,13 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
                 return;
             }
         } catch (const std::exception&) {
-            if (!me.frames.empty()) me.frames.pop_back();
             fail_me(me, now);
             return;
         }
-        me.frame_bytes += me.frames.back().bytes.size();
+        if (!stage_me_bytes(me, me_encode_buffer_)) {
+            defer_me_failure(me);
+            return;
+        }
         stats_.me_request(worker_index_, me.dc, control::MeResult::success);
         client.awaiting_reply = true;
         client.last_forward_at = now;
@@ -293,8 +298,13 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
         client.c2s.pop_front();
         reaccount(client);
         reaccount(me);
-        pump_me_out(me);
+        schedule_me_flush(me);
         if (clients_.find(token) == clients_.end()) return;
+    }
+    // A rare large request must not pin a multi-megabyte scratch buffer.
+    if (me_encode_buffer_.capacity() > detail::kScratchShrinkBytes) {
+        detail::trim_scratch(me_encode_buffer_);
+        reaccount_shared();
     }
     // Queue membership is the caller's job (enqueue_ready). pump_c2s only
     // drains; this is what removed the base tree's double re-enqueue.

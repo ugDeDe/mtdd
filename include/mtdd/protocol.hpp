@@ -145,6 +145,10 @@ class AesCtr {
   AesCtr& operator=(const AesCtr&) = delete;
 
   void apply(std::span<std::uint8_t> data);  // XOR in place, advancing the stream
+  // Out-of-place variant: out = in XOR keystream. Sizes must match and the
+  // spans must not partially overlap (decrypting a received TLS record body
+  // straight into the plaintext buffer, without copying it first).
+  void apply(std::span<const std::uint8_t> in, std::span<std::uint8_t> out);
   void skip(std::size_t bytes);
   void wipe();
 

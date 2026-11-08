@@ -118,7 +118,9 @@ void Runtime::Impl::pump_me_out(MeConn& me) {
         }
     }
     if (me.fd.valid() && !me.out->empty()) {
-        const auto result = me.out->flush_to(me.fd.get(), detail::kWriteBatch);
+        // Requests of a whole reactor iteration are written at once.
+        const auto result =
+            me.out->flush_to(me.fd.get(), std::max(detail::kWriteBatch, me.out->bytes()));
         if (result.status == io::FlushStatus::error) {
             defer_me_failure(me);
             return;
@@ -127,6 +129,74 @@ void Runtime::Impl::pump_me_out(MeConn& me) {
     }
     reaccount(me);
     update_me_interest(me);
+}
+
+bool Runtime::Impl::stage_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes) {
+    if (bytes.empty()) return true;
+    if (!me.out) return false;
+    std::size_t moved = 0;
+    if (me.frames.empty()) {
+        // FIFO: bytes go to `out` only while nothing is waiting in `frames`.
+        const std::size_t space = me.out->max_bytes() - me.out->bytes();
+        moved = std::min(space, bytes.size());
+        if (moved != 0 && me.out->append(bytes.first(moved)) != io::AppendStatus::ok) return false;
+    }
+    if (moved == bytes.size()) return true;
+    // The output queue is full: the remainder waits in `frames`, which also
+    // stops pump_c2s/pump_me_ready_queue until EPOLLOUT drains it.
+    try {
+        const auto rest = bytes.subspan(moved);
+        me.frames.push_back(StagedFrame{std::vector<std::uint8_t>(rest.begin(), rest.end()), 0});
+        me.frame_bytes += rest.size();
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
+}
+
+void Runtime::Impl::schedule_me_flush(MeConn& me) {
+    if (me.flush_pending) return;
+    try {
+        me_flush_tokens_.push_back(me.token);
+    } catch (const std::bad_alloc&) {
+        pump_me_out(me);  // cannot defer: write now
+        return;
+    }
+    me.flush_pending = true;
+}
+
+void Runtime::Impl::flush_pending_me(Time now) {
+    // A flush can resume clients waiting in ready_clients (their requests were
+    // held while `out` was full), which stages more; a few rounds settle it,
+    // and anything left is written without resuming (EPOLLOUT/ready wake).
+    constexpr int kRounds = 4;
+    for (int round = 0; round <= kRounds && !me_flush_tokens_.empty(); ++round) {
+        me_flush_batch_.clear();
+        me_flush_batch_.swap(me_flush_tokens_);
+        for (const std::uint64_t token : me_flush_batch_) {
+            const auto found = me_by_token_.find(token);
+            if (found == me_by_token_.end() || found->second == nullptr) continue;
+            MeConn& me = *found->second;
+            if (!me.flush_pending) continue;
+            me.flush_pending = false;
+            try {
+                pump_me_out(me);
+                if (round < kRounds && me.state == MeConn::State::ready && !me.failure_deferred &&
+                    !me.ready_clients.empty()) {
+                    pump_me_ready_queue(me, now);
+                } else {
+                    arm_me_ready_wake(me, now);
+                }
+                update_me_interest(me);
+            } catch (const std::exception&) {
+                try {
+                    fail_me(me, now);
+                } catch (...) {
+                }
+            }
+        }
+    }
+    me_flush_batch_.clear();
 }
 
 void Runtime::Impl::publish_me_queue(MeConn& me) {

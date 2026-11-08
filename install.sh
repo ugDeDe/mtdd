@@ -2888,6 +2888,7 @@ tune_network() {
 # non-default value, so the script is safe on any Linux host.
 set -u
 SYSFS=${MTDD_NETTUNE_SYSFS:-/sys}
+PROC=${MTDD_NETTUNE_PROC:-/proc}
 STATE=${MTDD_NETTUNE_STATE:-/run/mtdd-nettune}
 
 ifaces() {
@@ -2907,8 +2908,38 @@ set_if_default() {
     fi
 }
 
+# set_if_zero FILE VALUE: for CPU masks and counters whose kernel default is
+# all zeros ("0", "00", "00000000,00000000"); records the value read back.
+set_if_zero() {
+    file=$1 value=$2
+    [ -w "$file" ] || return 0
+    current=$(cat "$file" 2>/dev/null) || return 0
+    case $current in ''|*[!0,]*) return 0 ;; esac
+    if echo "$value" > "$file" 2>/dev/null; then
+        printf '%s %s %s\n' "$file" "$current" "$(cat "$file" 2>/dev/null)" >> "$STATE/restore"
+    fi
+}
+
+online_cpus() {
+    if [ -n "${MTDD_NETTUNE_CPUS:-}" ]; then echo "$MTDD_NETTUNE_CPUS"; return; fi
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+}
+
+# cpu_mask N: hex mask of CPUs 0..N-1 in the sysfs format (32-bit groups).
+cpu_mask() {
+    n=$1 mask=''
+    while [ "$n" -gt 0 ]; do
+        if [ "$n" -ge 32 ]; then group=ffffffff; n=$((n - 32))
+        else group=$(printf '%x' $(( (1 << n) - 1 ))); n=0; fi
+        if [ -z "$mask" ]; then mask=$group; else mask="$group,$mask"; fi
+    done
+    echo "$mask"
+}
+
 start() {
     mkdir -p "$STATE" && : > "$STATE/restore" || exit 0
+    cpus=$(online_cpus)
+    rfs=0
     for dev in $(ifaces); do
         net="$SYSFS/class/net/$dev"
         [ -d "$net" ] || continue
@@ -2920,7 +2951,22 @@ start() {
         # process and softirq while adding latency.
         set_if_default "$net/napi_defer_hard_irqs" 0 2
         set_if_default "$net/gro_flush_timeout" 0 1000000
+        # RPS/RFS for a single receive queue (typical small VMs: virtio-net
+        # with one queue). Otherwise every received packet is processed on
+        # the one CPU taking the NIC interrupt; measured on a 2 vCPU node,
+        # softirq went from 15%/58% per CPU to 45%/43%. RFS then steers each
+        # flow to the CPU of the mtdd reactor reading it. Multi-queue NICs
+        # already spread in hardware (RSS) and are left alone.
+        queues=$(ls -d "$net"/queues/rx-* 2>/dev/null | wc -l)
+        if [ "$cpus" -gt 1 ] && [ "$queues" -eq 1 ]; then
+            set_if_zero "$net/queues/rx-0/rps_cpus" "$(cpu_mask "$cpus")"
+            set_if_zero "$net/queues/rx-0/rps_flow_cnt" 32768
+            rfs=1
+        fi
     done
+    if [ "$rfs" -eq 1 ]; then
+        set_if_zero "$PROC/sys/net/core/rps_sock_flow_entries" 32768
+    fi
 }
 
 stop() {
@@ -2943,7 +2989,7 @@ exit 0
 NETTUNE
     install -m 0644 /dev/stdin "$MTDD_NETTUNE_UNIT" <<UNIT
 [Unit]
-Description=mtdd network interface tuning (NAPI IRQ deferral)
+Description=mtdd network interface tuning (NAPI IRQ deferral, RPS/RFS)
 After=network-online.target
 Wants=network-online.target
 Before=$MTDD_SERVICE

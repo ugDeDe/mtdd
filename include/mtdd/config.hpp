@@ -48,6 +48,11 @@ struct Config {
     // Zero means unlimited; set a positive value to enforce a global cap.
     std::uint32_t max_connections{0};
     // Maximum active ME connections per signed DC and reactor, range 1..24.
+    // Pin reactor i to the i-th CPU of the process affinity mask when there
+    // are no more reactors than CPUs. With RFS the kernel then processes each
+    // connection's packets on the CPU of the reactor that owns it, and
+    // reactors keep their caches instead of migrating.
+    bool cpu_affinity{true};
     std::uint32_t me_connections_per_dc{16};
     std::uint32_t me_clients_per_writer{400};
     // Zero means unlimited; set a positive value to cap pending handshakes.

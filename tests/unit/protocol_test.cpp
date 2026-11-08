@@ -136,7 +136,10 @@ TEST(Crypto, Crc32cKnownVectorsAndIndependentReference) {
       const auto data = std::span<const std::uint8_t>(storage).subspan(offset, length);
       EXPECT_EQ(crypto::crc32c(data), reference(data)) << offset << ":" << length;
     }
-    for (const std::size_t length : {255u, 256u, 257u, 4095u, 4096u, 4097u, 65535u}) {
+    // 767..769 and 24575..24577 cross the three-way block boundaries
+    // (3 x 256 and 3 x 8192 bytes) of the hardware path.
+    for (const std::size_t length : {255u, 256u, 257u, 767u, 768u, 769u, 4095u, 4096u, 4097u,
+                                     24575u, 24576u, 24577u, 50000u, 65535u, 1048576u}) {
       const auto data = std::span<const std::uint8_t>(storage).subspan(offset, length);
       EXPECT_EQ(crypto::crc32c(data), reference(data));
     }
@@ -911,6 +914,70 @@ TEST(FakeTls, Accepts16KiBRecordsIn12KiBChunks) {
   }
   EXPECT_EQ(conn.state(), FakeTlsConnection::State::Ready);
   EXPECT_EQ(plain, payload);
+}
+
+// Ready state: records are parsed straight from the input and decrypted into
+// the output buffer; any split of the input must give the same plaintext.
+TEST(FakeTls, ReadyRecordsAnySplitDecryptInPlaceOfCopy) {
+  auto hello = from_hex(kClientHelloHex);
+  auto obf = make_client_obfuscation(kSecret, 0xdddddddd, 2);
+  Bytes payload(50000);
+  for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::uint8_t>(i * 31 + 11);
+  Bytes stream = payload;
+  {
+    crypto::AesCtr c(obf.dec_key, obf.dec_iv);
+    c.skip(64);
+    c.apply(stream);
+  }
+  // Records of uneven sizes with a ChangeCipherSpec in the middle.
+  Bytes records;
+  const std::size_t sizes[] = {1, 300, 16384, 7, 9000, 2};
+  std::size_t off = 0;
+  for (std::size_t i = 0; off < stream.size(); ++i) {
+    const std::size_t n = std::min(sizes[i % 6], stream.size() - off);
+    records = cat({records, tls_wrap(0x17, std::span<const std::uint8_t>(stream).subspan(off, n))});
+    off += n;
+    if (i == 3) records = cat({records, tls_wrap(0x14, from_hex("01"))});
+  }
+  for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}, std::size_t{4096},
+                                  records.size()}) {
+    FakeTlsConnection::Config cfg;
+    cfg.secret = kSecret;
+    CountingRng rng;
+    cfg.random = rng.fn();
+    cfg.clock = [] { return kNow; };
+    FakeTlsConnection conn(cfg);
+    std::vector<std::uint8_t> to_client, plain;
+    ASSERT_EQ(conn.feed(hello, to_client, plain), Status::Ok);
+    ASSERT_NE(conn.feed(tls_wrap(0x17, obf.wire), to_client, plain), Status::ProtocolError);
+    ASSERT_EQ(conn.state(), FakeTlsConnection::State::Ready);
+    Bytes got;
+    for (std::size_t pos = 0; pos < records.size(); pos += chunk) {
+      plain.clear();
+      const auto st = conn.feed(std::span<const std::uint8_t>(records).subspan(
+                                    pos, std::min(chunk, records.size() - pos)),
+                                to_client, plain);
+      ASSERT_NE(st, Status::ProtocolError) << "chunk=" << chunk << " pos=" << pos;
+      got.insert(got.end(), plain.begin(), plain.end());
+    }
+    EXPECT_EQ(got, payload) << "chunk=" << chunk;
+    EXPECT_LT(conn.retained_bytes(), 32u * 1024u) << "chunk=" << chunk;
+    // An alert closes; nothing is accepted afterwards.
+    plain.clear();
+    EXPECT_EQ(conn.feed(tls_wrap(0x15, from_hex("0100")), to_client, plain), Status::Closed);
+    EXPECT_EQ(conn.feed(tls_wrap(0x17, from_hex("00")), to_client, plain), Status::Closed);
+  }
+  // A bad record length in the Ready state is still a protocol error.
+  FakeTlsConnection::Config cfg;
+  cfg.secret = kSecret;
+  CountingRng rng;
+  cfg.random = rng.fn();
+  cfg.clock = [] { return kNow; };
+  FakeTlsConnection conn(cfg);
+  std::vector<std::uint8_t> to_client, plain;
+  ASSERT_EQ(conn.feed(hello, to_client, plain), Status::Ok);
+  ASSERT_NE(conn.feed(tls_wrap(0x17, obf.wire), to_client, plain), Status::ProtocolError);
+  EXPECT_EQ(conn.feed(from_hex("1703030000"), to_client, plain), Status::ProtocolError);
 }
 
 // ----------------------------- transport codec -----------------------------

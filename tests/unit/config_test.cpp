@@ -39,6 +39,13 @@ TEST(Config, SuspectsAndFingerprintAreOffByDefault) {
     EXPECT_TRUE(enabled.fingerprint);
 }
 
+TEST(Config, CpuAffinityIsOnByDefaultAndCanBeDisabled) {
+    EXPECT_TRUE(mtdd::Config::parse(minimal_config(), "/work").cpu_affinity);
+    auto off = minimal_config();
+    off["cpu_affinity"] = false;
+    EXPECT_FALSE(mtdd::Config::parse(off, "/work").cpu_affinity);
+}
+
 TEST(Config, MetricsListenerDefaultsToLoopbackWithoutToken) {
     const auto config = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_EQ(config.metrics_host, "127.0.0.1");

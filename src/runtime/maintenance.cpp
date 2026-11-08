@@ -153,7 +153,7 @@ bool Runtime::Impl::budget_allows(std::size_t extra) const {
 
 std::size_t Runtime::Impl::shared_bytes() const noexcept {
     return read_buffer_.capacity() + plain_buffer_.capacity() + frame_buffer_.capacity() +
-           wire_buffer_.capacity() + to_me_buffer_.capacity();
+           wire_buffer_.capacity() + to_me_buffer_.capacity() + me_encode_buffer_.capacity();
 }
 
 void Runtime::Impl::reaccount(Client& client) {

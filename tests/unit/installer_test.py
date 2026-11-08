@@ -1133,6 +1133,51 @@ class NetTuneScriptTest(unittest.TestCase):
         # A second stop is a no-op.
         self.run_script("stop")
 
+    def test_rps_rfs_for_single_queue_nics_and_restore(self):
+        proc = self.root / "proc"
+        flows = proc / "sys/net/core/rps_sock_flow_entries"
+        flows.parent.mkdir(parents=True)
+        flows.write_text("0\n")
+        env = dict(self.env, MTDD_NETTUNE_PROC=str(proc), MTDD_NETTUNE_CPUS="2")
+        # eth0: one receive queue (virtio-like) -> RPS/RFS on all CPUs.
+        self.knob("eth0", "queues/rx-0/rps_cpus", "0")
+        self.knob("eth0", "queues/rx-0/rps_flow_cnt", "0")
+        # eth1: hardware multi-queue -> left alone.
+        self.knob("eth1", "queues/rx-0/rps_cpus", "0")
+        self.knob("eth1", "queues/rx-1/rps_cpus", "0")
+        result = subprocess.run([str(self.script), "start"], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_cpus"), "3")
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_flow_cnt"), "32768")
+        self.assertEqual(flows.read_text().strip(), "32768")
+        self.assertEqual(self.knob("eth1", "queues/rx-0/rps_cpus"), "0")
+        result = subprocess.run([str(self.script), "stop"], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_cpus"), "0")
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_flow_cnt"), "0")
+        self.assertEqual(flows.read_text().strip(), "0")
+
+    def test_rps_skipped_on_one_cpu_and_operator_masks_kept(self):
+        self.knob("eth0", "queues/rx-0/rps_cpus", "0")
+        env = dict(self.env, MTDD_NETTUNE_CPUS="1")
+        subprocess.run([str(self.script), "start"], env=env, check=True, timeout=10)
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_cpus"), "0")
+        subprocess.run([str(self.script), "stop"], env=env, check=True, timeout=10)
+        # An operator-set mask is never overwritten.
+        self.knob("eth0", "queues/rx-0/rps_cpus", "1")
+        env = dict(self.env, MTDD_NETTUNE_CPUS="4")
+        subprocess.run([str(self.script), "start"], env=env, check=True, timeout=10)
+        self.assertEqual(self.knob("eth0", "queues/rx-0/rps_cpus"), "1")
+
+    def test_cpu_mask_groups(self):
+        script = self.script.read_text()
+        for cpus, mask in (("2", "3"), ("8", "ff"), ("33", "1,ffffffff"), ("64", "ffffffff,ffffffff")):
+            out = subprocess.run(["sh", "-c", script.split("start() {")[0] + f"\ncpu_mask {cpus}\n"],
+                                 capture_output=True, text=True, timeout=10)
+            self.assertEqual(out.stdout.strip(), mask, cpus)
+
     def test_missing_knobs_and_interfaces_are_skipped(self):
         # Old kernel: the interface exists but has no NAPI deferral files.
         (self.sysfs / "class/net/eth0").mkdir(parents=True)

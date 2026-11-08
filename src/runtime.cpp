@@ -320,7 +320,11 @@ void Runtime::Impl::setup() {
         }
     }
 
-    read_buffer_.resize(detail::kReadBatch);
+    // The read buffer is charged to the relay budget (shared_bytes): the
+    // larger ME batch only where it is a negligible share of the budget.
+    read_buffer_.resize(config_.global_buffer_bytes >= 16U * detail::kMeReadBatch
+                            ? detail::kMeReadBatch
+                            : detail::kReadBatch);
     next_eof_sweep_ = Clock::now();
     next_eof_deadline_ = Time::max();
     reaccount_shared();
@@ -496,6 +500,9 @@ void Runtime::Impl::run() {
                 sweep_user_policy(now);
             }
 
+            // Requests staged for ME sockets during the previous batch, deferred
+            // closes, deadlines and housekeeping: one write per ME socket.
+            flush_pending_me(now);
             const int timeout = wait_timeout_ms(now);
             const int count = ::epoll_wait(epoll_.get(), events.data(),
                                            static_cast<int>(events.size()), timeout);
@@ -629,6 +636,10 @@ void Runtime::Impl::update_client_interest(Client& client) {
 }
 
 void Runtime::Impl::update_me_interest(MeConn& me) {
+    // Staged requests are written by flush_pending_me() before the next
+    // epoll_wait, which then sets the mask once; arming EPOLLOUT for bytes
+    // that are about to be written would cost two epoll_ctl per iteration.
+    if (me.flush_pending && me.state == MeConn::State::ready && me.fd.valid()) return;
     if (!me.fd.valid()) {
         if (me.armed != 0) {
             // The descriptor is already closed; the reactor token is removed

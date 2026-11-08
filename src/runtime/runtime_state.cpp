@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
@@ -19,6 +20,31 @@
 #include <utility>
 
 namespace mtdd {
+
+namespace {
+
+// CPUs the process may run on, in ascending order (empty when unknown).
+std::vector<int> allowed_cpus() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (::sched_getaffinity(0, sizeof(set), &set) != 0) return {};
+    std::vector<int> cpus;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+    }
+    return cpus;
+}
+
+// Best effort: a refused pin (container policy, CPU hot-unplug) only loses
+// the locality gain.
+void pin_current_thread(int cpu) noexcept {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+}
+
+}  // namespace
 
 Runtime::RuntimeState::RuntimeState(const Config& config,
                                    control::UserStore& users,
@@ -55,6 +81,7 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
         }
     }
     workers = requested;
+    cpu_affinity = config.cpu_affinity;
     // A corrupt usage file throws here (fail closed): silently starting from
     // zero would hand every user a fresh quota.
     usage_keeper = std::make_unique<control::UsageStateKeeper>(
@@ -179,10 +206,20 @@ void Runtime::RuntimeState::run_impl() {
         if (!failure) failure = std::move(error);
     };
     if (usage_keeper) usage_keeper->start();
+    // Reactor i on the i-th allowed CPU, only with one reactor per CPU at
+    // most. Every helper thread already exists, so pinning the calling thread
+    // (reactor 0) below cannot leak into threads created later.
+    std::vector<int> cpus;
+    if (cpu_affinity && workers > 1) {
+        cpus = allowed_cpus();
+        if (cpus.size() < workers) cpus.clear();
+    }
     try {
         threads.reserve(workers > 0 ? workers - 1 : 0);
         for (std::size_t index = 1; index < workers; ++index) {
-            threads.emplace_back([this, index, &record] {
+            const int cpu = cpus.empty() ? -1 : cpus[index];
+            threads.emplace_back([this, index, cpu, &record] {
+                if (cpu >= 0) pin_current_thread(cpu);
                 try {
                     reactors[index]->run();
                 } catch (...) {
@@ -199,6 +236,7 @@ void Runtime::RuntimeState::run_impl() {
         threads.clear();
         throw;
     }
+    if (!cpus.empty()) pin_current_thread(cpus.front());
     try {
         reactors.front()->run();
     } catch (...) {

@@ -140,7 +140,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
         "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds", "watch_ips",
-        "suspects", "fingerprint", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
+        "suspects", "fingerprint", "cpu_affinity", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
         "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
@@ -194,6 +194,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     config.watch_ips = networks(value, "watch_ips", {});
     config.suspects = boolean(value, "suspects", false);
     config.fingerprint = boolean(value, "fingerprint", false);
+    config.cpu_affinity = boolean(value, "cpu_affinity", true);
     config.suspect_watch_score = static_cast<std::uint32_t>(number(value, "suspect_watch_score", 60, 0, 100));
     config.suspect_ban_score = static_cast<std::uint32_t>(number(value, "suspect_ban_score", 0, 0, 100));
     config.suspect_ttl = std::chrono::hours(number(value, "suspect_ttl_hours", 168, 1, 720));

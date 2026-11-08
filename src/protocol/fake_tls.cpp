@@ -519,6 +519,82 @@ struct FakeTlsConnection::Impl {
     return Status::ProtocolError;
   }
 
+  // Validates a TLS record header (>= 5 bytes) and returns its body length.
+  Status record_header(std::span<const std::uint8_t> header, std::size_t& len) {
+    if (!is_tls_version(header.first(3))) return fail("bad TLS record version");
+    len = be16(header, 3);
+    if (len == 0 || len > cfg.max_record_body) return fail("bad TLS record length");
+    return Status::Ok;
+  }
+
+  // One complete record (header + body) after the obfuscation handshake.
+  // Application data is decrypted straight from the record into
+  // plaintext_out: no copy of the ciphertext into tls_wire/stream first.
+  Status consume_ready_record(std::span<const std::uint8_t> record,
+                              std::vector<std::uint8_t>& plaintext_out, bool& progress) {
+    const auto body = record.subspan(kTlsHeaderSize);
+    switch (record[0]) {
+      case 0x17: {
+        if (plaintext_out.size() + body.size() > cfg.max_pending_plaintext) {
+          return fail("plaintext output limit exceeded");
+        }
+        const std::size_t old = plaintext_out.size();
+        plaintext_out.resize(old + body.size());
+        decryptor->apply(body, std::span<std::uint8_t>(plaintext_out).subspan(old));
+        progress = true;
+        return Status::Ok;
+      }
+      case 0x14:
+        return Status::Ok;  // ChangeCipherSpec body is discarded.
+      case 0x15:
+        state = State::Closed;
+        return Status::Closed;
+      default:
+        return fail("unexpected TLS record type");
+    }
+  }
+
+  // Ready-state input. Whole records are parsed directly from the caller's
+  // span (normally the reactor's recv buffer); only an incomplete trailing
+  // record is buffered in tls_wire, and is completed from the next input
+  // first. Ciphertext is never copied before decryption.
+  Status feed_ready(std::span<const std::uint8_t> wire, std::vector<std::uint8_t>& plaintext_out,
+                    bool& progress) {
+    while (!tls_wire.empty() && !wire.empty()) {
+      std::size_t need = 0;
+      if (tls_wire.size() < kTlsHeaderSize) {
+        need = kTlsHeaderSize - tls_wire.size();
+      } else {
+        std::size_t len = 0;
+        if (const Status st = record_header(tls_wire, len); st != Status::Ok) return st;
+        need = kTlsHeaderSize + len - tls_wire.size();
+      }
+      const std::size_t take = std::min(need, wire.size());
+      append(tls_wire, wire.first(take));
+      wire = wire.subspan(take);
+      if (tls_wire.size() < kTlsHeaderSize) break;
+      std::size_t len = 0;
+      if (const Status st = record_header(tls_wire, len); st != Status::Ok) return st;
+      if (tls_wire.size() < kTlsHeaderSize + len) continue;
+      const Status st = consume_ready_record(tls_wire, plaintext_out, progress);
+      tls_wire.clear();
+      if (st != Status::Ok) return st;
+    }
+    std::size_t pos = 0;
+    while (wire.size() - pos >= kTlsHeaderSize) {
+      std::size_t len = 0;
+      if (const Status st = record_header(wire.subspan(pos), len); st != Status::Ok) return st;
+      if (wire.size() - pos < kTlsHeaderSize + len) break;
+      const Status st = consume_ready_record(wire.subspan(pos, kTlsHeaderSize + len), plaintext_out,
+                                             progress);
+      if (st != Status::Ok) return st;
+      pos += kTlsHeaderSize + len;
+    }
+    if (pos < wire.size()) append(tls_wire, wire.subspan(pos));
+    release_if_large(tls_wire);
+    return Status::Ok;
+  }
+
   // Consume every complete TLS record currently buffered. The caller bounds the
   // *residue* after this returns, so a recv() batch can contain many records.
   Status consume_tls_records(bool& progress, std::vector<std::uint8_t>& to_client) {
@@ -594,6 +670,15 @@ Status FakeTlsConnection::feed(std::span<const std::uint8_t> wire,
   auto& s = *impl_;
   if (s.state == State::Failed) return Status::ProtocolError;
   if (s.state == State::Closed) return Status::Closed;
+
+  // Relay hot path: records straight from `wire`, bodies decrypted directly
+  // into plaintext_out (see feed_ready).
+  if (s.state == State::Ready && s.stream.empty()) {
+    bool progress = false;
+    const Status st = s.feed_ready(wire, plaintext_out, progress);
+    if (st != Status::Ok) return st;
+    return progress ? Status::Ok : Status::NeedMoreData;
+  }
 
   // Feed arbitrarily large recv() batches in bounded internal chunks. The
   // aggregate check is on the unconsumed residue after complete records are

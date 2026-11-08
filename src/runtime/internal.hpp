@@ -46,6 +46,11 @@ namespace detail {
 // larger than 4 KiB, so a 32 KiB batch is used instead of a 4 KiB recv. It is
 // still bounded, which keeps one event from monopolising the worker.
 inline constexpr std::size_t kReadBatch = 32U * 1024U;
+// One ME read event: a ME socket multiplexes hundreds of clients, so a larger
+// batch means fewer recv() calls and more answers coalesced into each
+// client's TLS record and send (flush_s2c_batches). The read buffer is sized
+// for this; client and Direct reads stay bounded by kReadBatch.
+inline constexpr std::size_t kMeReadBatch = 256U * 1024U;
 inline constexpr std::size_t kWriteBatch = 64U * 1024U;
 // Fixed epoll wait batch. A 64-entry array forced a busy reactor back into
 // epoll_wait for every 64 ready descriptors, which starved new handshakes under
@@ -973,6 +978,10 @@ struct Runtime::Impl {
         std::size_t accounted{0};
         bool attempted{false};
         bool failure_deferred{false};
+        // Client requests were staged into `out` during this reactor
+        // iteration; the socket write happens once in flush_pending_me()
+        // before the next epoll_wait (one sendmsg for many small requests).
+        bool flush_pending{false};
         // The global relay-buffer budget refused a read event. EPOLLIN is
         // removed while set so a level-triggered reactor cannot spin on unread
         // socket data; unpause_clients_if_possible() re-arms it. Unlike a
@@ -1316,6 +1325,11 @@ struct Runtime::Impl {
     bool push_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes);
     bool push_me_frame(MeConn& me, std::vector<std::uint8_t>&& frame);
     void pump_me_out(MeConn& me);
+    // Encoded client request bytes into `out` (overflow into `frames`)
+    // without a socket write; false on an allocation failure.
+    bool stage_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes);
+    void schedule_me_flush(MeConn& me);
+    void flush_pending_me(Time now);
     void pump_me_ready_queue(MeConn& me, Time now);
     void enqueue_ready(Client& client);
     void arm_me_ready_wake(MeConn& me, Time now);
@@ -1422,6 +1436,12 @@ struct Runtime::Impl {
     std::vector<std::uint8_t> frame_buffer_;
     std::vector<std::uint8_t> wire_buffer_;
     std::vector<std::uint8_t> to_me_buffer_;
+    // Reused output of encode_client_message (no allocation per request).
+    std::vector<std::uint8_t> me_encode_buffer_;
+    // ME connections with staged, not yet written requests (by token: a
+    // connection can be retired mid-iteration).
+    std::vector<std::uint64_t> me_flush_tokens_;
+    std::vector<std::uint64_t> me_flush_batch_;
 
     std::vector<std::uint64_t> deferred_closes_;
     std::vector<std::uint64_t> deferred_me_failures_;
@@ -1501,6 +1521,8 @@ private:
 
 public:
     std::size_t workers{1};
+    // Config::cpu_affinity: reactors pin themselves at run() (run_impl).
+    bool cpu_affinity{false};
     std::shared_ptr<detail::SharedState> shared;
     std::vector<std::unique_ptr<Impl>> reactors;
     std::vector<std::thread> threads;

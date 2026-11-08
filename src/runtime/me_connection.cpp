@@ -184,6 +184,7 @@ void Runtime::Impl::fail_me(MeConn& me, Time now) {
         }
     }
     me.state = MeConn::State::backoff;
+    me.flush_pending = false;  // staged requests die with the session
     if (me.ping_token != 0) deadlines_.erase(me.ping_token);
     me.pending_pings.clear();
     me.unanswered_pings = 0;
@@ -292,7 +293,7 @@ void Runtime::Impl::handle_me(MeConn& me, std::uint32_t events, Time now) {
                 //   * budget_paused, where EPOLLIN is disarmed and no read will
                 //     ever happen, so waiting would only spin.
                 const bool batch_exhausted =
-                    (me.rx_bytes - rx_before) >= detail::kReadBatch;
+                    (me.rx_bytes - rx_before) >= detail::kReadBatch;  // incl. a budget-reduced batch
                 if (batch_exhausted && !me.budget_paused && (events & EPOLLHUP) == 0) return;
                 fail_me(me, now);
             }
@@ -325,13 +326,18 @@ void Runtime::Impl::read_me(MeConn& me, Time now) {
     } s2c_flush{*this};
     std::size_t total = 0;
     bool became_ready = false;
-    while (total < detail::kReadBatch) {
-        const std::size_t limit = detail::kReadBatch - total;
+    const std::size_t batch = std::min(detail::kMeReadBatch, read_buffer_.size());
+    while (total < batch) {
+        std::size_t limit = batch - total;
         // ME reassembly buffers (ciphertext/plaintext residue) are charged to
         // the global relay budget only after feed(); admit the worst-case
         // growth of this batch plus the shared headroom before touching the
         // socket. Without this an incomplete frame could grow past the hard
-        // envelope. Pausing is preferable to failing the shared session.
+        // envelope. Pausing is preferable to failing the shared session. A
+        // tight budget falls back to the client-sized batch before pausing.
+        if (!budget_allows(limit + detail::kBudgetHeadroom / 2)) {
+            limit = std::min(limit, detail::kReadBatch);
+        }
         if (!budget_allows(limit + detail::kBudgetHeadroom / 2)) {
             // Count only the false -> true transition: level-triggered retries
             // never reach here while paused, and a per-read counter would turn
