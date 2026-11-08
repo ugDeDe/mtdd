@@ -237,7 +237,7 @@ sudo mtdd-ctl            # меню → пункт 7 тоже умеет обн�
 | `/var/lib/mtdd/metrics-history.tsv` | История метрик для графиков (до 5000 точек) |
 | `/etc/systemd/system/mtdd.service` | Служба systemd (`LimitNOFILE=1048576`) |
 | `/etc/sysctl.d/99-mtdd-load.conf` | Параметры ядра для тысяч клиентов |
-| `mtdd-nettune.service` (`/usr/local/bin/mtdd-nettune`) | Настройка интерфейсов маршрутов по умолчанию при каждом старте: отложенные прерывания NAPI (`napi_defer_hard_irqs`, `gro_flush_timeout`), а для карт с одной очередью приёма (обычные небольшие VM с virtio-net) — RPS/RFS на все ядра. Меняет только значения ядра по умолчанию и возвращает их при остановке |
+| `mtdd-nettune.service` (`/usr/local/bin/mtdd-nettune`) | Настройка интерфейсов маршрутов по умолчанию при каждом старте: отложенные прерывания NAPI (`napi_defer_hard_irqs`, `gro_flush_timeout`). Меняет только значения ядра по умолчанию и возвращает их при остановке |
 
 Установщик при каждой установке и обновлении настраивает ядро под большое число
 клиентов: очереди приёма (`somaxconn`, `tcp_max_syn_backlog`, `netdev_max_backlog`),
@@ -489,7 +489,7 @@ ClientHello (SNI, шаблон), проверка секрета, маскиро
 | `handshake_timeout_seconds`, `idle_timeout_seconds` | Тайм-аут рукопожатия и простоя соединения |
 | `client_keepalive_seconds`, `client_ack_timeout_seconds` | TCP keepalive (по умолчанию 60 с) и `TCP_USER_TIMEOUT` (90 с) для клиентских сокетов: пропавшие клиенты закрываются ядром, а не через `idle_timeout`. `0` отключает |
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
-| `cpu_affinity` | Закрепить reactor *i* за *i*-м доступным ядром, если reactors не больше ядер (по умолчанию `true`): с RFS пакеты соединения обрабатываются на ядре его reactor |
+| `cpu_affinity` | Закрепить reactor *i* за *i*-м доступным ядром, если reactors не больше ядер (по умолчанию `true`) |
 | `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 16 |
 | `me_clients_per_writer` | Целевой порог клиентов для роста пула, по умолчанию 400 |
 | | `me_clients_per_writer` и `me_connections_per_dc` применяются без обрыва клиентов командой `systemctl reload mtdd`; остальные параметры требуют перезапуска |
