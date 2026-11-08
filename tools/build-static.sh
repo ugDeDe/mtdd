@@ -101,10 +101,12 @@ CURL_TARBALL=curl-$CURL_VERSION.tar.xz
 CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
 CURL_URL=https://github.com/curl/curl/releases/download/curl-8_23_0/$CURL_TARBALL
 
-# Optional allocator: MTDD_STATIC_MIMALLOC=1 links mimalloc's override object
-# ahead of musl libc, replacing musl's mallocng (which unmaps freed groups
-# eagerly and showed ~1k mmap/munmap per second under relay load).
-MIMALLOC=${MTDD_STATIC_MIMALLOC:-0}
+# Allocator: mimalloc's override object is linked ahead of musl libc by
+# default, replacing musl's mallocng — a global malloc lock (futex between
+# reactors) and freed groups unmapped eagerly (~1k mmap/munmap per second
+# under relay load, with page zeroing and TLB shootdowns in the kernel).
+# MTDD_STATIC_MIMALLOC=0 builds with musl malloc.
+MIMALLOC=${MTDD_STATIC_MIMALLOC:-1}
 MIMALLOC_VERSION=2.1.7
 MIMALLOC_TARBALL=mimalloc-$MIMALLOC_VERSION.tar.gz
 MIMALLOC_SHA256=0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d
