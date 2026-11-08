@@ -957,7 +957,8 @@ print("  Всего: {} · по числу совпадений: {} · под н
     ", ".join("{}×{}".format(k, by[k]) for k in sorted(by, key=int, reverse=True)) or "—",
     data.get("watched", 0), data.get("shadow_banned", 0)))
 if not rows:
-    print("  Подозрительных адресов нет")
+    print("  Подозрительных адресов нет. Учёт выключен по умолчанию: \"suspects\": true")
+    print("  в /etc/mtdd/config.json включает его (\"fingerprint\": true — ещё и платформу по SYN и TLS).")
     sys.exit(0)
 
 

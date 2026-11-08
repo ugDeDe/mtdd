@@ -255,7 +255,7 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     // (setup()) and inherited by every accepted socket: no per-connection
     // setsockopt calls on the accept path.
     owned->peer = *protocol_peer;
-    {
+    if (config_.fingerprint) {
         std::array<std::uint8_t, 128> syn{};
         socklen_t length = sizeof(syn);
         if (::getsockopt(owned->fd.get(), IPPROTO_TCP, TCP_SAVED_SYN, syn.data(), &length) == 0) {
@@ -504,7 +504,9 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
             // E: someone who knows our domain but not a valid secret.
             const auto sni = protocol::client_hello_sni(record);
             const bool ours = sni && !domain_for_sni(*sni).empty();
-            client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+            if (config_.fingerprint) {
+                client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+            }
             suspect(client, ours ? control::SuspectSignal::wrong_secret : control::SuspectSignal::junk,
                     sni ? std::string_view(*sni) : std::string_view{});
         }
@@ -558,7 +560,9 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     }
 
     if (client.phase != Client::Phase::tls_hello) return;
-    client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+    if (config_.fingerprint) {
+        client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+    }
     client.user_name = user->name;
     client.auth_at = now;
     client.canary = user->policy.canary;

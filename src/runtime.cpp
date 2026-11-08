@@ -262,7 +262,7 @@ void Runtime::Impl::setup() {
     (void)io::set_tcp_nodelay(listener_.get());
     // Keep each connection's SYN for the platform fingerprint (read once in
     // make_client; the kernel frees it on read or close).
-    {
+    if (config_.fingerprint) {
         const int enable = 1;
         (void)::setsockopt(listener_.get(), IPPROTO_TCP, TCP_SAVE_SYN, &enable, sizeof(enable));
     }

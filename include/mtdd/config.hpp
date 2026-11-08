@@ -77,12 +77,18 @@ struct Config {
     // first bytes, ClientHello, auth result, masking, DC, auth_key_id,
     // MTProto frames, close reason and kernel byte counts. Empty = off.
     std::vector<std::string> watch_ips;
+    // Client fingerprint: each accepted SYN is kept (TCP_SAVE_SYN) and read
+    // back, and the ClientHello is classified, to name the platform of a
+    // device or suspect (Android/Apple/Windows/Linux). Off by default: it costs
+    // a getsockopt and a parse per connection; without it platforms are
+    // "Undefined".
+    bool fingerprint{false};
     // Suspicious-behaviour detection (GET /v1/suspects, mtdd-ctl suspects).
-    // Addresses at or above suspect_watch_score get the watch_ips log
-    // automatically (0 = never). At or above suspect_ban_score their
-    // connections go to masking even with a valid secret (0 = off). Idle
-    // entries are dropped after suspect_ttl.
-    bool suspects{true};
+    // Off by default. Addresses at or above suspect_watch_score get the
+    // watch_ips log automatically (0 = never). At or above suspect_ban_score
+    // their connections go to masking even with a valid secret (0 = off).
+    // Idle entries are dropped after suspect_ttl.
+    bool suspects{false};
     std::uint32_t suspect_watch_score{60};
     std::uint32_t suspect_ban_score{0};
     std::chrono::hours suspect_ttl{168};

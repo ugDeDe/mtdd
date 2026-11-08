@@ -27,6 +27,18 @@ TEST(Config, MinimalConfigHasUnlimitedConnectionDefaults) {
     EXPECT_EQ(config.ad_tag.back(), 0xff);
 }
 
+TEST(Config, SuspectsAndFingerprintAreOffByDefault) {
+    const auto config = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_FALSE(config.suspects);
+    EXPECT_FALSE(config.fingerprint);
+    auto on = minimal_config();
+    on["suspects"] = true;
+    on["fingerprint"] = true;
+    const auto enabled = mtdd::Config::parse(on, "/work");
+    EXPECT_TRUE(enabled.suspects);
+    EXPECT_TRUE(enabled.fingerprint);
+}
+
 TEST(Config, MetricsListenerDefaultsToLoopbackWithoutToken) {
     const auto config = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_EQ(config.metrics_host, "127.0.0.1");

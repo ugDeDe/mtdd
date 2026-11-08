@@ -842,7 +842,10 @@ Bytes random_header() {
 TEST(Suspects, SecretTextPortCheckAndJunkAreRecorded) {
     EchoBackend echo;
     SuspectMaskingScope masking(echo.port());
-    Daemon daemon(1, false);
+    Daemon daemon(1, false, [](mtdd::Config& config) {
+        config.suspects = true;
+        config.fingerprint = true;  // SYN layout below
+    });
     const std::string secret = "eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275";
     send_raw_probe(daemon.port(), Bytes(secret.begin(), secret.end()));
     EXPECT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::secret_text); }, 3s));
@@ -867,6 +870,7 @@ TEST(Suspects, ProbeSessionAndMultiModeFromOneAddress) {
     EchoBackend echo;
     SuspectMaskingScope masking(echo.port());
     Daemon daemon(1, true, [](mtdd::Config& config) {
+        config.suspects = true;
         enable_policy_direct(config);
         config.direct_fallback_dcs = {1};
     });
@@ -915,6 +919,7 @@ TEST(Suspects, CanaryUserThenShadowBanSendsValidSecretToMasking) {
     EchoBackend echo;
     SuspectMaskingScope masking(echo.port());
     Daemon daemon(1, true, [](mtdd::Config& config) {
+        config.suspects = true;
         enable_policy_direct(config);
         config.masking = true;
         config.suspect_ban_score = 50;
@@ -947,7 +952,10 @@ TEST(Suspects, CrossingTheWatchScoreLogsAndDisabledDetectionRecordsNothing) {
     const std::string secret = "eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275";
     testing::internal::CaptureStderr();
     {
-        Daemon daemon(1, false, [](mtdd::Config& config) { config.suspect_watch_score = 30; });
+        Daemon daemon(1, false, [](mtdd::Config& config) {
+            config.suspects = true;
+            config.suspect_watch_score = 30;
+        });
         send_raw_probe(daemon.port(), Bytes(secret.begin(), secret.end()));
         ASSERT_TRUE(wait_for([&] { return suspect_has(daemon, SuspectSignal::secret_text); }, 3s));
         // Known now: the next connection is logged stage by stage.
@@ -1038,7 +1046,10 @@ TEST(Suspects, WatchBudgetAndScoreAwareEviction) {
 TEST(Suspects, RealClientRacingConnectionsIsNotASuspect) {
     mtdd::test::FakeDirectDc dc(2);
     PolicyDirectEndpointScope endpoint(dc.port());
-    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        config.suspects = true;
+        enable_policy_direct(config);
+    });
     ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
     ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
     TestClient winner(daemon.port(), secret_bytes());
@@ -1077,6 +1088,7 @@ TEST(Suspects, NewClientKeyCreationClearsLosingRaceConnection) {
     mtdd::test::FakeDirectDc dc(1);
     PolicyDirectEndpointScope endpoint(dc.port());
     Daemon daemon(1, true, [](mtdd::Config& config) {
+        config.suspects = true;
         enable_policy_direct(config);
         config.direct_fallback_dcs = {1};
     });
@@ -1131,7 +1143,10 @@ TEST(Suspects, RealClientOnDc2ProbeIsNotFlagged) {
     // race loser) is never a probe_session, so it is never a suspect.
     mtdd::test::FakeDirectDc dc(2);
     PolicyDirectEndpointScope endpoint(dc.port());
-    Daemon daemon(1, true, [](mtdd::Config& config) { enable_policy_direct(config); });
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        config.suspects = true;
+        enable_policy_direct(config);
+    });
     ASSERT_TRUE(add_policy_user(daemon, mtdd::control::UserPolicy{}));
     ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
     {
