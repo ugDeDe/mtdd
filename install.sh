@@ -2877,6 +2877,8 @@ PY
 # остановке возвращает только то, что поставила сама. Отключение:
 # systemctl disable --now mtdd-nettune.
 tune_network() {
+    local was_installed=0
+    [[ -f $MTDD_NETTUNE_UNIT ]] && was_installed=1
     step 'Настраиваю обработку сетевых прерываний (mtdd-nettune)…'
     install -d -m 0755 "$(dirname "$MTDD_NETTUNE")" /etc/systemd/system
     install -m 0755 /dev/stdin "$MTDD_NETTUNE" <<'NETTUNE'
@@ -2937,7 +2939,9 @@ cpu_mask() {
 }
 
 start() {
-    mkdir -p "$STATE" && : > "$STATE/restore" || exit 0
+    # The journal is appended to, never truncated: a second start without a
+    # stop must not lose the record of what the first one changed.
+    mkdir -p "$STATE" && touch "$STATE/restore" || exit 0
     cpus=$(online_cpus)
     rfs=0
     for dev in $(ifaces); do
@@ -3004,6 +3008,12 @@ ExecStop=$MTDD_NETTUNE stop
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload 2>/dev/null || true
+    # Operator opt-out (systemctl disable --now mtdd-nettune) survives updates:
+    # an already installed but disabled tuner is left off.
+    if ((was_installed)) && ! systemctl is-enabled --quiet "$MTDD_NETTUNE_SERVICE" 2>/dev/null; then
+        step 'mtdd-nettune выключен оператором — оставляю выключенным'
+        return 0
+    fi
     # restart = stop (restore) + start (apply), so an update re-evaluates.
     if ! { systemctl enable "$MTDD_NETTUNE_SERVICE" >/dev/null 2>&1 &&
            systemctl restart "$MTDD_NETTUNE_SERVICE" >/dev/null 2>&1; }; then

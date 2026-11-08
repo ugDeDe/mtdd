@@ -44,6 +44,18 @@ bool ascii_iequals(std::string_view a, std::string_view b) {
   return true;
 }
 
+// Capacity for `needed` bytes before any mutation (pre-crypto allocation
+// guarantee). Answers are appended to one batch many times per ME read; an
+// exact reserve() reallocated and copied the whole accumulated prefix on every
+// append (quadratic). Grow by at least half, but never by more than 128 KiB of
+// slack beyond what is needed.
+void reserve_growing(Bytes& b, std::size_t needed) {
+  if (needed <= b.capacity()) return;
+  constexpr std::size_t kMaxSlack = 128u * 1024u;
+  const std::size_t grown = b.capacity() + b.capacity() / 2;
+  b.reserve(std::max(needed, std::min(grown, needed + kMaxSlack)));
+}
+
 void release_if_large(Bytes& b) {
   if (b.capacity() > 64u * 1024u && b.empty()) Bytes().swap(b);
 }
@@ -755,7 +767,7 @@ Status FakeTlsConnection::send(std::span<const std::uint8_t> plaintext,
     alias_copy.assign(plaintext.begin(), plaintext.end());
     plaintext = alias_copy;
   }
-  to_client.reserve(to_client.size() + plaintext.size() + records * kTlsHeaderSize);
+  reserve_growing(to_client, to_client.size() + plaintext.size() + records * kTlsHeaderSize);
   std::size_t off = 0;
   if (const std::size_t room = open_record_room(to_client, open_record, kMaxBody);
       room != 0 && !plaintext.empty()) {
@@ -821,7 +833,7 @@ Status FakeTlsConnection::send_transport_message(ProtoTag tag,
   if (frame_size > available || records > (available - frame_size) / kTlsHeaderSize) {
     throw std::length_error("FakeTLS output too large");
   }
-  to_client.reserve(to_client.size() + frame_size + records * kTlsHeaderSize);
+  reserve_growing(to_client, to_client.size() + frame_size + records * kTlsHeaderSize);
 
   // The intermediate transport frame is [u32 len][payload][padding]; copy any
   // slice of that virtual frame into a TLS record body without materializing it.

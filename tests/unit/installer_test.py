@@ -1178,9 +1178,74 @@ class NetTuneScriptTest(unittest.TestCase):
                                  capture_output=True, text=True, timeout=10)
             self.assertEqual(out.stdout.strip(), mask, cpus)
 
+    def test_second_start_keeps_the_restore_journal(self):
+        self.knob("eth0", "napi_defer_hard_irqs", "0")
+        self.knob("eth0", "gro_flush_timeout", "0")
+        self.run_script("start")
+        self.run_script("start")  # e.g. a manual run without stop
+        self.run_script("stop")
+        self.assertEqual(self.knob("eth0", "napi_defer_hard_irqs"), "0")
+        self.assertEqual(self.knob("eth0", "gro_flush_timeout"), "0")
+
     def test_missing_knobs_and_interfaces_are_skipped(self):
         # Old kernel: the interface exists but has no NAPI deferral files.
         (self.sysfs / "class/net/eth0").mkdir(parents=True)
         self.run_script("start")
         self.assertFalse((self.sysfs / "class/net/eth0/napi_defer_hard_irqs").exists())
         self.run_script("stop")
+
+
+class NetTuneOptOutTest(unittest.TestCase):
+    """tune_network() of install.sh against fake /etc and systemctl."""
+
+    def setUp(self):
+        if not shutil.which("unshare") or subprocess.run(
+                ["unshare", "-Ur", "-m", "true"], capture_output=True).returncode:
+            self.skipTest("unprivileged mount namespaces unavailable")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        for name in ("etc/systemd/system", "bin", "commands"):
+            (self.root / name).mkdir(parents=True)
+        self.log = self.root / "systemctl.log"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_tune(self, enabled):
+        systemctl = self.root / "commands/systemctl"
+        systemctl.write_text(
+            "#!/bin/sh\n"
+            f"echo \"$*\" >> {self.log}\n"
+            f"case \"$1\" in is-enabled) exit {0 if enabled else 1} ;; esac\n"
+            "exit 0\n")
+        systemctl.chmod(0o755)
+        env = dict(os.environ, PATH=f"{self.root / 'commands'}:/usr/bin:/bin", TERM="dumb",
+                   MTDD_TEST_ROOT=str(self.root), MTDD_TEST_INSTALLER=str(INSTALLER),
+                   MTDD_INSTALLER_SOURCE_ONLY="1")
+        script = r'''
+set -eu
+mount --bind "$MTDD_TEST_ROOT/etc" /etc
+mount --bind "$MTDD_TEST_ROOT/bin" /usr/local/bin
+source "$MTDD_TEST_INSTALLER"
+tune_network
+'''
+        result = subprocess.run(["unshare", "-Ur", "-m", "bash", "-c", script], env=env,
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.log.read_text() if self.log.exists() else ""
+
+    def test_fresh_install_enables(self):
+        calls = self.run_tune(enabled=False)
+        self.assertIn("enable mtdd-nettune.service", calls)
+        self.assertIn("restart mtdd-nettune.service", calls)
+
+    def test_update_keeps_operator_opt_out(self):
+        (self.root / "etc/systemd/system/mtdd-nettune.service").write_text("[Unit]\n")
+        calls = self.run_tune(enabled=False)
+        self.assertNotIn("enable mtdd-nettune.service", calls)
+        self.assertNotIn("restart mtdd-nettune.service", calls)
+
+    def test_update_of_enabled_tuner_restarts_it(self):
+        (self.root / "etc/systemd/system/mtdd-nettune.service").write_text("[Unit]\n")
+        calls = self.run_tune(enabled=True)
+        self.assertIn("restart mtdd-nettune.service", calls)

@@ -180,6 +180,52 @@ TEST(FakeTlsSend, OpenRecordCoalescingKeepsTheDecryptedStreamIdentical) {
     EXPECT_EQ(fresh.size(), 9u);
 }
 
+TEST(FakeTlsSend, BatchCapacityGrowsGeometricallyAndStreamIsIntact) {
+    // 256 small answers coalesced into one batch: the output must not be
+    // reallocated (and its prefix copied) on every append.
+    auto conn = ready_fake_tls();
+    std::uint8_t state = 3;
+    const protocol::RandomFn random([&state](std::span<std::uint8_t> out) {
+        for (auto& byte : out) byte = state++;
+    });
+    Bytes batch;
+    std::size_t open = protocol::FakeTlsConnection::kNoOpenRecord;
+    std::size_t reallocations = 0;
+    Bytes expected;
+    for (std::size_t index = 0; index < 256; ++index) {
+        Bytes payload(256);
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = static_cast<std::uint8_t>(i * 7 + index);
+        }
+        const std::size_t before = batch.capacity();
+        ASSERT_EQ(conn.send_transport_message(protocol::ProtoTag::Secure, payload, batch, random,
+                                              &open),
+                  protocol::Status::Ok);
+        if (batch.capacity() != before) ++reallocations;
+    }
+    EXPECT_LE(reallocations, 16u);
+    // Slack stays bounded.
+    EXPECT_LE(batch.capacity() - batch.size(), 128u * 1024u + 16u * 1024u);
+    auto decryptor = fake_tls_client_decryptor();
+    std::size_t records = 0;
+    const Bytes stream = decode_records(batch, decryptor, records);
+    // Each secure frame: 4-byte length, payload, 0..15 padding bytes.
+    std::size_t pos = 0;
+    for (std::size_t index = 0; index < 256; ++index) {
+        ASSERT_LE(pos + 4, stream.size());
+        const std::uint32_t len = static_cast<std::uint32_t>(stream[pos]) |
+                                  (static_cast<std::uint32_t>(stream[pos + 1]) << 8) |
+                                  (static_cast<std::uint32_t>(stream[pos + 2]) << 16) |
+                                  (static_cast<std::uint32_t>(stream[pos + 3]) << 24);
+        ASSERT_GE(len, 256u) << index;
+        for (std::size_t i = 0; i < 256; ++i) {
+            ASSERT_EQ(stream[pos + 4 + i], static_cast<std::uint8_t>(i * 7 + index)) << index;
+        }
+        pos += 4 + len;
+    }
+    EXPECT_EQ(pos, stream.size());
+}
+
 TEST(FakeTlsSend, AliasedInputSurvivesOutputReallocation) {
     auto connection = ready_fake_tls();
     auto decryptor = fake_tls_client_decryptor();
