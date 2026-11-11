@@ -13,15 +13,20 @@
 #include "mtdd/runtime.hpp"
 #include "mtdd/runtime_support.hpp"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <mtdd/usage_state.hpp>
+
 #include <optional>
 #include <span>
 #include <string>
@@ -41,6 +46,11 @@ namespace detail {
 // larger than 4 KiB, so a 32 KiB batch is used instead of a 4 KiB recv. It is
 // still bounded, which keeps one event from monopolising the worker.
 inline constexpr std::size_t kReadBatch = 32U * 1024U;
+// One ME read event: a ME socket multiplexes hundreds of clients, so a larger
+// batch means fewer recv() calls and more answers coalesced into each
+// client's TLS record and send (flush_s2c_batches). The read buffer is sized
+// for this; client and Direct reads stay bounded by kReadBatch.
+inline constexpr std::size_t kMeReadBatch = 256U * 1024U;
 inline constexpr std::size_t kWriteBatch = 64U * 1024U;
 // Fixed epoll wait batch. A 64-entry array forced a busy reactor back into
 // epoll_wait for every 64 ready descriptors, which starved new handshakes under
@@ -54,6 +64,9 @@ inline constexpr std::size_t kAcceptBatch = 128;
 // on the reactor at TTL expiry is an acceptable trade-off (documented).
 inline constexpr std::chrono::seconds kFallbackResolveTtl{300};
 inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
+// A client's coalesced ME answers are handed to its queue once they reach this
+// size even before the ME read ends, bounding the per-read staging copy.
+inline constexpr std::size_t kS2cBatchFlushBytes = 128U * 1024U;
 
 // Releases a worker scratch buffer that grew for one large frame.
 inline void trim_buffer(std::vector<std::uint8_t>& buffer) {
@@ -95,6 +108,8 @@ inline constexpr std::size_t kMePendingBatch = 4;
 // reached over several ticks, and a synchronously failing endpoint cannot turn
 // one call into a connect storm.
 inline constexpr std::size_t kMeDialBatch = 4;
+// TCP_USER_TIMEOUT for ME sockets (milliseconds).
+inline constexpr unsigned kMeUserTimeoutMs = 30000;
 
 // Bound for configured reactors. Fixed-size statistic arrays use the same cap.
 inline constexpr std::size_t kMaxWorkers = 256;
@@ -120,6 +135,10 @@ inline constexpr std::chrono::milliseconds kPollInterval{150};
 // by the 150 ms housekeeping tick and by an earlier exact EOF deadline, so an
 // EOF close is bounded by this cadence without scanning every epoll batch.
 inline constexpr std::chrono::milliseconds kEofSweepInterval{150};
+
+// After the client's read EOF, how long a session whose only pending work is
+// an unanswered ME request is kept for that reply.
+inline constexpr std::chrono::milliseconds kEofReplyGrace{2000};
 
 // After this much inactivity a client releases its empty per-connection
 // buffers (output block, TLS/decoder reassembly capacity, staged TLS wire).
@@ -195,6 +214,9 @@ struct DirectEndpointOverride {
     std::uint16_t port{443};
 };
 void set_direct_endpoint_override(std::optional<DirectEndpointOverride> value);
+// Test-only: every automatic masking target (SNI name or tls_domain) dials
+// this endpoint instead, so tests never resolve or reach the real domain.
+void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value);
 
 // Test-only fault injection. Production never calls these; they let the local
 // tests prove failure paths without touching sockets or real crypto.
@@ -305,6 +327,17 @@ using ConnId = protocol::MiddleEndSession::ConnId;
 // are ignored. Native IPv6 stays distinct.
 using IpKey = std::array<std::uint8_t, 16>;
 
+// Unique-IP counting key: IPv4 and IPv4-mapped addresses stay as they are; any
+// other IPv6 address collapses to its /64, because privacy-address rotation
+// hands one device many interface identifiers inside one prefix. Applied only
+// at the counting boundary (make_ip_key), never to the stored peer address.
+inline IpKey collapse_ip_key(IpKey key) noexcept {
+    constexpr std::array<std::uint8_t, 12> mapped_prefix{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::equal(mapped_prefix.begin(), mapped_prefix.end(), key.begin())) return key;
+    std::fill(key.begin() + 8, key.end(), std::uint8_t{0});
+    return key;
+}
+
 struct IpKeyHash {
     std::size_t operator()(const IpKey& key) const noexcept {
         std::uint64_t hash = 0xcbf29ce484222325ULL;
@@ -363,6 +396,210 @@ private:
         order_;
 };
 
+// Coarse client platform (see platform.cpp for the reference fingerprints).
+enum class Platform : std::uint8_t { undefined, apple, android, linux_desktop, windows };
+enum class SynLayout : std::uint8_t { other, linux_stack, apple_stack, windows_stack };
+enum class TlsTemplate : std::uint8_t { other, safari, chrome };
+struct SynPrint {
+    bool valid{false};
+    std::uint8_t ttl{0};
+    std::uint16_t window{0};
+    std::uint16_t mss{0};
+    std::int8_t wscale{-1};
+    bool timestamps{false};
+    SynLayout layout{SynLayout::other};
+};
+const char* platform_name(Platform platform) noexcept;
+// `syn` is what TCP_SAVED_SYN returns: the IP header followed by the TCP header.
+SynPrint parse_saved_syn(std::span<const std::uint8_t> syn) noexcept;
+// `record` is the whole ClientHello TLS record, header included.
+TlsTemplate classify_client_hello(std::span<const std::uint8_t> record) noexcept;
+Platform classify_platform(const SynPrint& syn, TlsTemplate tls) noexcept;
+
+// Config::watch_ips entry: IPv4 is stored IPv4-mapped, its prefix offset by 96.
+struct WatchNet {
+    std::array<std::uint8_t, 16> address{};
+    std::uint8_t prefix{128};
+};
+std::optional<WatchNet> parse_watch_net(std::string_view text);
+bool watch_net_contains(const WatchNet& net, const protocol::Endpoint& peer) noexcept;
+
+// Per-IP suspicious-behaviour table (suspects.cpp), shared by all reactors.
+// Touched on connection events only (accept, handshake outcome, close), never
+// per packet. Sharded by address; bounded with FIFO eviction.
+class SuspectTable {
+public:
+    using Clock = std::chrono::steady_clock;
+    using Signal = control::SuspectSignal;
+    struct Context {
+        const protocol::Endpoint* peer{nullptr};
+        const SynPrint* syn{nullptr};
+        Platform platform{Platform::undefined};
+        TlsTemplate tls{TlsTemplate::other};
+        std::string_view user;
+        std::string_view sni;
+    };
+    struct Recorded {
+        double score{0};
+        std::uint32_t matches{0};
+        bool crossed_watch{false};  // first time at or above the watch score
+        std::string signals;        // "probe_session,raw_obfuscated2"
+    };
+    struct Seen {
+        bool known{false};
+        double score{0};
+        bool repeat_visit{false};  // this accept starts another short visit (G)
+    };
+
+    explicit SuspectTable(std::size_t capacity = 65536);
+    // A connection from `peer` presented a non-zero auth_key_id: a real
+    // client. Lock-free hashed slot, plus a flag on an existing entry.
+    void mark_real(const protocol::Endpoint& peer, Clock::time_point now);
+    bool recently_real(const protocol::Endpoint& peer, Clock::time_point now) const noexcept;
+    // Global budget for automatic per-stage logging: false once
+    // kWatchPerMinute connections were put under watch this minute.
+    bool watch_budget(Clock::time_point now) noexcept;
+    Recorded record(const Context& context, Signal signal, Clock::time_point now,
+                    std::int64_t unix_now, double watch_score);
+    // An accepted connection: counts visits of known addresses, returns the
+    // current score. Never creates an entry.
+    Seen accept(const protocol::Endpoint& peer, Clock::time_point now);
+    double score(const protocol::Endpoint& peer, Clock::time_point now);
+    // Multi-mode correlation (D): a FakeTLS session authenticated at
+    // `auth_at` and closing now; true when the same address sent raw
+    // obfuscated2 within 3 s of it. Also records the session length (G).
+    bool close_session(const protocol::Endpoint& peer, Clock::time_point auth_at,
+                       Clock::time_point now);
+    std::vector<control::Statistics::SuspectInfo> list(Clock::time_point now,
+                                                       std::int64_t unix_now,
+                                                       double watch_score, double ban_score);
+    void prune(Clock::time_point now, std::chrono::hours ttl);
+    static double score_of(const std::array<std::uint32_t, control::kSuspectSignals>& hits,
+                           double age_hours, bool real = false) noexcept;
+    static constexpr std::uint32_t kWatchPerMinute = 30;
+    static constexpr std::size_t kRealSlots = 1U << 16;
+
+private:
+    struct Entry {
+        std::array<std::uint32_t, control::kSuspectSignals> hits{};
+        Clock::time_point first{};
+        Clock::time_point last{};
+        Clock::time_point last_visit{};
+        Clock::time_point last_raw{};       // last raw obfuscated2 (C)
+        std::int64_t first_unix{0};
+        std::int64_t last_unix{0};
+        std::uint32_t visits{0};
+        std::chrono::seconds longest_session{0};
+        std::uint64_t sequence{0};
+        bool watch_reported{false};
+        bool real{false};
+        protocol::Endpoint peer{};
+        SynPrint syn{};
+        Platform platform{Platform::undefined};
+        TlsTemplate tls{TlsTemplate::other};
+        std::string user;
+        std::string sni;
+    };
+    struct Shard {
+        std::mutex mutex;
+        std::unordered_map<IpKey, Entry, IpKeyHash> entries;
+        std::deque<std::pair<IpKey, std::uint64_t>> order;
+        std::uint64_t sequence{0};
+    };
+    static constexpr std::size_t kShards = 16;
+    Shard& shard_for(const IpKey& key) noexcept;
+    std::size_t per_shard_;
+    std::array<Shard, kShards> shards_;
+    // (32-bit address tag << 32) | minute of the last real session.
+    std::unique_ptr<std::atomic<std::uint64_t>[]> real_;
+    std::atomic<std::int64_t> watch_minute_{0};
+    std::atomic<std::uint32_t> watch_used_{0};
+};
+IpKey suspect_key(const protocol::Endpoint& peer) noexcept;
+
+// What a non-TLS first segment looks like (B, C or H).
+enum class RawProbe : std::uint8_t { secret_text, raw_obfuscated2, junk };
+RawProbe classify_raw_probe(std::span<const std::uint8_t> bytes) noexcept;
+// `name` is `domain` or a subdomain of it (case-insensitive, trailing dot ok).
+bool domain_covers(std::string_view name, std::string_view domain);
+
+// Leading client frames inspected for a non-zero auth_key_id. Key exchange
+// (auth_key_id 0) takes a few frames; nothing after the first key is read.
+inline constexpr std::uint8_t kDeviceScanFrames = 16;
+
+// Per-user device table for max_devices. A device is identified by the MTProto
+// auth_key_id its connections present, per signed DC (Android keeps a separate
+// temporary key for media DCs). One app installation keeps one current key per
+// signed DC, so the device count is the maximum over DCs. Only keys with an
+// open connection hold a slot against the limit: over the limit, the least
+// recently seen idle key is displaced, so a device that disconnected frees its
+// slot at once and a rotated temporary key does not lock its own device out.
+// Idle keys stay listed (and counted in the gauge) for `window`. Touched once
+// per connection (admit/release) and by a periodic prune, never per packet.
+
+class DeviceTable {
+public:
+    using Clock = std::chrono::steady_clock;
+    enum class Admit : std::uint8_t { ok, limit };
+    // Max over DCs of the listed keys, and of the keys with an open connection.
+    struct Count {
+        std::uint64_t recent{0};
+        std::uint64_t connected{0};
+    };
+
+    Admit admit(const std::string& user, std::int16_t dc, std::uint64_t key,
+                const protocol::Endpoint& peer, Platform platform, std::uint32_t max_devices,
+                Clock::time_point now,
+                std::chrono::seconds window, Count& devices);
+    void release(const std::string& user, std::int16_t dc, std::uint64_t key,
+                 Clock::time_point now, std::chrono::seconds window, Count& devices);
+    // The keys of one user, for GET /v1/users/{name}/devices.
+    std::vector<control::Statistics::DeviceInfo> list(const std::string& user,
+                                                      Clock::time_point now,
+                                                      std::chrono::seconds window);
+    // Drops expired keys; reports the device count of every known user.
+    void prune(Clock::time_point now, std::chrono::seconds window,
+               std::vector<std::pair<std::string, Count>>& counts);
+
+private:
+    struct Key {
+        std::uint64_t auth_key_id{0};
+        std::int16_t dc{0};
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const noexcept {
+            return static_cast<std::size_t>(key.auth_key_id ^
+                                            (static_cast<std::uint64_t>(
+                                                 static_cast<std::uint16_t>(key.dc)) *
+                                             0x9e3779b97f4a7c15ULL));
+        }
+    };
+    struct Entry {
+        std::uint32_t open{0};
+        Clock::time_point last{};
+        protocol::Endpoint peer{};
+        Platform platform{Platform::undefined};
+    };
+    using Keys = std::unordered_map<Key, Entry, KeyHash>;
+    // Keys of one user plus per-DC counts kept incrementally: admit/release
+    // run on every connection and must not scan all keys of the user (a
+    // shared pool user holds tens of thousands of them). Expired idle keys
+    // are dropped by the periodic prune() (and list()); between prunes the
+    // "recent" count may still include keys expired since the last pass.
+    struct UserKeys {
+        Keys keys;
+        std::unordered_map<std::int16_t, Count> per_dc;
+    };
+    static void account(UserKeys& user, std::int16_t dc, const Entry& entry, bool add);
+    static void erase_key(UserKeys& user, Keys::iterator it);
+    static Count total(const UserKeys& user);
+    static Count prune_locked(UserKeys& user, Clock::time_point now, std::chrono::seconds window);
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, UserKeys> users_;
+};
+
 // State shared by all reactors. Hot-path relay traffic never touches this
 // object; only admission (connection/handshake reservation, replay cache,
 // unique-IP accounting) and shutdown coordination do.
@@ -372,6 +609,31 @@ struct SharedState {
           worker_budget(budget_per_worker) {}
 
     std::atomic<bool> stop{false};
+    // Live-reloadable ME pool tunables (Runtime::set_tunables). Reactors pick
+    // them up on their housekeeping tick when the generation changes.
+    std::atomic<std::uint32_t> me_clients_per_writer{0};
+    std::atomic<std::uint32_t> me_connections_per_dc{0};
+    std::atomic<std::uint64_t> tunables_generation{0};
+    // Live ad-tag override (Runtime::set_ad_tag). The value is read under the
+    // mutex only when the generation changed, never per relayed packet.
+    std::mutex ad_tag_mutex;
+    std::array<std::uint8_t, 16> ad_tag{};
+    std::atomic<std::uint64_t> ad_tag_generation{0};
+    // Media shaping (signed DC < 0, server-to-client bytes), bytes/s; 0 = off.
+    // A limit is split evenly over the currently active media connections
+    // (per user, and process-wide for the total cap).
+    std::atomic<std::uint64_t> media_user_rate{0};
+    std::atomic<std::uint64_t> media_total_rate{0};
+    std::atomic<std::int64_t> active_media_total{0};
+    std::atomic<std::uint64_t> active_media_generation{0};
+    void set_media_rates(std::uint64_t user_rate, std::uint64_t total_rate) noexcept {
+        media_user_rate.store(user_rate, std::memory_order_relaxed);
+        media_total_rate.store(total_rate, std::memory_order_relaxed);
+    }
+    // SIGHUP handler installed before run(); invoked on the signal reactor.
+    std::function<void()> reload_hook;
+    DeviceTable devices;
+    SuspectTable suspects;
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
@@ -393,6 +655,13 @@ struct SharedState {
     std::unordered_map<std::string,
                        std::unordered_map<IpKey, std::uint32_t, IpKeyHash>>
         user_unique_ip_counts;
+    // Same maps restricted to connections that moved >= unique_ip_min_bytes
+    // ("active"). Written only when a connection first crosses the threshold
+    // and on close, under ip_mutex.
+    std::unordered_map<IpKey, std::uint32_t, IpKeyHash> active_ip_counts;
+    std::unordered_map<std::string,
+                       std::unordered_map<IpKey, std::uint32_t, IpKeyHash>>
+        user_active_ip_counts;
 
     // Number of reactors that have finished finalization. The last one clears
     // shared gauges (unique IPs, replay entries) before the process reports
@@ -511,6 +780,12 @@ struct Runtime::Impl {
         std::optional<protocol::TransportDecoder> decoder;
         std::optional<io::ByteQueue> out;
         std::vector<std::uint8_t> s2c_wire; // ordered TLS wire not yet queued
+        // ME answers for this client decoded during the current ME read,
+        // coalesced into open TLS records and written once per read by
+        // flush_s2c_batches(). Empty outside read_me().
+        std::vector<std::uint8_t> s2c_batch;
+        std::size_t s2c_open_record{protocol::FakeTlsConnection::kNoOpenRecord};
+        bool in_s2c_batch{false};
         std::size_t s2c_offset{0};
         std::deque<protocol::TransportDecoder::Message> c2s;
         std::size_t c2s_capacity{0}; // allocated bytes of c2s message vectors
@@ -532,6 +807,30 @@ struct Runtime::Impl {
         bool conn_registered{false};
         bool deferred{false};
         bool close_requested{false};
+        // Rate limits are per user but enforced per connection: each active
+        // connection gets an equal share of the user's limit (and of the media
+        // limits) with its own GCRA state, so connections slow down evenly and
+        // independently. rate_up/rate_down hold this connection's current
+        // share in bytes/s (0 = unlimited); the hot path is one branch.
+        std::uint64_t rate_up{0};
+        std::uint64_t rate_down{0};
+        std::uint64_t policy_up{0};    // user's configured total, bytes/s
+        std::uint64_t policy_down{0};
+        std::int64_t rate_tat_up{0};   // GCRA theoretical arrival time, ns
+        std::int64_t rate_tat_down{0};
+        // Payload bytes moved since the last 1 Hz pass. A limited connection
+        // is counted active at its first bytes (counted_active) and uncounted
+        // by the 1 Hz pass after a silent second, or on close.
+        std::uint64_t window_bytes{0};
+        bool counted_active{false};
+        // Generations the current share was computed for (user, media total).
+        std::uint64_t share_generation{0};
+        std::uint64_t share_media_generation{0};
+        // While set, reading from the source of that direction is disabled
+        // (EPOLLIN removed); process_rate_resumes() re-arms it.
+        bool rate_pause_c2s{false};
+        bool rate_pause_s2c{false};
+        bool rate_listed{false};
         // Raw-TLS fallback pair state (phase == fallback). `out` is the
         // backend->client queue; c2b is client->backend.
         io::UniqueFd backend;
@@ -577,6 +876,10 @@ struct Runtime::Impl {
 
         bool ip_counted{false};
         detail::IpKey ip_key{};
+        // Per-connection payload bytes (c2s+s2c) until the IP qualifies as
+        // active; plain reactor-local fields, no lock or lookup per packet.
+        bool ip_qualified{false};
+        std::uint64_t ip_bytes{0};
 
         bool read_eof{false};   // recv()==0: socket read side is truly empty
         Time read_eof_at{};
@@ -587,6 +890,39 @@ struct Runtime::Impl {
         // true between forwarding any C2S message and the next S2C response.
         bool awaiting_reply{false};
         Time last_forward_at{};
+        // First recorded reason this relay session is being closed for;
+        // published once by close_client() for authenticated sessions.
+        control::RelayCloseReason close_reason{control::RelayCloseReason::other};
+        bool close_reason_set{false};
+        // Signed DC < 0 (file/photo/video downloads): subject to media limits.
+        bool media{false};
+        // Device accounting (max_devices): the first non-zero auth_key_id the
+        // connection presents, registered once in SharedState::devices.
+        std::uint64_t auth_key_id{0};
+        detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
+        // Config::watch_ips: this connection is logged stage by stage.
+        bool watched{false};
+        // Suspect detection (suspects.cpp): connection timeline and what the
+        // first MTProto frames looked like.
+        Time accepted_at{};
+        Time auth_at{};            // FakeTLS authenticated, Time{} otherwise
+        bool canary{false};        // authenticated as a bait user
+        std::uint8_t zero_key_frames{0};  // frames with auth_key_id 0 (key exchange)
+        bool saw_req_dh{false};    // key exchange went past req_pq
+        std::uint8_t watch_frames{0};
+        Time watch_start{};
+        detail::Platform platform{detail::Platform::undefined};
+        std::int16_t device_dc{0};      // signed DC
+        std::uint32_t max_devices{0};   // user's policy, 0 = unlimited
+        std::uint8_t device_scan_left{0};  // messages still inspected for a key
+        bool device_registered{false};
+        // Direct route: auth_key_id scan over the relayed padded-intermediate
+        // stream (frame length prefix, then the MTProto message).
+        std::uint32_t direct_scan_skip{0};
+        std::uint8_t direct_scan_have{0};
+        // 4-byte length + the first 24 payload bytes: auth_key_id(8), and for
+        // unencrypted key exchange msg_id(8) + msg_len(4) + the TL constructor.
+        std::array<std::uint8_t, 28> direct_scan_head{};
     };
 
     struct StagedFrame {
@@ -642,6 +978,10 @@ struct Runtime::Impl {
         std::size_t accounted{0};
         bool attempted{false};
         bool failure_deferred{false};
+        // Client requests were staged into `out` during this reactor
+        // iteration; the socket write happens once in flush_pending_me()
+        // before the next epoll_wait (one sendmsg for many small requests).
+        bool flush_pending{false};
         // The global relay-buffer budget refused a read event. EPOLLIN is
         // removed while set so a level-triggered reactor cannot spin on unread
         // socket data; unpause_clients_if_possible() re-arms it. Unlike a
@@ -762,6 +1102,7 @@ struct Runtime::Impl {
     void process_deadlines(Time now);
     int wait_timeout_ms(Time now) const;
     void housekeeping(Time now);
+    void apply_shared_ad_tag();
 
     std::uint64_t add_target(const Target& target);
     Target* find_target(std::uint64_t token);
@@ -791,6 +1132,12 @@ struct Runtime::Impl {
     void poll_users(Time now);
     void poll_metadata(Time now);
     void apply_user_snapshot(bool initial);
+    // Per-user policy runtime (src/runtime/policy.cpp).
+    void load_client_rates(Client& client, const control::UserRecord& user);
+    void charge_rate(Client& client, control::Direction direction, std::uint64_t bytes,
+                     Time now);
+    void process_rate_resumes(Time now);
+    void sweep_user_policy(Time now);
     void recompute_ready();
     void start_warming(Time now);
     void advance_warming(Time now);
@@ -801,7 +1148,10 @@ struct Runtime::Impl {
     // Clients
     // ------------------------------------------------------------------
     void accept_clients(Time now);
-    Client* make_client(io::UniqueFd fd, Time now, control::RejectReason& failure);
+    // `peer` is the address accept4() returned; nullopt falls back to
+    // getpeername().
+    Client* make_client(io::UniqueFd fd, Time now, control::RejectReason& failure,
+                        std::optional<io::Endpoint> peer = std::nullopt);
     // Client object pool. acquire_client() returns a default-constructed,
     // fully reset Client; recycle_client() returns one after close_client has
     // removed every external reference, and is noexcept.
@@ -812,6 +1162,10 @@ struct Runtime::Impl {
     void read_client(Client& client, Time now);
     void consume_client_bytes(Client& client, std::span<const std::uint8_t> wire, Time now);
     void process_client_hello(Client& client, Time now);
+    void refresh_personal_domains();
+    /// The configured domain (global first, then personal) that covers `sni`
+    /// (equal or a subdomain); empty when the name is not ours.
+    std::string domain_for_sni(std::string_view sni);
     bool authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                             Time now, protocol::ClientHelloInfo& info,
                             const control::UserRecord*& user);
@@ -838,12 +1192,64 @@ struct Runtime::Impl {
     void schedule_client_deadline(Client& client, Time now);
     void on_client_deadline(Client& client, Time now);
     void touch(Client& client, Time now) { client.last_activity = now; }
+    void apply_shared_tunables();
+    // max_devices: record the connection's auth key; false = over the limit
+    // (the client is already being closed).
+    bool register_device(Client& client, std::uint64_t auth_key_id, Time now);
+    bool scan_direct_auth_key(Client& client, std::span<const std::uint8_t> plain, Time now);
+    void release_device(Client& client, Time now) noexcept;
+    void publish_devices(Time now);
+    // Config::watch_ips investigation log (watch.cpp). Callers check
+    // client.watched first; nothing here runs for other connections.
+    void watch_accept(Client& client, Time now);
+    void watch_log(const Client& client, std::string_view event, std::string_view detail);
+    void watch_hello(const Client& client, std::span<const std::uint8_t> record);
+    void watch_frame(Client& client, std::span<const std::uint8_t> payload, std::size_t length);
+    void watch_close(const Client& client);
+    // Records a suspect signal for this connection's address (suspects.cpp).
+    void suspect(Client& client, control::SuspectSignal signal, std::string_view sni = {});
+    void suspect_first_bytes(Client& client);
+    void suspect_close(Client& client, Time now);
+    bool suspect_shadow_ban(Client& client, Time now);
+    Time next_suspect_prune_{};
+    // Fair-share rate limits: recompute this connection's share, and publish
+    // this reactor's active-connection counts (1 Hz, from the gauge pass).
+    void recompute_rate_share(Client& client) noexcept;
+    bool rate_limited(const Client& client) const noexcept;
+    void set_counted_active(Client& client, bool active) noexcept;
+    // Hot path: one add, plus one shared increment when a limited connection
+    // becomes active.
+    void note_activity(Client& client, std::size_t bytes) noexcept {
+        client.window_bytes += bytes;
+        if (!client.counted_active && rate_limited(client)) set_counted_active(client, true);
+    }
     void reject_close(Client& client, control::RejectReason reason,
                       std::optional<control::HandshakeResult> handshake);
     void close_client(std::uint64_t token, bool record_pending_handshake = true);
+    // Appends the current ME read's coalesced answers to every touched client
+    // and writes them with one direct flush each (EPOLLOUT only on EAGAIN).
+    void flush_s2c_batches();
+    // write_now=false only queues (safe inside an ME decoder callback, where a
+    // socket error must not close the client and re-enter the ME session).
+    bool finish_s2c_batch(Client& client, bool write_now = true);
+    static void note_close(Client& client, control::RelayCloseReason reason) noexcept {
+        if (client.close_reason_set) return;
+        client.close_reason_set = true;
+        client.close_reason = reason;
+    }
+    void close_client(std::uint64_t token, control::RelayCloseReason reason);
     void close_fallback_backend(Client& client);
-    bool count_client_unique_ip(Client& client);
+    enum class IpCountResult { ok, failure, limit };
+    IpCountResult count_client_unique_ip(Client& client,
+                                         std::optional<std::uint32_t> max_unique_ips);
     void decrement_client_unique_ip(Client& client) noexcept;
+    // Hot path: a bool test once qualified, otherwise one add and compare.
+    void note_ip_payload(Client& client, std::uint64_t bytes) {
+        if (client.ip_qualified || !client.ip_counted) return;
+        client.ip_bytes += bytes;
+        if (client.ip_bytes >= config_.unique_ip_min_bytes) qualify_client_unique_ip(client);
+    }
+    void qualify_client_unique_ip(Client& client);
     void refresh_ip_history();
     void defer_close(std::uint64_t token);
     void defer_close_conn(const detail::ConnId& id);
@@ -919,6 +1325,11 @@ struct Runtime::Impl {
     bool push_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes);
     bool push_me_frame(MeConn& me, std::vector<std::uint8_t>&& frame);
     void pump_me_out(MeConn& me);
+    // Encoded client request bytes into `out` (overflow into `frames`)
+    // without a socket write; false on an allocation failure.
+    bool stage_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes);
+    void schedule_me_flush(MeConn& me);
+    void flush_pending_me(Time now);
     void pump_me_ready_queue(MeConn& me, Time now);
     void enqueue_ready(Client& client);
     void arm_me_ready_wake(MeConn& me, Time now);
@@ -988,10 +1399,31 @@ struct Runtime::Impl {
     Deadlines deadlines_;
 
     std::shared_ptr<const control::UserSnapshot> users_snapshot_;
+    std::vector<std::uint64_t> s2c_batch_tokens_;
+    std::size_t accept_burst_{1};
+    Time next_device_prune_{};
+    std::vector<detail::WatchNet> watch_;
+    // sweep_user_policy(): users with an expiry or quota, by name, valid for
+    // policy_index_snapshot_ (held so the record pointers stay valid).
+    std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;
+    std::unordered_map<std::string, const control::UserRecord*> policy_index_;
+    std::vector<std::uint64_t> policy_doomed_;
+    std::uint64_t tunables_seen_{0};
+    std::uint64_t ad_tag_seen_{0};
+    // Pre-keyed ClientHello HMAC per enabled user of hello_keys_snapshot_
+    // (held so the UserRecord pointers stay valid). Rebuilt on snapshot change.
+    std::shared_ptr<const control::UserSnapshot> hello_keys_snapshot_;
+    std::vector<protocol::crypto::HmacSha256Key> hello_keys_;
+    std::vector<const protocol::crypto::HmacSha256Key*> hello_key_ptrs_;
+    std::vector<const control::UserRecord*> hello_key_users_;
+    // Distinct personal tls_domain values of domains_snapshot_ (users with a
+    // personal FakeTLS domain). Rebuilt on snapshot change; masking and the
+    // suspect "ours" test accept any configured domain, not only the global.
+    std::shared_ptr<const control::UserSnapshot> domains_snapshot_;
+    std::vector<std::string> personal_domains_;
     std::shared_ptr<const MeMetadata> metadata_snapshot_;
     std::size_t enabled_users_{0};
     bool warming_{false};
-    std::size_t warm_cursor_{0};
     std::vector<std::int16_t> warm_dcs_;
 
     std::size_t budget_used_{0};
@@ -1004,15 +1436,25 @@ struct Runtime::Impl {
     std::vector<std::uint8_t> frame_buffer_;
     std::vector<std::uint8_t> wire_buffer_;
     std::vector<std::uint8_t> to_me_buffer_;
+    // Reused output of encode_client_message (no allocation per request).
+    std::vector<std::uint8_t> me_encode_buffer_;
+    // ME connections with staged, not yet written requests (by token: a
+    // connection can be retired mid-iteration).
+    std::vector<std::uint64_t> me_flush_tokens_;
+    std::vector<std::uint64_t> me_flush_batch_;
 
     std::vector<std::uint64_t> deferred_closes_;
     std::vector<std::uint64_t> deferred_me_failures_;
     std::vector<std::uint64_t> paused_clients_;
+    std::vector<std::uint64_t> rate_clients_;  // tokens with a rate pause flag set
+    std::vector<std::uint64_t> rate_remaining_;
+    Time next_rate_resume_{Time::max()};
     std::vector<std::uint64_t> eof_clients_;
     // Scratch storage for the sweep's survivor list: swapped with eof_clients_
     // so a steady-state sweep allocates nothing.
     std::vector<std::uint64_t> eof_remaining_;
     std::vector<std::uint64_t> fallback_clients_;
+    std::vector<std::uint64_t> fallback_remaining_; // sweep scratch, reused
     std::vector<std::uint64_t> direct_eof_clients_;
     std::map<std::int16_t, std::uint64_t> direct_accepted_;
     std::map<std::int16_t, std::uint64_t> direct_connect_fail_;
@@ -1069,15 +1511,24 @@ struct Runtime::RuntimeState {
     void finish_run() noexcept;
     std::vector<std::uint64_t> accepted_clients_per_worker() const;
     std::vector<std::uint64_t> replay_rejections_per_worker() const;
+    void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
+    void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+    void set_ad_tag(const std::array<std::uint8_t, 16>& tag);
+    void on_reload(std::function<void()> hook);
 
 private:
     void run_impl();
 
 public:
     std::size_t workers{1};
+    // Config::cpu_affinity: reactors pin themselves at run() (run_impl).
+    bool cpu_affinity{false};
     std::shared_ptr<detail::SharedState> shared;
     std::vector<std::unique_ptr<Impl>> reactors;
     std::vector<std::thread> threads;
+    // Quota counter persistence (no-op without Config::usage_state_path).
+    std::unique_ptr<control::UsageStateKeeper> usage_keeper;
+    control::Statistics* statistics_{nullptr};
     // A concurrent destructor must not clear reactors/threads while run() is
     // still starting or joining workers. The destructor requests stop first,
     // then waits here for run() to publish its terminal state.

@@ -20,9 +20,90 @@
 
 namespace mtdd {
 
+void Runtime::Impl::apply_shared_tunables() {
+    const std::uint64_t generation =
+        shared_->tunables_generation.load(std::memory_order_acquire);
+    if (generation == tunables_seen_) return;
+    tunables_seen_ = generation;
+    config_.me_clients_per_writer =
+        shared_->me_clients_per_writer.load(std::memory_order_relaxed);
+    config_.me_connections_per_dc =
+        shared_->me_connections_per_dc.load(std::memory_order_relaxed);
+    // A lower cap applies now: clamp the target and scale-drain the excess
+    // writers (fewest bound clients first). Draining only stops new bindings;
+    // each writer closes after its own clients leave, so nobody is dropped.
+    const std::size_t cap = config_.me_connections_per_dc;
+    for (auto& [dc, pool] : me_pool_) {
+        if (pool.scale_target > cap) pool.scale_target = cap;
+        std::vector<MeConn*> active;
+        for (auto& connection : pool.conns) {
+            if (connection && !connection->draining &&
+                connection->generation == pool.desired_generation) {
+                active.push_back(connection.get());
+            }
+        }
+        if (active.size() <= cap) continue;
+        std::sort(active.begin(), active.end(), [](const MeConn* left, const MeConn* right) {
+            return left->clients < right->clients;
+        });
+        for (std::size_t index = 0; index < active.size() - cap; ++index) {
+            active[index]->draining = true;
+            active[index]->scale_draining = true;
+            active[index]->draining_deadline = Time::max();
+            ++pool.scale_down_total;
+        }
+        publish_me_pool(dc);
+    }
+    recompute_ready();
+}
+
+void Runtime::Impl::apply_shared_ad_tag() {
+    const std::uint64_t generation =
+        shared_->ad_tag_generation.load(std::memory_order_acquire);
+    if (generation == ad_tag_seen_) return;
+    ad_tag_seen_ = generation;
+    {
+        std::lock_guard lock(shared_->ad_tag_mutex);
+        config_.ad_tag = shared_->ad_tag;
+    }
+    // New ME sessions start from config_.ad_tag; live ones switch on their next
+    // RPC_PROXY_REQ, so existing clients are neither dropped nor re-handshaked.
+    protocol::AdTag tag;
+    tag.bytes = config_.ad_tag;
+    for (auto& [dc, pool] : me_pool_) {
+        for (auto& connection : pool.conns) {
+            if (connection && connection->session) connection->session->set_ad_tag(tag);
+        }
+    }
+}
+
 void Runtime::Impl::housekeeping(Time now) {
+    // A reload must never become a reactor failure; on allocation failure the
+    // generation is already consumed and the next reload retries.
+    try {
+        apply_shared_tunables();
+    } catch (...) {
+    }
+    try {
+        apply_shared_ad_tag();
+    } catch (...) {
+    }
     shared_->replay.evict(now);
     refresh_ip_history();
+    if (worker_index_ == 0 && config_.suspects && now >= next_suspect_prune_) {
+        next_suspect_prune_ = now + std::chrono::seconds(60);
+        try {
+            shared_->suspects.prune(now, config_.suspect_ttl);
+        } catch (...) {
+        }
+    }
+    if (worker_index_ == 0 && now >= next_device_prune_) {
+        next_device_prune_ = now + std::chrono::seconds(10);
+        try {
+            publish_devices(now);
+        } catch (...) {
+        }
+    }
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
     if (!stopping_) {
         advance_warming(now);
@@ -72,7 +153,7 @@ bool Runtime::Impl::budget_allows(std::size_t extra) const {
 
 std::size_t Runtime::Impl::shared_bytes() const noexcept {
     return read_buffer_.capacity() + plain_buffer_.capacity() + frame_buffer_.capacity() +
-           wire_buffer_.capacity() + to_me_buffer_.capacity();
+           wire_buffer_.capacity() + to_me_buffer_.capacity() + me_encode_buffer_.capacity();
 }
 
 void Runtime::Impl::reaccount(Client& client) {
@@ -83,6 +164,7 @@ void Runtime::Impl::reaccount(Client& client) {
     if (client.c2b) next += client.c2b->capacity_bytes();
     if (client.direct_out) next += client.direct_out->capacity_bytes();
     next += client.s2c_wire.capacity();
+    next += client.s2c_batch.capacity();
     next += client.c2s_capacity;
     if (next >= client.accounted) {
         budget_used_ += next - client.accounted;
@@ -298,7 +380,9 @@ void Runtime::Impl::shutdown_pump(Time now) {
             closing.push_back(token);
         }
     }
-    for (const std::uint64_t token : closing) close_client(token);
+    for (const std::uint64_t token : closing) {
+        close_client(token, control::RelayCloseReason::shutdown);
+    }
     for (auto& [dc, pool] : me_pool_) {
         (void)dc;
         for (auto& me : pool.conns) {
@@ -322,7 +406,9 @@ void Runtime::Impl::finalize() {
         (void)client;
         tokens.push_back(token);
     }
-    for (const std::uint64_t token : tokens) close_client(token);
+    for (const std::uint64_t token : tokens) {
+        close_client(token, control::RelayCloseReason::shutdown);
+    }
     for (auto& [dc, pool] : me_pool_) {
         for (auto& me : pool.conns) {
             if (!me) continue;
@@ -362,7 +448,10 @@ void Runtime::Impl::finalize() {
             const std::lock_guard lock{shared_->ip_mutex};
             shared_->unique_ip_counts.clear();
             shared_->user_unique_ip_counts.clear();
+            shared_->active_ip_counts.clear();
+            shared_->user_active_ip_counts.clear();
             stats_.set_active_unique_ips(0);
+            stats_.set_qualified_unique_ips(0);
         }
     }
     barrier_.stop();

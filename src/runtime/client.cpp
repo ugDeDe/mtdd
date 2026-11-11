@@ -1,5 +1,7 @@
 #include "internal.hpp"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,6 +19,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef TCP_SAVE_SYN
+#define TCP_SAVE_SYN 27  // Linux 4.2+
+#endif
+#ifndef TCP_SAVED_SYN
+#define TCP_SAVED_SYN 28
+#endif
 
 namespace mtdd {
 namespace {
@@ -130,7 +139,15 @@ void Runtime::Impl::release_client_pool() noexcept {
 }
 
 void Runtime::Impl::accept_clients(Time now) {
-    for (std::size_t iteration = 0; iteration < detail::kAcceptBatch; ++iteration) {
+    // Adaptive burst: the listener is level-triggered and the loop turns over
+    // far more often than connections arrive, so normally one accept per event
+    // is enough and the EAGAIN-only probe (~half of all accept4 calls) is
+    // skipped. A burst that fills the limit doubles it for the next event; a
+    // drained backlog (EAGAIN) shrinks it back to one.
+    const std::size_t burst = accept_burst_;
+    bool drained = false;
+    std::size_t accepted_now = 0;
+    for (std::size_t iteration = 0; iteration < burst; ++iteration) {
         if (config_.max_connections != 0 &&
             (clients_.size() >= static_cast<std::size_t>(config_.max_connections) ||
              shared_->connections.load(std::memory_order_relaxed) >=
@@ -148,8 +165,10 @@ void Runtime::Impl::accept_clients(Time now) {
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
+            drained = errno == EAGAIN || errno == EWOULDBLOCK;
             break;
         }
+        ++accepted_now;
         // Reserve one process-wide connection slot before counting the socket as
         // accepted; a socket refused by the global cap is a rejection, not an
         // accepted-and-immediately-closed connection. Each reactor also keeps
@@ -166,7 +185,9 @@ void Runtime::Impl::accept_clients(Time now) {
         try {
             io::UniqueFd owned{fd};
             control::RejectReason failure = control::RejectReason::overload;
-            Client* client = make_client(std::move(owned), now, failure);
+            Client* client = make_client(
+                std::move(owned), now, failure,
+                io::endpoint_from_address(&address, static_cast<std::size_t>(length)));
             if (client == nullptr) {
                 // `overload` is reserved for capacity/admission limits. An
                 // accepted socket without a usable peer address (reset before
@@ -182,16 +203,22 @@ void Runtime::Impl::accept_clients(Time now) {
             shared_->release_connection();
         }
     }
+    if (drained) {
+        accept_burst_ = 1;
+    } else if (accepted_now == burst) {
+        accept_burst_ = std::min(burst * 2, detail::kAcceptBatch);
+    }
     update_listener_interest();
 }
 
 Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
-                                                 control::RejectReason& failure) {
+                                                 control::RejectReason& failure,
+                                                 std::optional<io::Endpoint> accepted_peer) {
     if (!budget_allows(detail::kBudgetHeadroom + 8192)) {
         failure = control::RejectReason::overload;
         return nullptr;
     }
-    const auto peer = io::peer_endpoint(fd.get());
+    const auto peer = accepted_peer ? std::move(accepted_peer) : io::peer_endpoint(fd.get());
     if (!peer || peer->port == 0) {
         failure = control::RejectReason::other;
         return nullptr;
@@ -224,8 +251,36 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     }
     owned->fd = std::move(fd);
     // Client-facing FakeTLS records are latency-sensitive and often small.
-    (void)io::set_tcp_nodelay(owned->fd.get());
+    // TCP_NODELAY, keepalive and TCP_USER_TIMEOUT are set once on the listener
+    // (setup()) and inherited by every accepted socket: no per-connection
+    // setsockopt calls on the accept path.
     owned->peer = *protocol_peer;
+    if (config_.fingerprint) {
+        std::array<std::uint8_t, 128> syn{};
+        socklen_t length = sizeof(syn);
+        if (::getsockopt(owned->fd.get(), IPPROTO_TCP, TCP_SAVED_SYN, syn.data(), &length) == 0) {
+            owned->syn = detail::parse_saved_syn(std::span<const std::uint8_t>(syn.data(), length));
+        }
+    }
+    if (!watch_.empty()) {
+        for (const auto& net : watch_) {
+            if (detail::watch_net_contains(net, owned->peer)) {
+                owned->watched = true;
+                break;
+            }
+        }
+    }
+    owned->accepted_at = now;
+    bool repeat_visit = false;
+    if (config_.suspects) {
+        const auto seen = shared_->suspects.accept(owned->peer, now);
+        if (seen.known && config_.suspect_watch_score != 0 &&
+            seen.score >= static_cast<double>(config_.suspect_watch_score) &&
+            shared_->suspects.watch_budget(now)) {
+            owned->watched = true;  // known suspect: per-stage log (rate-limited)
+        }
+        repeat_visit = seen.repeat_visit;
+    }
     owned->phase = Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
     owned->last_activity = now;
@@ -251,6 +306,8 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         deadlines_.set(token, now + config_.handshake_timeout);
         reaccount(*raw);
         update_client_interest(*raw);
+        if (raw->watched) watch_accept(*raw, now);
+        if (repeat_visit) suspect(*raw, control::SuspectSignal::repeat_visits);
     } catch (...) {
         // close_client() is safe here: handshake accounting is still pending and
         // no user metrics have been attached yet.
@@ -307,6 +364,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
+    if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
     if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
         paused_clients_.push_back(client.token);
@@ -350,6 +408,12 @@ void Runtime::Impl::read_client(Client& client, Time now) {
                                  now);
             if (clients_.find(token) == clients_.end()) return;
             if (client.phase == Client::Phase::fallback) return;
+            if (client.rate_pause_c2s) break;
+            // A short read drained the socket. The listener is level-triggered
+            // and EPOLLIN stays armed until recv()==0, so new bytes or a FIN
+            // raise another event; probing again only returned EAGAIN (~40% of
+            // all recv calls under load).
+            if (bytes < limit) break;
         } else if (received == 0) {
             latch_read_eof(client, now);
             return;
@@ -358,7 +422,8 @@ void Runtime::Impl::read_client(Client& client, Time now) {
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         } else {
-            close_client(token);
+            close_client(token, errno == ETIMEDOUT ? control::RelayCloseReason::client_timeout
+                                                   : control::RelayCloseReason::client_error);
             return;
         }
     }
@@ -377,6 +442,12 @@ void Runtime::Impl::consume_client_bytes(Client& client,
                              (client.hello[2] == 0x01 || client.hello[2] == 0x03);
             if (!tls || record_length < 100 ||
                 record_length > protocol::kFakeTlsMaxClientHello) {
+                if (client.watched) watch_hello(client, client.hello);
+                if (tls) {
+                    suspect(client, control::SuspectSignal::junk);  // bad record length
+                } else {
+                    suspect_first_bytes(client);
+                }
                 if (masking_enabled()) {
                     start_fallback(client, client.hello, now);
                     return;
@@ -424,9 +495,32 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         return;
     }
 
+    if (client.watched) watch_hello(client, record);
     protocol::ClientHelloInfo info;
     const control::UserRecord* user = nullptr;
     if (!authenticate_hello(client, record, now, info, user)) {
+        if (client.watched) watch_log(client, "auth", "result=bad_secret");
+        if (config_.suspects) {
+            // E: someone who knows our domain but not a valid secret.
+            const auto sni = protocol::client_hello_sni(record);
+            const bool ours = sni && !domain_for_sni(*sni).empty();
+            if (config_.fingerprint) {
+                client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+            }
+            suspect(client, ours ? control::SuspectSignal::wrong_secret : control::SuspectSignal::junk,
+                    sni ? std::string_view(*sni) : std::string_view{});
+        }
+        if (masking_enabled()) {
+            start_fallback(client, record, now);
+            return;
+        }
+        reject_close(client, control::RejectReason::auth_failed,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    // Shadow ban: a known checker gets what any unauthenticated visitor gets
+    // (the real site), so its list marks this proxy dead. No RST, no refusal.
+    if (suspect_shadow_ban(client, now)) {
         if (masking_enabled()) {
             start_fallback(client, record, now);
             return;
@@ -442,6 +536,12 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // rejected by every other one.
     const auto outcome = shared_->replay.insert(info.canonical_hmac, now);
     stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
+    if (client.watched && outcome != detail::ReplayCache::Outcome::accepted) {
+        watch_log(client, "auth", "result=replay");
+    }
+    if (outcome == detail::ReplayCache::Outcome::duplicate) {
+        suspect(client, control::SuspectSignal::junk);
+    }
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
@@ -460,11 +560,38 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     }
 
     if (client.phase != Client::Phase::tls_hello) return;
+    if (config_.fingerprint) {
+        client.platform = detail::classify_platform(client.syn, detail::classify_client_hello(record));
+    }
     client.user_name = user->name;
+    client.auth_at = now;
+    client.canary = user->policy.canary;
+    if (client.canary) {
+        const auto sni = protocol::client_hello_sni(record);
+        suspect(client, control::SuspectSignal::canary,
+                sni ? std::string_view(*sni) : std::string_view{});
+    }
+    if (client.watched) {
+        watch_log(client, "auth", "result=ok user=" + user->name +
+                                      " platform=" + detail::platform_name(client.platform));
+    }
     client.generation = user->generation;
     client.metrics = stats_.user(user->name);
     if (!client.metrics) {
         reject_close(client, control::RejectReason::overload,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    // Policy gates run after auth and replay, before any slot is reserved, so a
+    // rejected user never holds a connection slot.
+    if (user->policy.expires_at && *user->policy.expires_at <= unix_now()) {
+        reject_close(client, control::RejectReason::user_expired,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    if (user->policy.data_quota_bytes &&
+        client.metrics->quota_used_bytes() >= *user->policy.data_quota_bytes) {
+        reject_close(client, control::RejectReason::user_quota_exceeded,
                      control::HandshakeResult::failure);
         return;
     }
@@ -474,7 +601,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // metrics_counted is already true.
     if (user->max_connections) {
         if (!client.metrics->try_connection_open(*user->max_connections)) {
-            reject_close(client, control::RejectReason::overload,
+            reject_close(client, control::RejectReason::user_connection_limit,
                          control::HandshakeResult::failure);
             return;
         }
@@ -482,6 +609,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         client.metrics->connection_opened();
     }
     client.metrics_counted = true;
+    load_client_rates(client, *user);
     begin_client_tls(client, *user, std::move(info), record, now);
     if (clients_.find(token) != clients_.end()) reaccount(client);
 }
@@ -493,32 +621,48 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
     (void)now;
     const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
     if (!snapshot) return false;
-    const std::int64_t now_unix = unix_now();
-    for (const auto& candidate : snapshot->users) {
-        if (!candidate.enabled) continue;
-        std::array<std::uint8_t, 16> secret{};
-        if (!parse_user_secret(candidate.secret_hex, secret)) continue;
-        protocol::ClientHelloInfo found;
-        const auto status = protocol::validate_client_hello(record, secret, now_unix, 120, found);
-        protocol::crypto::secure_zero(secret);
-        if (status == protocol::HelloStatus::Ok) {
-            if (!config_.tls_domain.empty() &&
-                !ascii_iequals(found.server_name, config_.tls_domain)) {
-                return false;
-            }
-            info = std::move(found);
-            user = &candidate;
-            return true;
+    if (hello_keys_snapshot_ != snapshot) {
+        // Parse and pre-key every enabled secret once per user snapshot, not
+        // once per user for every ClientHello. Order (and therefore which user
+        // wins a duplicate secret) is the snapshot order, as before.
+        hello_keys_.clear();
+        hello_key_ptrs_.clear();
+        hello_key_users_.clear();
+        hello_keys_snapshot_.reset();
+        hello_keys_.reserve(snapshot->users.size());
+        for (const auto& candidate : snapshot->users) {
+            if (!candidate.enabled) continue;
+            std::array<std::uint8_t, 16> secret{};
+            if (!parse_user_secret(candidate.secret_hex, secret)) continue;
+            hello_keys_.emplace_back(secret);
+            protocol::crypto::secure_zero(secret);
+            hello_key_users_.push_back(&candidate);
         }
-        if (status != protocol::HelloStatus::Unauthenticated) return false;
+        for (const auto& key : hello_keys_) hello_key_ptrs_.push_back(&key);
+        hello_keys_snapshot_ = snapshot;
     }
-    return false;
+    protocol::ClientHelloInfo found;
+    std::size_t matched = 0;
+    const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, unix_now(),
+                                                        120, found, matched);
+    if (status != protocol::HelloStatus::Ok || matched >= hello_key_users_.size()) return false;
+    // A user with a personal tls_domain authenticates only on that SNI; the
+    // others on the global one (when configured).
+    const control::UserRecord* matched_user = hello_key_users_[matched];
+    const std::string& expected_sni = matched_user->policy.tls_domain.empty()
+                                          ? config_.tls_domain
+                                          : matched_user->policy.tls_domain;
+    if (!expected_sni.empty() && !ascii_iequals(found.server_name, expected_sni)) {
+        return false;
+    }
+    info = std::move(found);
+    user = matched_user;
+    return true;
 }
 
 void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& user,
                                      protocol::ClientHelloInfo&& info,
                                      std::span<const std::uint8_t> record, Time now) {
-    (void)user;
     protocol::FakeTlsConnection::Config tls_config;
     tls_config.secret = info.secret;
     tls_config.random = random_;
@@ -526,7 +670,11 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     tls_config.max_client_hello = protocol::kFakeTlsMaxClientHello;
     tls_config.max_record_body = protocol::kFakeTlsMaxRecordBody;
     tls_config.max_pending_plaintext = detail::kReadBatch + 2U * protocol::kFakeTlsMaxRecordBody;
-    if (!config_.tls_domain.empty()) tls_config.expected_server_name = config_.tls_domain;
+    if (!user.policy.tls_domain.empty()) {
+        tls_config.expected_server_name = user.policy.tls_domain;
+    } else if (!config_.tls_domain.empty()) {
+        tls_config.expected_server_name = config_.tls_domain;
+    }
     client.tls.emplace(std::move(tls_config));
 
     wire_buffer_.clear();
@@ -543,13 +691,17 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
                      control::HandshakeResult::failure);
         return;
     }
-    if (!count_client_unique_ip(client)) {
-        reject_close(client, control::RejectReason::overload,
+    const auto ip_result = count_client_unique_ip(client, user.policy.max_unique_ips);
+    if (ip_result != IpCountResult::ok) {
+        reject_close(client,
+                     ip_result == IpCountResult::limit ? control::RejectReason::user_ip_limit
+                                                       : control::RejectReason::overload,
                      control::HandshakeResult::failure);
         return;
     }
     refresh_ip_history();
     stats_.observe_ip_history(client.ip_key);
+    note_ip_payload(client, 0);  // unique_ip_min_bytes == 0: active at handshake
     client.phase = Client::Phase::tls_handshake;
     client.deadline_kind = Client::DeadlineKind::handshake;
     deadlines_.set(client.token, now + config_.handshake_timeout);
@@ -588,6 +740,9 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         // Relay the authenticated padded-intermediate transport bytes verbatim.
         // Decoding and re-framing here would strip only 0..3 padding bytes and
         // corrupt encrypted MTProto lengths/CRC for padding 4..15.
+        if (client.device_scan_left != 0 && !scan_direct_auth_key(client, plain_buffer_, now)) {
+            return;
+        }
         try {
             client.direct_encrypt->apply(plain_buffer_);
         } catch (const std::exception&) {
@@ -612,6 +767,12 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         if (client.metrics) {
             client.metrics->add_payload(control::Direction::client_to_server,
                                         plain_buffer_.size());
+            note_ip_payload(client, plain_buffer_.size());
+            note_activity(client, plain_buffer_.size());
+            if (client.rate_up != 0) {
+                charge_rate(client, control::Direction::client_to_server,
+                            plain_buffer_.size(), now);
+            }
         }
         client.awaiting_reply = true;
         client.last_forward_at = now;
@@ -634,6 +795,39 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         const std::size_t cap_limit =
             std::max(config_.connection_queue_bytes, config_.max_frame_bytes + 4096);
         for (auto& message : messages) {
+            if (client.watched) watch_frame(client, message.data, message.data.size());
+            if (client.device_scan_left != 0) {
+                --client.device_scan_left;
+                if (message.data.size() >= 8) {
+                    std::uint64_t key = 0;
+                    for (int i = 7; i >= 0; --i) {
+                        key = (key << 8) | message.data[static_cast<std::size_t>(i)];
+                    }
+                    if (key != 0 && !register_device(client, key, now)) return;
+                    if (key == 0) {
+                        // Unencrypted key exchange: the TL constructor follows
+                        // msg_id (8) and length (4).
+                        if (client.zero_key_frames != 255) ++client.zero_key_frames;
+                        if (message.data.size() >= 24) {
+                            std::uint32_t constructor = 0;
+                            for (int i = 23; i >= 20; --i) {
+                                constructor = (constructor << 8) |
+                                              message.data[static_cast<std::size_t>(i)];
+                            }
+                            if (constructor == 0xd712e4beU || constructor == 0xf5045f1fU) {
+                                // req_DH_params / set_client_DH_params: the key
+                                // exchange went past req_pq, so a genuine client
+                                // is creating a key from this address. (During
+                                // creation auth_key_id stays 0, so register_device
+                                // never marks it real — this does.) A checker
+                                // only ever sends req_pq and leaves.
+                                client.saw_req_dh = true;
+                                if (config_.suspects) shared_->suspects.mark_real(client.peer, now);
+                            }
+                        }
+                    }
+                }
+            }
             const std::size_t bytes = message.data.capacity();
             if (client.c2s_capacity + bytes > cap_limit ||
                 !budget_allows(bytes + detail::kMeEncodeOverhead)) {
@@ -643,6 +837,12 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             }
             client.metrics->add_payload(control::Direction::client_to_server,
                                         message.data.size());
+            note_ip_payload(client, message.data.size());
+            note_activity(client, message.data.size());
+            if (client.rate_up != 0) {
+                charge_rate(client, control::Direction::client_to_server,
+                            message.data.size(), now);
+            }
             client.c2s_capacity += bytes;
             client.c2s.push_back(std::move(message));
         }
@@ -660,6 +860,20 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
 void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     const auto tag = client.tls->proto_tag();
     const std::int16_t dc = client.tls->dc_id();
+    client.media = dc < 0;
+    // Devices are counted per signed DC: a device holds one current auth key
+    // per DC, and Android uses a separate temporary key for media DCs.
+    client.device_dc = dc;
+    client.device_scan_left = detail::kDeviceScanFrames;
+    if (client.watched) {
+        watch_log(client, "tls_ready",
+                  "dc=" + std::to_string(dc) + " proto=" +
+                      (tag == protocol::ProtoTag::Secure ? "secure" : "other") +
+                      " route=" + (direct_route_enabled(dc) ? "direct" : "me"));
+    }
+    // The share was first computed at authentication, before the DC (and so
+    // the media class) was known.
+    if (client.media) recompute_rate_share(client);
     if (tag != protocol::ProtoTag::Secure || dc == 0) {
         reject_close(client, control::RejectReason::auth_failed,
                      client.handshake_pending ? std::optional{control::HandshakeResult::failure}

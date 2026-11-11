@@ -44,6 +44,18 @@ bool ascii_iequals(std::string_view a, std::string_view b) {
   return true;
 }
 
+// Capacity for `needed` bytes before any mutation (pre-crypto allocation
+// guarantee). Answers are appended to one batch many times per ME read; an
+// exact reserve() reallocated and copied the whole accumulated prefix on every
+// append (quadratic). Grow by at least half, but never by more than 128 KiB of
+// slack beyond what is needed.
+void reserve_growing(Bytes& b, std::size_t needed) {
+  if (needed <= b.capacity()) return;
+  constexpr std::size_t kMaxSlack = 128u * 1024u;
+  const std::size_t grown = b.capacity() + b.capacity() / 2;
+  b.reserve(std::max(needed, std::min(grown, needed + kMaxSlack)));
+}
+
 void release_if_large(Bytes& b) {
   if (b.capacity() > 64u * 1024u && b.empty()) Bytes().swap(b);
 }
@@ -72,6 +84,25 @@ bool reserved_nonce(std::span<const std::uint8_t> raw) {
   return raw[4] == 0 && raw[5] == 0 && raw[6] == 0 && raw[7] == 0;
 }
 
+// Room left in the record that `open_record` names, or 0 when it is not the
+// final, extendable ApplicationData record of `wire`.
+std::size_t open_record_room(const Bytes& wire, const std::size_t* open_record,
+                             std::size_t max_body) {
+  if (open_record == nullptr || *open_record == FakeTlsConnection::kNoOpenRecord) return 0;
+  const std::size_t header = *open_record;
+  if (header > wire.size() || wire.size() - header < 5 || wire[header] != 0x17) return 0;
+  const std::size_t length = (static_cast<std::size_t>(wire[header + 3]) << 8) | wire[header + 4];
+  if (header + 5 + length != wire.size() || length >= max_body) return 0;
+  return max_body - length;
+}
+
+void grow_open_record(Bytes& wire, std::size_t header, std::size_t added) {
+  const std::size_t length =
+      ((static_cast<std::size_t>(wire[header + 3]) << 8) | wire[header + 4]) + added;
+  wire[header + 3] = static_cast<std::uint8_t>(length >> 8);
+  wire[header + 4] = static_cast<std::uint8_t>(length);
+}
+
 }  // namespace
 
 void ObfuscationParams::wipe() {
@@ -93,10 +124,15 @@ void ClientHelloInfo::wipe() {
   server_name.shrink_to_fit();
 }
 
-HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
-                                  std::span<const std::uint8_t, 16> secret,
-                                  std::int64_t now_unix, std::uint32_t skew_seconds,
-                                  ClientHelloInfo& out) {
+namespace {
+
+// Shared ClientHello validation. `authenticate(input, canonical, secret)`
+// returns true when some key's HMAC over the canonical input matches the first
+// 28 digest bytes, filling the canonical HMAC and that key's secret.
+template <typename Authenticate>
+HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64_t now_unix,
+                                std::uint32_t skew_seconds, ClientHelloInfo& out,
+                                Authenticate&& authenticate) {
   out.wipe();
   if (record.size() < 5) return HelloStatus::NeedMoreData;
   if (record[0] != 0x16 || !is_tls_version(record)) return HelloStatus::NotTls;
@@ -123,16 +159,21 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
   append(hmac_input, record.first(11));
   hmac_input.insert(hmac_input.end(), 32, 0);
   append(hmac_input, record.subspan(43));
-  const auto canonical = crypto::hmac_sha256(secret, hmac_input);
-
-  std::array<std::uint8_t, 28> got28{}, want28{};
-  std::copy_n(digest.begin(), 28, got28.begin());
-  std::copy_n(canonical.begin(), 28, want28.begin());
-  if (!crypto::constant_time_equal(got28, want28)) {
+  std::array<std::uint8_t, 32> canonical{};
+  std::array<std::uint8_t, 16> secret{};
+  if (!authenticate(std::span<const std::uint8_t>(hmac_input), digest, canonical, secret)) {
     crypto::secure_zero(digest);
     crypto::secure_zero(hmac_input);
     return HelloStatus::Unauthenticated;
   }
+  struct Wipe {
+    std::array<std::uint8_t, 32>& canonical;
+    std::array<std::uint8_t, 16>& secret;
+    ~Wipe() {
+      crypto::secure_zero(canonical);
+      crypto::secure_zero(secret);
+    }
+  } wipe_keys{canonical, secret};
 
   const std::uint32_t mask = (static_cast<std::uint32_t>(digest[28]) ^ canonical[28]) |
                              ((static_cast<std::uint32_t>(digest[29]) ^ canonical[29]) << 8) |
@@ -229,6 +270,53 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
   out.offers_pq = offers_pq;
   crypto::secure_zero(hmac_input);
   return HelloStatus::Ok;
+}
+
+bool hmac_prefix_matches(const std::array<std::uint8_t, 32>& digest,
+                         const std::array<std::uint8_t, 32>& canonical) {
+  std::array<std::uint8_t, 28> got28{}, want28{};
+  std::copy_n(digest.begin(), 28, got28.begin());
+  std::copy_n(canonical.begin(), 28, want28.begin());
+  return crypto::constant_time_equal(got28, want28);
+}
+
+}  // namespace
+
+HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
+                                  std::span<const std::uint8_t, 16> secret,
+                                  std::int64_t now_unix, std::uint32_t skew_seconds,
+                                  ClientHelloInfo& out) {
+  return validate_hello_core(
+      record, now_unix, skew_seconds, out,
+      [&](std::span<const std::uint8_t> input, const std::array<std::uint8_t, 32>& digest,
+          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& matched) {
+        canonical = crypto::hmac_sha256(secret, input);
+        if (!hmac_prefix_matches(digest, canonical)) return false;
+        std::copy(secret.begin(), secret.end(), matched.begin());
+        return true;
+      });
+}
+
+HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
+                                  std::span<const crypto::HmacSha256Key* const> keys,
+                                  std::int64_t now_unix, std::uint32_t skew_seconds,
+                                  ClientHelloInfo& out, std::size_t& matched) {
+  return validate_hello_core(
+      record, now_unix, skew_seconds, out,
+      [&](std::span<const std::uint8_t> input, const std::array<std::uint8_t, 32>& digest,
+          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& secret) {
+        for (std::size_t index = 0; index < keys.size(); ++index) {
+          if (keys[index] == nullptr) continue;
+          canonical = keys[index]->mac(input);
+          if (!hmac_prefix_matches(digest, canonical)) continue;
+          const auto key = keys[index]->key();
+          std::copy(key.begin(), key.end(), secret.begin());
+          matched = index;
+          return true;
+        }
+        crypto::secure_zero(canonical);
+        return false;
+      });
 }
 
 std::optional<std::string> client_hello_sni(std::span<const std::uint8_t> record) {
@@ -443,6 +531,82 @@ struct FakeTlsConnection::Impl {
     return Status::ProtocolError;
   }
 
+  // Validates a TLS record header (>= 5 bytes) and returns its body length.
+  Status record_header(std::span<const std::uint8_t> header, std::size_t& len) {
+    if (!is_tls_version(header.first(3))) return fail("bad TLS record version");
+    len = be16(header, 3);
+    if (len == 0 || len > cfg.max_record_body) return fail("bad TLS record length");
+    return Status::Ok;
+  }
+
+  // One complete record (header + body) after the obfuscation handshake.
+  // Application data is decrypted straight from the record into
+  // plaintext_out: no copy of the ciphertext into tls_wire/stream first.
+  Status consume_ready_record(std::span<const std::uint8_t> record,
+                              std::vector<std::uint8_t>& plaintext_out, bool& progress) {
+    const auto body = record.subspan(kTlsHeaderSize);
+    switch (record[0]) {
+      case 0x17: {
+        if (plaintext_out.size() + body.size() > cfg.max_pending_plaintext) {
+          return fail("plaintext output limit exceeded");
+        }
+        const std::size_t old = plaintext_out.size();
+        plaintext_out.resize(old + body.size());
+        decryptor->apply(body, std::span<std::uint8_t>(plaintext_out).subspan(old));
+        progress = true;
+        return Status::Ok;
+      }
+      case 0x14:
+        return Status::Ok;  // ChangeCipherSpec body is discarded.
+      case 0x15:
+        state = State::Closed;
+        return Status::Closed;
+      default:
+        return fail("unexpected TLS record type");
+    }
+  }
+
+  // Ready-state input. Whole records are parsed directly from the caller's
+  // span (normally the reactor's recv buffer); only an incomplete trailing
+  // record is buffered in tls_wire, and is completed from the next input
+  // first. Ciphertext is never copied before decryption.
+  Status feed_ready(std::span<const std::uint8_t> wire, std::vector<std::uint8_t>& plaintext_out,
+                    bool& progress) {
+    while (!tls_wire.empty() && !wire.empty()) {
+      std::size_t need = 0;
+      if (tls_wire.size() < kTlsHeaderSize) {
+        need = kTlsHeaderSize - tls_wire.size();
+      } else {
+        std::size_t len = 0;
+        if (const Status st = record_header(tls_wire, len); st != Status::Ok) return st;
+        need = kTlsHeaderSize + len - tls_wire.size();
+      }
+      const std::size_t take = std::min(need, wire.size());
+      append(tls_wire, wire.first(take));
+      wire = wire.subspan(take);
+      if (tls_wire.size() < kTlsHeaderSize) break;
+      std::size_t len = 0;
+      if (const Status st = record_header(tls_wire, len); st != Status::Ok) return st;
+      if (tls_wire.size() < kTlsHeaderSize + len) continue;
+      const Status st = consume_ready_record(tls_wire, plaintext_out, progress);
+      tls_wire.clear();
+      if (st != Status::Ok) return st;
+    }
+    std::size_t pos = 0;
+    while (wire.size() - pos >= kTlsHeaderSize) {
+      std::size_t len = 0;
+      if (const Status st = record_header(wire.subspan(pos), len); st != Status::Ok) return st;
+      if (wire.size() - pos < kTlsHeaderSize + len) break;
+      const Status st = consume_ready_record(wire.subspan(pos, kTlsHeaderSize + len), plaintext_out,
+                                             progress);
+      if (st != Status::Ok) return st;
+      pos += kTlsHeaderSize + len;
+    }
+    if (pos < wire.size()) append(tls_wire, wire.subspan(pos));
+    release_if_large(tls_wire);
+    return Status::Ok;
+  }
+
   // Consume every complete TLS record currently buffered. The caller bounds the
   // *residue* after this returns, so a recv() batch can contain many records.
   Status consume_tls_records(bool& progress, std::vector<std::uint8_t>& to_client) {
@@ -519,6 +683,15 @@ Status FakeTlsConnection::feed(std::span<const std::uint8_t> wire,
   if (s.state == State::Failed) return Status::ProtocolError;
   if (s.state == State::Closed) return Status::Closed;
 
+  // Relay hot path: records straight from `wire`, bodies decrypted directly
+  // into plaintext_out (see feed_ready).
+  if (s.state == State::Ready && s.stream.empty()) {
+    bool progress = false;
+    const Status st = s.feed_ready(wire, plaintext_out, progress);
+    if (st != Status::Ok) return st;
+    return progress ? Status::Ok : Status::NeedMoreData;
+  }
+
   // Feed arbitrarily large recv() batches in bounded internal chunks. The
   // aggregate check is on the unconsumed residue after complete records are
   // parsed, never on the caller's input span.
@@ -574,7 +747,7 @@ Status FakeTlsConnection::feed(std::span<const std::uint8_t> wire,
 }
 
 Status FakeTlsConnection::send(std::span<const std::uint8_t> plaintext,
-                               std::vector<std::uint8_t>& to_client) {
+                               std::vector<std::uint8_t>& to_client, std::size_t* open_record) {
   auto& s = *impl_;
   if (s.state != State::Ready) return Status::ProtocolError;
   constexpr std::size_t kMaxBody = 16384;
@@ -594,10 +767,20 @@ Status FakeTlsConnection::send(std::span<const std::uint8_t> plaintext,
     alias_copy.assign(plaintext.begin(), plaintext.end());
     plaintext = alias_copy;
   }
-  to_client.reserve(to_client.size() + plaintext.size() + records * kTlsHeaderSize);
+  reserve_growing(to_client, to_client.size() + plaintext.size() + records * kTlsHeaderSize);
   std::size_t off = 0;
+  if (const std::size_t room = open_record_room(to_client, open_record, kMaxBody);
+      room != 0 && !plaintext.empty()) {
+    const std::size_t n = std::min(room, plaintext.size());
+    const std::size_t body_offset = to_client.size();
+    append(to_client, plaintext.first(n));
+    s.encryptor->apply(std::span<std::uint8_t>(to_client).subspan(body_offset, n));
+    grow_open_record(to_client, *open_record, n);
+    off = n;
+  }
   while (off < plaintext.size()) {
     const std::size_t n = std::min(kMaxBody, plaintext.size() - off);
+    if (open_record) *open_record = to_client.size();
     to_client.push_back(0x17);
     to_client.push_back(0x03);
     to_client.push_back(0x03);
@@ -614,7 +797,8 @@ Status FakeTlsConnection::send(std::span<const std::uint8_t> plaintext,
 Status FakeTlsConnection::send_transport_message(ProtoTag tag,
                                                  std::span<const std::uint8_t> payload,
                                                  std::vector<std::uint8_t>& to_client,
-                                                 const RandomFn& random) {
+                                                 const RandomFn& random,
+                                                 std::size_t* open_record) {
   auto& s = *impl_;
   // Same validation order and messages as encode_transport_message() + send().
   if (tag == ProtoTag::Abridged) throw std::invalid_argument("abridged transport is not supported");
@@ -649,7 +833,7 @@ Status FakeTlsConnection::send_transport_message(ProtoTag tag,
   if (frame_size > available || records > (available - frame_size) / kTlsHeaderSize) {
     throw std::length_error("FakeTLS output too large");
   }
-  to_client.reserve(to_client.size() + frame_size + records * kTlsHeaderSize);
+  reserve_growing(to_client, to_client.size() + frame_size + records * kTlsHeaderSize);
 
   // The intermediate transport frame is [u32 len][payload][padding]; copy any
   // slice of that virtual frame into a TLS record body without materializing it.
@@ -690,8 +874,17 @@ Status FakeTlsConnection::send_transport_message(ProtoTag tag,
   };
 
   std::size_t off = 0;
+  if (const std::size_t room = open_record_room(to_client, open_record, kMaxBody); room != 0) {
+    const std::size_t n = std::min(room, frame_size);
+    const std::size_t body_offset = to_client.size();
+    append_frame_range(0, n);
+    s.encryptor->apply(std::span<std::uint8_t>(to_client).subspan(body_offset, n));
+    grow_open_record(to_client, *open_record, n);
+    off = n;
+  }
   while (off < frame_size) {
     const std::size_t n = std::min(kMaxBody, frame_size - off);
+    if (open_record) *open_record = to_client.size();
     to_client.push_back(0x17);
     to_client.push_back(0x03);
     to_client.push_back(0x03);

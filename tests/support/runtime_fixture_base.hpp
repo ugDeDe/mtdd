@@ -68,7 +68,7 @@ A16 secret_bytes() {
     return out;
 }
 
-std::array<std::uint8_t, 128> me_secret() {
+[[maybe_unused]] std::array<std::uint8_t, 128> me_secret() {
     std::array<std::uint8_t, 128> out{};
     for (std::size_t i = 0; i < out.size(); ++i) out[i] = static_cast<std::uint8_t>(i);
     return out;

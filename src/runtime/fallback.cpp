@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -49,6 +51,23 @@ bool sni_domain_matches(std::string_view sni, std::string_view domain) {
 
 }  // namespace
 
+namespace {
+std::mutex g_masking_override_mutex;
+std::optional<detail::DirectEndpointOverride> g_masking_override;
+
+std::optional<detail::DirectEndpointOverride> masking_override() {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    return g_masking_override;
+}
+}  // namespace
+
+namespace detail {
+void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value) {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    g_masking_override = std::move(value);
+}
+}  // namespace detail
+
 bool Runtime::Impl::fallback_enabled() const noexcept { return config_.fallback_port != 0; }
 
 bool Runtime::Impl::masking_enabled() const noexcept {
@@ -71,6 +90,32 @@ bool Runtime::Impl::append_fallback_bytes(Client& client, io::ByteQueue& queue,
     }
     reaccount(client);
     return true;
+}
+
+void Runtime::Impl::refresh_personal_domains() {
+    const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
+    if (!snapshot || snapshot == domains_snapshot_) return;
+    personal_domains_.clear();
+    for (const auto& user : snapshot->users) {
+        const auto& domain = user.policy.tls_domain;
+        if (domain.empty()) continue;
+        if (std::find(personal_domains_.begin(), personal_domains_.end(), domain) ==
+            personal_domains_.end()) {
+            personal_domains_.push_back(domain);
+        }
+    }
+    domains_snapshot_ = snapshot;
+}
+
+std::string Runtime::Impl::domain_for_sni(std::string_view sni) {
+    if (!config_.tls_domain.empty() && sni_domain_matches(sni, config_.tls_domain)) {
+        return config_.tls_domain;
+    }
+    refresh_personal_domains();
+    for (const auto& domain : personal_domains_) {
+        if (sni_domain_matches(sni, domain)) return domain;
+    }
+    return {};
 }
 
 std::string Runtime::Impl::ensure_fallback_address(Time now, std::string_view host) {
@@ -126,25 +171,41 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
     if (fallback_enabled()) {
         targets.emplace_back(ensure_fallback_address(now, config_.fallback_host),
                              config_.fallback_port);
-    } else if (config_.masking) {
+    } else if (config_.masking && !config_.tls_domain.empty()) {
         const auto sni = protocol::client_hello_sni(prefetched);
-        if (sni && sni_domain_matches(*sni, config_.tls_domain)) {
+        const std::string ours = sni ? domain_for_sni(*sni) : std::string{};
+        if (!ours.empty()) {
             targets.emplace_back(*sni, 443U);
-            if (to_lower(*sni) != to_lower(config_.tls_domain)) {
-                targets.emplace_back(config_.tls_domain, 443U);
+            if (to_lower(*sni) != to_lower(ours)) {
+                targets.emplace_back(ours, 443U);
             }
+        } else {
+            // A foreign or missing SNI, or bytes that are not TLS at all: the
+            // real site of tls_domain answers, as it would if the probe had
+            // reached it directly. Closing instead (an RST for the unread
+            // bytes) would single this server out. The target is fixed, so
+            // this never relays to an address chosen by the client.
+            targets.emplace_back(config_.tls_domain, 443U);
         }
     }
     if (targets.empty()) {
+        if (client.watched) watch_log(client, "masking", "target=none");
         close_client(client.token);
         return true;
     }
     auto connected = io::FdResult{};
     bool dialled = false;
-    for (const auto& [host, port] : targets) {
-        const std::string address = ensure_fallback_address(now, host);
+    const auto override_target = fallback_enabled() ? std::nullopt : masking_override();
+    for (const auto& [host, target_port] : targets) {
+        const std::string address =
+            override_target ? override_target->host : ensure_fallback_address(now, host);
+        const std::uint16_t port = override_target ? override_target->port : target_port;
         if (address.empty()) continue;
         auto attempt = io::connect_tcp(address, port);
+        if (client.watched) {
+            watch_log(client, "masking", "target=" + host + ":" + std::to_string(port) +
+                                             (attempt.ok() ? "" : " connect_failed"));
+        }
         if (attempt.ok()) {
             connected = std::move(attempt);
             dialled = true;
@@ -464,7 +525,8 @@ void Runtime::Impl::on_fallback_deadline(Client& client, Time now) {
 
 void Runtime::Impl::finish_fallback_pairs(Time now) {
     if (fallback_clients_.empty()) return;
-    std::vector<std::uint64_t> remaining;
+    std::vector<std::uint64_t>& remaining = fallback_remaining_;
+    remaining.clear();
     for (const std::uint64_t token : fallback_clients_) {
         const auto found = clients_.find(token);
         if (found == clients_.end()) continue;
@@ -499,7 +561,8 @@ void Runtime::Impl::finish_fallback_pairs(Time now) {
             remaining.push_back(token);
         }
     }
-    fallback_clients_ = std::move(remaining);
+    fallback_clients_.swap(remaining);
+    remaining.clear();
 }
 
 } // namespace mtdd

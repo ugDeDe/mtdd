@@ -118,6 +118,68 @@ class Result {
 
 // max_connections == nullopt means "unlimited"; 0 is rejected so null is the
 // only unlimited spelling.
+inline constexpr size_t kMaxNoteBytes = 256;
+inline constexpr size_t kMaxTlsDomainBytes = 253;
+inline constexpr uint64_t kMaxQuotaBytes = 1ull << 60;
+inline constexpr uint32_t kMaxUniqueIpsLimit = 1'000'000;
+inline constexpr uint32_t kMaxDevicesLimit = 1'000'000;
+inline constexpr uint64_t kMinRateLimitBytesPerSecond = 1024;
+inline constexpr uint64_t kMaxRateLimitBytesPerSecond = 100'000'000'000ull;
+inline constexpr int64_t kMaxExpiresAt = 253402300799;  // 9999-12-31T23:59:59Z
+
+// Optional per-user limits. nullopt / empty note means "not set". Any set
+// field makes the users file version 2; without them it stays version 1 so a
+// previous binary can still read it.
+struct UserPolicy {
+  std::optional<int64_t> expires_at;  // Unix seconds, UTC
+  std::optional<uint64_t> data_quota_bytes;  // c2s + s2c payload
+  std::optional<uint32_t> max_unique_ips;    // concurrent distinct client IPs
+  // Distinct devices (MTProto auth keys per DC, see the runtime device table).
+  std::optional<uint32_t> max_devices;
+  // Shaping in payload bytes per second, shared by all of the user's
+  // connections: up = client to Telegram, down = Telegram to client.
+  std::optional<uint64_t> rate_limit_up_bytes_per_sec;
+  std::optional<uint64_t> rate_limit_down_bytes_per_sec;
+  std::string note;  // admin free text, <= kMaxNoteBytes of printable UTF-8
+  // Bait user: its link is published on purpose, so every connection that
+  // authenticates with it is reported as a suspect (signal "canary").
+  bool canary{false};
+  // Personal FakeTLS domain (lowercase DNS name; empty = the global
+  // tls_domain). The user's link carries it, and only a ClientHello whose SNI
+  // equals it authenticates this user. Masking relays probes for any
+  // configured domain (global or personal) to that domain's real site.
+  std::string tls_domain;
+
+  bool empty() const noexcept {
+    return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
+           !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           note.empty() && !canary && tls_domain.empty();
+  }
+  bool operator==(const UserPolicy&) const = default;
+};
+
+// Explicit-null-aware patch: outer nullopt = unchanged, inner nullopt = clear.
+template <typename T>
+using Patch = std::optional<std::optional<T>>;
+
+struct UserPolicyPatch {
+  Patch<int64_t> expires_at;
+  Patch<uint64_t> data_quota_bytes;
+  Patch<uint32_t> max_unique_ips;
+  Patch<uint32_t> max_devices;
+  Patch<uint64_t> rate_limit_up_bytes_per_sec;
+  Patch<uint64_t> rate_limit_down_bytes_per_sec;
+  std::optional<std::string> note;  // "" clears
+  std::optional<bool> canary;
+  std::optional<std::string> tls_domain;  // "" clears (back to the global domain)
+
+  bool empty() const noexcept {
+    return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
+           !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           !note && !canary && !tls_domain;
+  }
+};
+
 struct UserRecord {
   std::string name;
   // 32 lowercase hexadecimal characters. Sensitive: never serialize through
@@ -131,6 +193,7 @@ struct UserRecord {
   // sessions by absence from the snapshot. Runtime authorizes a session only if
   // both name and generation match the current immutable snapshot.
   uint64_t generation{1};
+  UserPolicy policy;
 };
 
 struct UserSnapshot {
@@ -168,6 +231,7 @@ struct CreateUserRequest {
   std::optional<std::string> secret;  // omitted => generate via RAND_bytes
   bool enabled{true};
   std::optional<uint32_t> max_connections;  // nullopt => unlimited
+  UserPolicy policy;
   std::optional<uint64_t> if_match;         // optional optimistic concurrency
 };
 
@@ -176,6 +240,7 @@ struct UpdateUserRequest {
   std::optional<bool> enabled;       // nullopt => unchanged
   bool set_max_connections{false};   // distinguishes absent from explicit null
   std::optional<uint32_t> max_connections;  // nullopt + set_* => unlimited
+  UserPolicyPatch policy;
   std::optional<uint64_t> if_match;
 };
 
@@ -225,6 +290,9 @@ class UserStore {
   static Result<std::string> generate_secret();
   static bool is_valid_name(std::string_view name) noexcept;
   static bool is_valid_secret_hex(std::string_view secret) noexcept;
+  // Range and content checks shared by the API and the users file parser;
+  // returns a human-readable reason on failure.
+  static std::optional<std::string> validate_policy(const UserPolicy& policy);
 
  private:
   struct Impl;
@@ -243,15 +311,67 @@ enum class RejectReason {
   handshake_timeout,
   invalid_request,
   other,
+  // Per-user policy rejections (UserPolicy / UserRecord::max_connections).
+  user_connection_limit,
+  user_expired,
+  user_quota_exceeded,
+  user_ip_limit,
 };
 
 enum class HandshakeResult { success, failure, timeout, replay };
+// Why an authenticated relay session ended. First recorded reason wins.
+enum class RelayCloseReason : uint8_t {
+  other,
+  client_eof,      // peer half-closed and the session drained
+  client_error,    // recv/send error (reset, broken pipe)
+  client_timeout,  // ETIMEDOUT: TCP keepalive / TCP_USER_TIMEOUT found a dead peer
+  idle_timeout,
+  me_lost,         // the bound ME writer failed or was retired
+  backpressure,    // buffer budget or queue limit
+  remote_close,    // ME sent RPC_CLOSE_CONN
+  revoked,         // user disabled, deleted or rotated
+  shutdown,
+  device_limit,    // a new device (auth key) beyond the user's max_devices
+};
+inline constexpr std::size_t kRelayCloseReasons = 11;
 enum class Direction { client_to_server, server_to_client };
 enum class BufferState { queued, pending_write, relay };
 enum class MeResult { success, failure, timeout };
 // Outcome of one RPC_PROXY_ANS received from the signed-DC peer. "received" is
 // counted at the callback, so it stays distinct from delivery to a client.
 enum class MeAnswerResult { received, delivered, dropped_unknown, dropped_other };
+// Suspicious-behaviour signals (runtime suspect table, GET /v1/suspects).
+// Order is the wire/metric order; names are stable API strings.
+// Real iOS clients open a burst of connections, send req_pq on each, get
+// resPQ and drop them without reaching req_DH, which looks exactly like a
+// checker's probe. The one thing that separates them: the auth DC. For an RF
+// audience the authorization DC is always DC2 (media DC -2); a key exchange to
+// DC1 is never a real user here. probe_session is therefore recorded only when
+// the abandoned req_pq went to DC1.
+enum class SuspectSignal : uint8_t {
+  probe_session,    // A: req_pq to DC1 (never the RF auth DC), then abandoned
+  secret_text,      // B: proxy secret sent as plain text ("ee"/"dd" + hex)
+  raw_obfuscated2,  // C: raw obfuscated2 (no FakeTLS) to a FakeTLS-only proxy
+  multi_mode,       // D: FakeTLS and raw obfuscated2 from one IP within seconds
+  wrong_secret,     // E: ClientHello for our domain with a wrong secret
+  port_check,       // F: connected and closed without sending anything
+  repeat_visits,    // G: repeated short visits, never a long session
+  junk,             // H: other non-TLS bytes, foreign-SNI probe, replayed hello
+  canary,           // K: authenticated with a bait (canary) user
+};
+// Signals a real client also produces now and then (a key creation on DC1 by a
+// non-RF user, proxy ping, a stale link, retries). They score nothing for an
+// address that recently brought a real MTProto key; B, C, D and K always count.
+constexpr bool suspect_signal_ambiguous(SuspectSignal signal) noexcept {
+  return signal == SuspectSignal::probe_session || signal == SuspectSignal::wrong_secret ||
+         signal == SuspectSignal::port_check || signal == SuspectSignal::repeat_visits ||
+         signal == SuspectSignal::junk;
+}
+inline constexpr std::size_t kSuspectSignals = 9;
+const char* to_string(SuspectSignal signal) noexcept;
+// Fraud-score weight of the first hit; repeats add up to the same again.
+unsigned suspect_signal_weight(SuspectSignal signal) noexcept;
+
 enum class ApiRoute {
   health,
   ready,
@@ -262,6 +382,18 @@ enum class ApiRoute {
   rotate_secret,
   metrics,
   unknown,
+  system_info,
+  config,
+  stats_summary,
+  stats_me,
+  stats_users,
+  events,
+  user_enable,
+  user_disable,
+  user_reset_quota,
+  user_devices,
+  suspects,
+  ad_tag,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -275,9 +407,20 @@ const char* to_string(ApiMethod method) noexcept;
 
 struct UserMetricsSnapshot {
   uint64_t active_connections{0};
+  // Online IPs counted at authenticated handshake ("seen").
   uint64_t unique_ips_active{0};
+  // Online IPs whose connections moved >= unique_ip_min_bytes ("active").
+  uint64_t unique_ips_qualified{0};
+  // Distinct devices (MTProto auth keys, max over DCs) seen within the device
+  // window, and those of them with an open connection right now.
+  uint64_t devices{0};
+  uint64_t devices_connected{0};
   uint64_t payload_c2s_bytes{0};
   uint64_t payload_s2c_bytes{0};
+  // c2s + s2c payload bytes counted against UserPolicy::data_quota_bytes.
+  uint64_t quota_used_bytes{0};
+  // Unix seconds of the last reset_quota(); 0 = never reset.
+  int64_t quota_reset_at{0};
 };
 
 struct MeDcSnapshot {
@@ -391,7 +534,9 @@ struct StatisticsSnapshot {
   bool ready{false};
   uint64_t connections_accepted_total{0};
   uint64_t connections_active{0};
-  uint64_t active_unique_ips{0};
+  uint64_t active_unique_ips{0};     // online, counted at handshake ("seen")
+  uint64_t qualified_unique_ips{0};  // online, past the byte threshold ("active")
+  uint64_t unique_ip_min_bytes{0};
   uint64_t connections_rejected_total{0};
   std::map<std::string, uint64_t> rejected_by_reason;
   std::map<std::string, uint64_t> handshakes_by_result;
@@ -404,6 +549,10 @@ struct StatisticsSnapshot {
   uint64_t client_reuses_total{0};         // Client objects taken from freelist
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
+  std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
+  std::array<uint64_t, kSuspectSignals> suspect_events_total{};
+  uint64_t suspect_shadow_bans_total{0};
+  uint64_t media_throttled_total{0};
   uint64_t replay_cache_entries{0};
   uint64_t api_requests_total{0};
   uint64_t me_pending_buffer_bytes{0};
@@ -426,19 +575,70 @@ class UserMetrics {
   // per-user limit when two reactors admitted the same user concurrently.
   bool try_connection_open(uint64_t limit) noexcept;
   void connection_closed() noexcept;
+  // Also adds `bytes` to the quota counter, so every payload call site is
+  // quota-accounted without a second call.
   void add_payload(Direction direction, uint64_t bytes) noexcept;
+
+  // Quota counter (c2s + s2c payload). Not reset by connection churn.
+  uint64_t quota_used_bytes() const noexcept;
+  void set_quota_used_bytes(uint64_t value) noexcept;
+  // Startup restore of a persisted counter: both fields at once.
+  void restore_quota(uint64_t used_bytes, int64_t reset_at) noexcept;
+  // Zeroes the counter and records the wall-clock reset time (unix seconds).
+  void reset_quota() noexcept;
+  int64_t quota_reset_at() const noexcept;
+
+  // Per-user token bucket (one per direction), shared by every connection of
+  // the user on every reactor. Implemented as a GCRA "theoretical arrival
+  // time" in steady-clock nanoseconds, so it is one lock-free atomic per
+  // direction and a rate change needs no bucket state migration.
+  // Charges `bytes` against `rate_bytes_per_sec` (0 = unlimited, no-op).
+  // Always succeeds (debt model): returns the steady-clock time in ns at which
+  // the direction may be read again, or 0 if no pause is needed.
+  int64_t rate_consume(Direction direction, uint64_t bytes,
+                       uint64_t rate_bytes_per_sec, int64_t now_ns) noexcept;
+  // Same pause computation without charging anything.
+  int64_t rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
+                         int64_t now_ns) const noexcept;
+  // Burst allowance in bytes for a rate: max(rate, 64 KiB).
+  static uint64_t rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept;
+  // Connections of this user that moved payload in the last second (all, and
+  // media DCs only), summed over reactors. Rate limits are split by these.
+  void add_active_connections(int64_t all, int64_t media) noexcept;
+  int64_t active_rate_connections() const noexcept;
+  int64_t active_media_connections() const noexcept;
+  // Bumped on every active-count change, so connections can refresh their
+  // share as soon as the split changes instead of on the next 1 Hz pass.
+  uint64_t active_generation() const noexcept;
 
   uint64_t active_connections() const noexcept;
   void set_active_unique_ips(uint64_t value) noexcept;
   uint64_t active_unique_ips() const noexcept;
+  void set_qualified_unique_ips(uint64_t value) noexcept;
+  uint64_t qualified_unique_ips() const noexcept;
+  void set_devices(uint64_t recent, uint64_t connected) noexcept;
+  uint64_t devices() const noexcept;
+  uint64_t devices_connected() const noexcept;
   uint64_t payload_c2s_bytes() const noexcept;
   uint64_t payload_s2c_bytes() const noexcept;
 
  private:
   std::atomic<uint64_t> active_{0};
   std::atomic<uint64_t> unique_ips_{0};
+  std::atomic<uint64_t> qualified_ips_{0};
+  std::atomic<uint64_t> devices_{0};
+  std::atomic<uint64_t> devices_connected_{0};
   std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
+  // Quota usage is (c2s + s2c) - quota_base_: the hot path pays only the
+  // existing per-direction counter, and reset/restore just move the base.
+  std::atomic<int64_t> quota_base_{0};
+  std::atomic<int64_t> quota_reset_at_{0};
+  // Own cache line: rate buckets are written by every reactor serving the user.
+  alignas(64) std::atomic<int64_t> rate_tat_[2]{};
+  std::atomic<int64_t> active_rate_conns_{0};
+  std::atomic<int64_t> active_media_conns_{0};
+  std::atomic<uint64_t> active_generation_{0};
 };
 
 // Thread-safe. Label sets are bounded by construction (enums and fixed label
@@ -464,6 +664,48 @@ class Statistics {
   bool ready() const noexcept;
   void set_build_info(std::string version);
 
+  // Per-user device list (max_devices accounting), provided by the runtime.
+  // An empty lister (no runtime) yields no devices.
+  struct DeviceInfo {
+    uint32_t id{0};           // short tag derived from the auth_key_id
+    int16_t dc{0};            // signed DC
+    uint32_t connections{0};  // open connections presenting this key
+    int64_t idle_seconds{0};  // since the last connection closed; 0 while connected
+    std::string ip;           // address of the most recent connection
+    std::string platform{"Undefined"};  // Apple, Android, Linux, Windows, Undefined
+  };
+  using DeviceLister = std::function<std::vector<DeviceInfo>(const std::string& user)>;
+  void set_device_lister(DeviceLister lister);
+  std::vector<DeviceInfo> devices(const std::string& user) const;
+
+  // Runtime suspect table (GET /v1/suspects), provided by the runtime.
+  struct SuspectInfo {
+    std::string ip;
+    std::array<uint32_t, kSuspectSignals> hits{};
+    uint32_t matches{0};      // distinct signals seen
+    double score{0};          // fraud score 0..100, decayed
+    int64_t first_seen{0};    // Unix seconds
+    int64_t last_seen{0};
+    uint32_t visits{0};
+    std::string user;         // last authenticated user, if any
+    std::string sni;          // last ClientHello SNI, if any
+    std::string platform{"Undefined"};
+    std::string tls{"other"};
+    uint8_t ttl{0};
+    uint16_t window{0};
+    uint16_t mss{0};
+    int8_t wscale{-1};
+    std::string layout{"other"};
+    bool watched{false};      // above suspect_watch_score: per-stage log
+    bool shadow_banned{false};  // above suspect_ban_score: sent to masking
+    bool real_client{false};    // also had real sessions (a non-zero auth key)
+  };
+  using SuspectLister = std::function<std::vector<SuspectInfo>()>;
+  void set_suspect_lister(SuspectLister lister);
+  std::vector<SuspectInfo> suspects() const;
+  void suspect_event(SuspectSignal signal) noexcept;
+  void suspect_shadow_banned() noexcept;
+
   // Global connection counters.
   void connection_accepted() noexcept;
   void connection_closed() noexcept;
@@ -477,6 +719,9 @@ class Statistics {
   void forget_user(std::string_view name) noexcept;
 
   void set_active_unique_ips(uint64_t value) noexcept;
+  // Online IPs past the byte threshold; see Config::unique_ip_min_bytes.
+  void set_qualified_unique_ips(uint64_t value) noexcept;
+  void set_unique_ip_min_bytes(uint64_t value) noexcept;
 
   // Startup-only, once, before the reactor/control threads run. An empty path
   // is memory-only. Construction may throw a generic startup/read error.
@@ -486,6 +731,8 @@ class Statistics {
   // Canonical 16-byte IP without port. False when disabled or the keyed HLL
   // update failed. Never affects proxy clients.
   bool observe_ip_history(const std::array<std::uint8_t, 16>& ip) noexcept;
+  // Same, for the "active" sketches (IP passed the byte threshold).
+  bool observe_ip_history_active(const std::array<std::uint8_t, 16>& ip) noexcept;
 
   void set_buffer_bytes(BufferState state, uint64_t bytes) noexcept;
   void set_buffer_bytes(std::size_t worker, BufferState state, uint64_t bytes) noexcept;
@@ -497,6 +744,9 @@ class Statistics {
   void set_client_pool(std::size_t worker, uint64_t pooled, uint64_t allocations,
                        uint64_t reuses) noexcept;
   void add_backpressure(Direction direction) noexcept;
+  void relay_closed(RelayCloseReason reason) noexcept;
+  // Media shaping held a client (one count per throttle episode).
+  void media_throttled() noexcept;
   void set_replay_cache_entries(uint64_t entries) noexcept;
   void set_replay_cache_entries(std::size_t worker, uint64_t entries) noexcept;
 
@@ -608,6 +858,8 @@ class Statistics {
   static std::string escape_label(std::string_view value);
 
  private:
+  bool observe_history(const std::array<std::uint8_t, 16>& ip, bool active) noexcept;
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -616,7 +868,12 @@ class Statistics {
 // HTTP control server
 // ---------------------------------------------------------------------------
 
+// A listener either serves the management API (/v1/*, plus the deprecated
+// /metrics alias for the admin token) or only the Prometheus exporter.
+enum class HttpRole { api, metrics };
+
 struct HttpOptions {
+  HttpRole role{HttpRole::api};
   std::string public_host;
   uint16_t public_port{0};
   std::string tls_domain;
@@ -624,7 +881,16 @@ struct HttpOptions {
   uint16_t port{0};  // 0 => ephemeral, actual port from start()
   // Required; never persisted or logged by this module. Supplied by the leader
   // from the environment.
+  // api role: admin token, required. Ignored by the metrics role.
   std::string bearer_token;
+  // api role, optional: GET-only token; never sees /links or /metrics.
+  std::string read_token;
+  // metrics role, optional: when empty the listener relies on allow_networks
+  // alone, which then must not be empty.
+  std::string metrics_token;
+  // CIDR allowlist of peer addresses ("127.0.0.0/8", "::1"). Empty => any
+  // peer that holds a valid token. Refused peers get 403 before auth.
+  std::vector<std::string> allow_networks;
   size_t max_body_bytes{64 * 1024};
   size_t max_header_bytes{16 * 1024};
   // Max retained HTTP connections (1..4096). Each accepted connection gets an
@@ -640,6 +906,16 @@ struct HttpOptions {
   double global_rate_limit_per_second{1000.0};
   double global_rate_limit_burst{2000.0};
   size_t rate_limit_sources{256};
+  // api role: pre-rendered JSON objects served by GET /v1/config and merged
+  // into GET /v1/system/info. Built by the leader from Config with every token
+  // and the ad_tag left out; empty means "{}".
+  std::string config_json;
+  std::string system_info_json;
+  // api role, optional: live ad-tag override (GET/POST/DELETE /v1/ad-tag).
+  // Applies a tag to the running data plane (nullopt = back to the configured
+  // one) and returns false when the runtime rejected it. Nothing is persisted:
+  // a restart returns to config.ad_tag. Without a hook the route answers 404.
+  std::function<bool(const std::optional<std::array<uint8_t, 16>>&)> ad_tag_hook;
 };
 
 class ControlServer {

@@ -71,7 +71,11 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
     // detects a half-open ME socket (NAT/peer restart) even when no traffic and
     // no PONG is pending, complementing the application-level ping.
     (void)io::set_tcp_nodelay(me.fd.get());
-    (void)io::set_tcp_keepalive(me.fd.get());
+    (void)io::set_tcp_keepalive(me.fd.get(), 30, 10, 3);
+    // A shared ME stream whose frames stay unacknowledged for this long is
+    // dead; failing it in ~30 s instead of the ping window (3 x 25 s) lets its
+    // clients reconnect to a live writer sooner.
+    (void)io::set_tcp_user_timeout(me.fd.get(), detail::kMeUserTimeoutMs);
     me.state = MeConn::State::connecting;
     me.armed = 0;
     update_me_interest(me);
@@ -180,6 +184,7 @@ void Runtime::Impl::fail_me(MeConn& me, Time now) {
         }
     }
     me.state = MeConn::State::backoff;
+    me.flush_pending = false;  // staged requests die with the session
     if (me.ping_token != 0) deadlines_.erase(me.ping_token);
     me.pending_pings.clear();
     me.unanswered_pings = 0;
@@ -225,7 +230,7 @@ void Runtime::Impl::close_me_clients(MeConn& me) {
     for (const auto& [token, client] : clients_) {
         if (client->me == &me) closing.push_back(token);
     }
-    for (const std::uint64_t token : closing) close_client(token);
+    for (const std::uint64_t token : closing) close_client(token, control::RelayCloseReason::me_lost);
 }
 
 void Runtime::Impl::shutdown_me(MeConn& me) {
@@ -288,7 +293,7 @@ void Runtime::Impl::handle_me(MeConn& me, std::uint32_t events, Time now) {
                 //   * budget_paused, where EPOLLIN is disarmed and no read will
                 //     ever happen, so waiting would only spin.
                 const bool batch_exhausted =
-                    (me.rx_bytes - rx_before) >= detail::kReadBatch;
+                    (me.rx_bytes - rx_before) >= detail::kReadBatch;  // incl. a budget-reduced batch
                 if (batch_exhausted && !me.budget_paused && (events & EPOLLHUP) == 0) return;
                 fail_me(me, now);
             }
@@ -308,15 +313,31 @@ void Runtime::Impl::handle_me(MeConn& me, std::uint32_t events, Time now) {
 
 void Runtime::Impl::read_me(MeConn& me, Time now) {
     if (!me.session || !me.fd.valid()) return;
+    // Answers decoded below are coalesced per client; write them on every exit
+    // path, including a failure of this ME connection.
+    struct S2cFlush {
+        Impl& impl;
+        ~S2cFlush() {
+            try {
+                impl.flush_s2c_batches();
+            } catch (...) {
+            }
+        }
+    } s2c_flush{*this};
     std::size_t total = 0;
     bool became_ready = false;
-    while (total < detail::kReadBatch) {
-        const std::size_t limit = detail::kReadBatch - total;
+    const std::size_t batch = std::min(detail::kMeReadBatch, read_buffer_.size());
+    while (total < batch) {
+        std::size_t limit = batch - total;
         // ME reassembly buffers (ciphertext/plaintext residue) are charged to
         // the global relay budget only after feed(); admit the worst-case
         // growth of this batch plus the shared headroom before touching the
         // socket. Without this an incomplete frame could grow past the hard
-        // envelope. Pausing is preferable to failing the shared session.
+        // envelope. Pausing is preferable to failing the shared session. A
+        // tight budget falls back to the client-sized batch before pausing.
+        if (!budget_allows(limit + detail::kBudgetHeadroom / 2)) {
+            limit = std::min(limit, detail::kReadBatch);
+        }
         if (!budget_allows(limit + detail::kBudgetHeadroom / 2)) {
             // Count only the false -> true transition: level-triggered retries
             // never reach here while paused, and a per-read counter would turn
@@ -353,6 +374,9 @@ void Runtime::Impl::read_me(MeConn& me, Time now) {
                 me.session->state() == protocol::MiddleEndSession::State::Ready) {
                 became_ready = true;
             }
+            // Short read: the socket is drained; the level-triggered EPOLLIN
+            // reports further data, so skip the EAGAIN-only recv.
+            if (static_cast<std::size_t>(received) < limit) break;
         } else if (received == 0) {
             fail_me(me, now);
             return;

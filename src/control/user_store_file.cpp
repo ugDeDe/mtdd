@@ -7,7 +7,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <limits>
 #include <string>
 #include <unordered_set>
 
@@ -35,6 +37,26 @@ std::string lower_ascii(std::string value) {
     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
   }
   return value;
+}
+
+bool valid_tls_domain(std::string_view domain) {
+  if (domain.empty() || domain.size() > kMaxTlsDomainBytes) return false;
+  size_t start = 0;
+  while (start < domain.size()) {
+    const size_t end = domain.find('.', start);
+    const size_t length = (end == std::string_view::npos ? domain.size() : end) - start;
+    if (length == 0 || length > 63 || domain[start] == '-' ||
+        domain[start + length - 1] == '-') {
+      return false;
+    }
+    for (size_t i = start; i < start + length; ++i) {
+      const char c = domain[i];
+      if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-') return false;
+    }
+    if (end == std::string_view::npos) return true;
+    start = end + 1;
+  }
+  return false;  // trailing dot
 }
 
 bool is_hex_digit(char c) {
@@ -158,12 +180,76 @@ std::optional<uint32_t> as_max_connections(const json& value) {
   return static_cast<uint32_t>(*number);
 }
 
-std::optional<Error> validate_user_json(const json& j, UserRecord& out) {
+// Reads an optional unsigned (or, for expires_at, non-negative) integer.
+template <typename T>
+std::optional<Error> optional_number(const json& j, const char* key,
+                                     std::optional<T>& out) {
+  if (!j.contains(key) || j[key].is_null()) return std::nullopt;
+  const auto value = as_u64(j[key]);
+  if (!value || *value > static_cast<uint64_t>(std::numeric_limits<T>::max())) {
+    return Error{ErrorCode::invalid_field,
+                 std::string("user.") + key + " must be null or an unsigned integer"};
+  }
+  out = static_cast<T>(*value);
+  return std::nullopt;
+}
+
+std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
+  if (auto error = optional_number(j, "expires_at", out.expires_at)) return error;
+  if (auto error = optional_number(j, "data_quota_bytes", out.data_quota_bytes)) {
+    return error;
+  }
+  if (auto error = optional_number(j, "max_unique_ips", out.max_unique_ips)) {
+    return error;
+  }
+  if (auto error = optional_number(j, "max_devices", out.max_devices)) return error;
+  if (auto error = optional_number(j, "rate_limit_up_bytes_per_sec",
+                                   out.rate_limit_up_bytes_per_sec)) {
+    return error;
+  }
+  if (auto error = optional_number(j, "rate_limit_down_bytes_per_sec",
+                                   out.rate_limit_down_bytes_per_sec)) {
+    return error;
+  }
+  if (j.contains("note")) {
+    if (!j["note"].is_string()) {
+      return Error{ErrorCode::invalid_field, "user.note must be a string"};
+    }
+    out.note = j["note"].get<std::string>();
+  }
+  if (j.contains("canary")) {
+    if (!j["canary"].is_boolean()) {
+      return Error{ErrorCode::invalid_field, "user.canary must be a boolean"};
+    }
+    out.canary = j["canary"].get<bool>();
+  }
+  if (j.contains("tls_domain")) {
+    if (!j["tls_domain"].is_string()) {
+      return Error{ErrorCode::invalid_field, "user.tls_domain must be a string"};
+    }
+    out.tls_domain = j["tls_domain"].get<std::string>();
+  }
+  if (auto reason = UserStore::validate_policy(out)) {
+    return Error{ErrorCode::invalid_field, "user: " + *reason};
+  }
+  return std::nullopt;
+}
+
+std::optional<Error> validate_user_json(const json& j, uint64_t version,
+                                        UserRecord& out) {
   if (!j.is_object()) {
     return Error{ErrorCode::invalid_file, "user entry is not an object"};
   }
-  if (auto error = check_allowed_store_fields(
-          j, {"name", "secret", "enabled", "max_connections", "generation"})) {
+  if (version == 1) {
+    if (auto error = check_allowed_store_fields(
+            j, {"name", "secret", "enabled", "max_connections", "generation"})) {
+      return error;
+    }
+  } else if (auto error = check_allowed_store_fields(
+                 j, {"name", "secret", "enabled", "max_connections", "generation",
+                     "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
+                     "rate_limit_up_bytes_per_sec",
+                     "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
     return error;
   }
   if (!j.contains("name") || !j["name"].is_string()) {
@@ -206,6 +292,7 @@ std::optional<Error> validate_user_json(const json& j, UserRecord& out) {
     return Error{ErrorCode::invalid_field, "user.generation must be >= 1"};
   }
   out.generation = *generation;
+  if (version >= 2) return validate_policy_json(j, out.policy);
   return std::nullopt;
 }
 
@@ -224,7 +311,7 @@ std::optional<Error> parse_store_file(const std::string& text, size_t max_users,
   }
   const auto version = as_u64(root["version"]);
   if (!version) return Error{ErrorCode::invalid_field, "version must be an integer"};
-  if (*version != 1) {
+  if (*version != 1 && *version != 2) {
     return Error{ErrorCode::unsupported_version,
                  "unsupported users file version " + std::to_string(*version)};
   }
@@ -252,7 +339,7 @@ std::optional<Error> parse_store_file(const std::string& text, size_t max_users,
   users.reserve(array.size());
   for (const auto& entry : array) {
     UserRecord record;
-    if (auto error = validate_user_json(entry, record)) {
+    if (auto error = validate_user_json(entry, *version, record)) {
       return error;
     }
     if (!names.insert(record.name).second) {
@@ -299,7 +386,10 @@ std::optional<Error> write_all(int fd, std::string_view data) {
 std::string serialize_snapshot(uint64_t revision,
                                const std::vector<UserRecord>& users) {
   json root;
-  root["version"] = 1;
+  const bool extended = std::any_of(users.begin(), users.end(), [](const UserRecord& user) {
+    return !user.policy.empty();
+  });
+  root["version"] = extended ? 2 : 1;
   root["revision"] = revision;
   json array = json::array();
   for (const auto& user : users) {
@@ -313,6 +403,22 @@ std::string serialize_snapshot(uint64_t revision,
       entry["max_connections"] = nullptr;
     }
     entry["generation"] = user.generation;
+    if (extended) {
+      const auto nullable = [](const auto& value) {
+        return value ? json(*value) : json(nullptr);
+      };
+      const UserPolicy& policy = user.policy;
+      entry["expires_at"] = nullable(policy.expires_at);
+      entry["data_quota_bytes"] = nullable(policy.data_quota_bytes);
+      entry["max_unique_ips"] = nullable(policy.max_unique_ips);
+      entry["max_devices"] = nullable(policy.max_devices);
+      entry["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
+      entry["rate_limit_down_bytes_per_sec"] =
+          nullable(policy.rate_limit_down_bytes_per_sec);
+      entry["note"] = policy.note;
+      if (policy.canary) entry["canary"] = true;
+      if (!policy.tls_domain.empty()) entry["tls_domain"] = policy.tls_domain;
+    }
     array.push_back(std::move(entry));
   }
   root["users"] = std::move(array);

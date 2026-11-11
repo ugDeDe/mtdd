@@ -216,6 +216,12 @@ struct FdResult {
                                      int interval_seconds = 10,
                                      int probes = 6) noexcept;
 
+/// Sets TCP_USER_TIMEOUT: the connection is reset when transmitted data (or a
+/// keepalive probe) stays unacknowledged for @p timeout_ms. Zero restores the
+/// kernel default (retransmission/orphan retry limits). Returns false when the
+/// option could not be applied.
+[[nodiscard]] bool set_tcp_user_timeout(int fd, unsigned timeout_ms) noexcept;
+
 /// Disables Nagle's algorithm. MTProto/FakeTLS records are small and
 /// latency-sensitive, so coalescing them adds avoidable round-trip delay.
 [[nodiscard]] bool set_tcp_nodelay(int fd) noexcept;
@@ -226,5 +232,9 @@ struct FdResult {
 /// std::bad_alloc may propagate to the caller.
 [[nodiscard]] std::optional<Endpoint> local_endpoint(int fd);
 [[nodiscard]] std::optional<Endpoint> peer_endpoint(int fd);
+/// Converts a sockaddr returned by accept4()/recvfrom() (@p length bytes at
+/// @p address) without a getpeername() system call.
+[[nodiscard]] std::optional<Endpoint> endpoint_from_address(const void* address,
+                                                            std::size_t length);
 
 }  // namespace mtdd::io

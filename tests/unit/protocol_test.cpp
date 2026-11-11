@@ -136,7 +136,10 @@ TEST(Crypto, Crc32cKnownVectorsAndIndependentReference) {
       const auto data = std::span<const std::uint8_t>(storage).subspan(offset, length);
       EXPECT_EQ(crypto::crc32c(data), reference(data)) << offset << ":" << length;
     }
-    for (const std::size_t length : {255u, 256u, 257u, 4095u, 4096u, 4097u, 65535u}) {
+    // 767..769 and 24575..24577 cross the three-way block boundaries
+    // (3 x 256 and 3 x 8192 bytes) of the hardware path.
+    for (const std::size_t length : {255u, 256u, 257u, 767u, 768u, 769u, 4095u, 4096u, 4097u,
+                                     24575u, 24576u, 24577u, 50000u, 65535u, 1048576u}) {
       const auto data = std::span<const std::uint8_t>(storage).subspan(offset, length);
       EXPECT_EQ(crypto::crc32c(data), reference(data));
     }
@@ -349,6 +352,70 @@ TEST(FakeTls, ClientHelloKnownAnswer) {
   EXPECT_EQ(info.digest, arr<32>(from_hex("e9554afbd8c6fccd0dd851be7043e8cac9904b7d18f4ef8b6b0dd0f274c3f4f2")));
   EXPECT_FALSE(info.offers_pq);
   EXPECT_TRUE(info.server_name.empty());
+}
+
+TEST(Crypto, BufferedRandomServesFreshBytesAcrossRefills) {
+  const auto random = buffered_random();
+  std::set<Bytes> seen;
+  std::size_t served = 0;
+  // Small requests cross several 4 KiB refills; large ones bypass the block.
+  for (const std::size_t size : {1U, 3U, 16U, 32U, 257U, 4096U}) {
+    for (int round = 0; round < 300; ++round) {
+      Bytes out(size, 0);
+      random(out);
+      served += size;
+      if (size >= 16) {
+        EXPECT_TRUE(seen.insert(out).second) << "repeated block of " << size;
+        EXPECT_NE(out, Bytes(size, 0));
+      }
+    }
+  }
+  EXPECT_GT(served, 3U * 4096U);
+  Bytes empty;
+  random(empty);
+}
+
+TEST(Crypto, PrekeyedHmacMatchesOneShotHmac) {
+  A16 key{};
+  for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::uint8_t>(i * 7 + 1);
+  const crypto::HmacSha256Key keyed(key);
+  for (const std::size_t size : {0U, 1U, 55U, 64U, 517U, 4096U}) {
+    Bytes data(size);
+    for (std::size_t i = 0; i < size; ++i) data[i] = static_cast<std::uint8_t>(i ^ 0xa5);
+    EXPECT_EQ(keyed.mac(data), crypto::hmac_sha256(key, data)) << size;
+    // The keyed state is reusable: a second call gives the same answer.
+    EXPECT_EQ(keyed.mac(data), crypto::hmac_sha256(key, data)) << size;
+  }
+  crypto::HmacSha256Key source(key);
+  crypto::HmacSha256Key moved(std::move(source));
+  EXPECT_EQ(moved.mac(Bytes{1, 2, 3}), crypto::hmac_sha256(key, Bytes{1, 2, 3}));
+}
+
+TEST(FakeTls, ClientHelloMultiKeyPicksFirstMatchingKey) {
+  auto rec = from_hex(kClientHelloHex);
+  A16 wrong{};
+  wrong.fill(0x5a);
+  const crypto::HmacSha256Key bad_key(wrong);
+  const crypto::HmacSha256Key good_key(kSecret);
+  const crypto::HmacSha256Key* keys[] = {&bad_key, nullptr, &good_key, &good_key};
+  ClientHelloInfo info;
+  std::size_t matched = 99;
+  ASSERT_EQ(validate_client_hello(rec, keys, kNow, 120, info, matched), HelloStatus::Ok);
+  EXPECT_EQ(matched, 2U);
+  EXPECT_EQ(info.timestamp, 1600000000u);
+  EXPECT_EQ(info.secret, kSecret);
+  ClientHelloInfo single;
+  ASSERT_EQ(validate_client_hello(rec, kSecret, kNow, 120, single), HelloStatus::Ok);
+  EXPECT_EQ(info.canonical_hmac, single.canonical_hmac);
+
+  const crypto::HmacSha256Key* only_bad[] = {&bad_key};
+  EXPECT_EQ(validate_client_hello(rec, only_bad, kNow, 120, info, matched),
+            HelloStatus::Unauthenticated);
+  EXPECT_EQ(validate_client_hello(rec, std::span<const crypto::HmacSha256Key* const>{}, kNow,
+                                  120, info, matched),
+            HelloStatus::Unauthenticated);
+  EXPECT_EQ(validate_client_hello(rec, keys, kNow + 121, 120, info, matched),
+            HelloStatus::ClockSkew);
 }
 
 TEST(FakeTls, ClientHelloRejectsTamperWrongSecretAndSkew) {
@@ -847,6 +914,70 @@ TEST(FakeTls, Accepts16KiBRecordsIn12KiBChunks) {
   }
   EXPECT_EQ(conn.state(), FakeTlsConnection::State::Ready);
   EXPECT_EQ(plain, payload);
+}
+
+// Ready state: records are parsed straight from the input and decrypted into
+// the output buffer; any split of the input must give the same plaintext.
+TEST(FakeTls, ReadyRecordsAnySplitDecryptInPlaceOfCopy) {
+  auto hello = from_hex(kClientHelloHex);
+  auto obf = make_client_obfuscation(kSecret, 0xdddddddd, 2);
+  Bytes payload(50000);
+  for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::uint8_t>(i * 31 + 11);
+  Bytes stream = payload;
+  {
+    crypto::AesCtr c(obf.dec_key, obf.dec_iv);
+    c.skip(64);
+    c.apply(stream);
+  }
+  // Records of uneven sizes with a ChangeCipherSpec in the middle.
+  Bytes records;
+  const std::size_t sizes[] = {1, 300, 16384, 7, 9000, 2};
+  std::size_t off = 0;
+  for (std::size_t i = 0; off < stream.size(); ++i) {
+    const std::size_t n = std::min(sizes[i % 6], stream.size() - off);
+    records = cat({records, tls_wrap(0x17, std::span<const std::uint8_t>(stream).subspan(off, n))});
+    off += n;
+    if (i == 3) records = cat({records, tls_wrap(0x14, from_hex("01"))});
+  }
+  for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}, std::size_t{4096},
+                                  records.size()}) {
+    FakeTlsConnection::Config cfg;
+    cfg.secret = kSecret;
+    CountingRng rng;
+    cfg.random = rng.fn();
+    cfg.clock = [] { return kNow; };
+    FakeTlsConnection conn(cfg);
+    std::vector<std::uint8_t> to_client, plain;
+    ASSERT_EQ(conn.feed(hello, to_client, plain), Status::Ok);
+    ASSERT_NE(conn.feed(tls_wrap(0x17, obf.wire), to_client, plain), Status::ProtocolError);
+    ASSERT_EQ(conn.state(), FakeTlsConnection::State::Ready);
+    Bytes got;
+    for (std::size_t pos = 0; pos < records.size(); pos += chunk) {
+      plain.clear();
+      const auto st = conn.feed(std::span<const std::uint8_t>(records).subspan(
+                                    pos, std::min(chunk, records.size() - pos)),
+                                to_client, plain);
+      ASSERT_NE(st, Status::ProtocolError) << "chunk=" << chunk << " pos=" << pos;
+      got.insert(got.end(), plain.begin(), plain.end());
+    }
+    EXPECT_EQ(got, payload) << "chunk=" << chunk;
+    EXPECT_LT(conn.retained_bytes(), 32u * 1024u) << "chunk=" << chunk;
+    // An alert closes; nothing is accepted afterwards.
+    plain.clear();
+    EXPECT_EQ(conn.feed(tls_wrap(0x15, from_hex("0100")), to_client, plain), Status::Closed);
+    EXPECT_EQ(conn.feed(tls_wrap(0x17, from_hex("00")), to_client, plain), Status::Closed);
+  }
+  // A bad record length in the Ready state is still a protocol error.
+  FakeTlsConnection::Config cfg;
+  cfg.secret = kSecret;
+  CountingRng rng;
+  cfg.random = rng.fn();
+  cfg.clock = [] { return kNow; };
+  FakeTlsConnection conn(cfg);
+  std::vector<std::uint8_t> to_client, plain;
+  ASSERT_EQ(conn.feed(hello, to_client, plain), Status::Ok);
+  ASSERT_NE(conn.feed(tls_wrap(0x17, obf.wire), to_client, plain), Status::ProtocolError);
+  EXPECT_EQ(conn.feed(from_hex("1703030000"), to_client, plain), Status::ProtocolError);
 }
 
 // ----------------------------- transport codec -----------------------------

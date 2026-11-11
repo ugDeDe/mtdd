@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/eventfd.h>
@@ -17,6 +18,13 @@
 #include <system_error>
 #include <string>
 #include <utility>
+
+#ifndef TCP_SAVE_SYN
+#define TCP_SAVE_SYN 27  // Linux 4.2+
+#endif
+#ifndef TCP_SAVED_SYN
+#define TCP_SAVED_SYN 28
+#endif
 
 namespace mtdd {
 namespace {
@@ -166,9 +174,14 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
                      : std::make_shared<detail::SharedState>(
                            1, config.global_buffer_bytes)),
       worker_index_(worker_index), reuse_port_(reuse_port),
-      signal_owner_(signal_owner), random_(protocol::system_random()) {
+      signal_owner_(signal_owner), random_(protocol::buffered_random()) {
     if (config_.max_frame_bytes == 0 || config_.connection_queue_bytes == 0) {
         throw std::invalid_argument("runtime configuration has zero limits");
+    }
+    for (const auto& entry : config_.watch_ips) {
+        auto net = detail::parse_watch_net(entry);
+        if (!net) throw std::invalid_argument("invalid watch_ips entry: " + entry);
+        watch_.push_back(*net);
     }
     if (std::all_of(config_.ad_tag.begin(), config_.ad_tag.end(),
                     [](std::uint8_t byte) { return byte == 0; })) {
@@ -200,6 +213,7 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
                              ? pool_budget
                              : std::min<std::size_t>(config_.max_connections,
                                                      pool_budget);
+    stats_.set_unique_ip_min_bytes(config_.unique_ip_min_bytes);
     setup();
 }
 
@@ -241,6 +255,25 @@ void Runtime::Impl::setup() {
         throw syscall_error("cannot bind proxy listener");
     }
     listener_ = std::move(listener.fd);
+    // Accepted sockets inherit these from the listener (Linux copies the
+    // listening socket's options on accept), so the accept path issues no
+    // per-connection setsockopt. Small FakeTLS records: no Nagle. Keepalive and
+    // TCP_USER_TIMEOUT find vanished peers instead of idle_timeout.
+    (void)io::set_tcp_nodelay(listener_.get());
+    // Keep each connection's SYN for the platform fingerprint (read once in
+    // make_client; the kernel frees it on read or close).
+    if (config_.fingerprint) {
+        const int enable = 1;
+        (void)::setsockopt(listener_.get(), IPPROTO_TCP, TCP_SAVE_SYN, &enable, sizeof(enable));
+    }
+    if (config_.client_keepalive.count() > 0) {
+        const int idle = static_cast<int>(config_.client_keepalive.count());
+        (void)io::set_tcp_keepalive(listener_.get(), idle, std::clamp(idle / 4, 5, 30), 4);
+    }
+    if (config_.client_ack_timeout.count() > 0) {
+        (void)io::set_tcp_user_timeout(
+            listener_.get(), static_cast<unsigned>(config_.client_ack_timeout.count()) * 1000U);
+    }
 
     const auto local = io::local_endpoint(listener_.get());
     if (!local) throw std::runtime_error("cannot read bound proxy port");
@@ -270,6 +303,13 @@ void Runtime::Impl::setup() {
     sigaddset(&all, SIGINT);
     sigaddset(&all, SIGTERM);
     sigset_t current{};
+    // SIGHUP (reload) is taken only when the embedder blocked it as well;
+    // otherwise its default action is left to the process.
+    sigset_t blocked{};
+    if (::pthread_sigmask(SIG_SETMASK, nullptr, &blocked) == 0 &&
+        sigismember(&blocked, SIGHUP) == 1) {
+        sigaddset(&all, SIGHUP);
+    }
     if (signal_owner_ && ::pthread_sigmask(SIG_SETMASK, nullptr, &current) == 0 &&
         (sigismember(&current, SIGINT) == 1 || sigismember(&current, SIGTERM) == 1)) {
         const int fd = ::signalfd(-1, &all, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -280,7 +320,11 @@ void Runtime::Impl::setup() {
         }
     }
 
-    read_buffer_.resize(detail::kReadBatch);
+    // The read buffer is charged to the relay budget (shared_bytes): the
+    // larger ME batch only where it is a negligible share of the budget.
+    read_buffer_.resize(config_.global_buffer_bytes >= 16U * detail::kMeReadBatch
+                            ? detail::kMeReadBatch
+                            : detail::kReadBatch);
     next_eof_sweep_ = Clock::now();
     next_eof_deadline_ = Time::max();
     reaccount_shared();
@@ -350,8 +394,19 @@ void Runtime::Impl::run() {
                 std::uint64_t relay = 0;
                 std::uint64_t me_pending = 0;
                 std::map<std::int16_t, std::uint64_t> direct_active;
+                // Fair-share rate limits: a limited connection silent for a
+                // second stops counting as active; every limited connection
+                // re-reads its share of the user's (and media) limits.
                 for (auto& [token, client] : clients_) {
                     (void)token;
+                    if (client->counted_active && client->window_bytes == 0) {
+                        set_counted_active(*client, false);
+                    }
+                    client->window_bytes = 0;
+                    if (client->counted_active || client->rate_up != 0 ||
+                        client->rate_down != 0 || rate_limited(*client)) {
+                        recompute_rate_share(*client);
+                    }
                     if (now - client->last_activity >= detail::kIdleTrimAfter) {
                         trim_idle_client(*client);
                     }
@@ -441,8 +496,13 @@ void Runtime::Impl::run() {
                     lifecycle.allocations.load(std::memory_order_relaxed),
                     lifecycle.reuses.load(std::memory_order_relaxed));
                 next_gauge_ = now + std::chrono::seconds(1);
+                // Expiry and quota are time/traffic driven, not snapshot driven.
+                sweep_user_policy(now);
             }
 
+            // Requests staged for ME sockets during the previous batch, deferred
+            // closes, deadlines and housekeeping: one write per ME socket.
+            flush_pending_me(now);
             const int timeout = wait_timeout_ms(now);
             const int count = ::epoll_wait(epoll_.get(), events.data(),
                                            static_cast<int>(events.size()), timeout);
@@ -488,12 +548,15 @@ void Runtime::Impl::run() {
             }
             process_deferred();
             process_deadlines(Clock::now());
+            if (!rate_clients_.empty()) process_rate_resumes(Clock::now());
             // O(eof/fin clients) work after the batch, not a full client scan.
             // This makes a drained EOF close prompt instead of waiting for the
             // 150 ms housekeeping tick.
             const Time finished = Clock::now();
             finish_eof_clients(finished);
-            finish_fallback_pairs(finished);
+            // Fallback pairs are pumped by their own read/write events; the
+            // sweep only closes finished or expired pairs, so it runs from the
+            // 150 ms housekeeping tick instead of after every epoll batch.
         }
     } catch (...) {
         fatal = std::current_exception();
@@ -558,8 +621,14 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // EPOLLIN stays armed until recv()==0. A pending FIN alone must NOT stop
     // reading: bytes may still be queued behind the FIN. Budget pause disables
     // it temporarily; the unpause path re-arms it so the tail is preserved.
+    // A rate-limited direction stops reading its source. On the ME route the
+    // shared ME socket cannot be paused per user, so a drained s2c bucket
+    // throttles the requests that drive downloads (c2s) instead.
+    const bool rate_paused =
+        client.rate_pause_c2s ||
+        (client.rate_pause_s2c && client.route != Client::Route::direct);
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested) {
+        !client.close_requested && !rate_paused) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
@@ -567,6 +636,10 @@ void Runtime::Impl::update_client_interest(Client& client) {
 }
 
 void Runtime::Impl::update_me_interest(MeConn& me) {
+    // Staged requests are written by flush_pending_me() before the next
+    // epoll_wait, which then sets the mask once; arming EPOLLOUT for bytes
+    // that are about to be written would cost two epoll_ctl per iteration.
+    if (me.flush_pending && me.state == MeConn::State::ready && me.fd.valid()) return;
     if (!me.fd.valid()) {
         if (me.armed != 0) {
             // The descriptor is already closed; the reactor token is removed
@@ -610,7 +683,12 @@ int Runtime::Impl::wait_timeout_ms(Time now) const {
     if (next_gauge_ < limit) limit = next_gauge_;
     if (const auto deadline = deadlines_.next(); deadline && *deadline < limit) limit = *deadline;
     // Wake for the earliest FIN/read-EOF expiry even when no traffic arrives.
-    if (next_eof_deadline_ < limit) limit = next_eof_deadline_;
+    // The sweep never runs before next_eof_sweep_, so waking earlier is wasted.
+    if (next_eof_deadline_ != Time::max()) {
+        const Time eof_wake = std::max(next_eof_deadline_, next_eof_sweep_);
+        if (eof_wake < limit) limit = eof_wake;
+    }
+    if (next_rate_resume_ < limit) limit = next_rate_resume_;
     if (stopping_ && shutdown_deadline_ < limit) limit = shutdown_deadline_;
     if (limit <= now) return 0;
     // Round a positive sub-millisecond delay up: truncating it to 0 would turn
@@ -644,7 +722,16 @@ void Runtime::Impl::handle_event(const Target& target, std::uint32_t events, Tim
         do {
             read = ::read(signal_.get(), &info, sizeof(info));
         } while (read < 0 && errno == EINTR);
-        (void)read;
+        if (read == static_cast<ssize_t>(sizeof(info)) && info.ssi_signo == SIGHUP) {
+            // Reload: apply live tunables, keep every connection.
+            if (shared_->reload_hook) {
+                try {
+                    shared_->reload_hook();
+                } catch (...) {
+                }
+            }
+            break;
+        }
         // A process signal is global: the signal-owning reactor must stop all
         // peers, not only itself.
         request_stop();

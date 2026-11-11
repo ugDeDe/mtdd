@@ -305,7 +305,8 @@ HttpResult http_call(uint16_t port, const std::string& method,
     ::close(fd);
     return result;
   }
-  ::shutdown(fd, SHUT_WR);
+  // No shutdown(SHUT_WR): evhttp treats the half-close as EOF and drops
+  // the connection mid-reply, truncating bodies larger than one write.
 
   std::string raw;
   auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -407,6 +408,7 @@ HttpResult http_call(uint16_t port, const std::string& method,
     if (cl != result.headers.end()) {
       try {
         size_t want = std::stoull(cl->second);
+        if (payload.size() < want && result.error.empty()) result.error = "truncated body";
         result.body = payload.substr(0, std::min(want, payload.size()));
       } catch (...) {
         result.body = payload;

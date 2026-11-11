@@ -114,18 +114,23 @@ def run(binary):
                 open_authenticated("127.0.0.1")
                 open_authenticated("127.0.0.1")
                 same = wait_for(lambda: (s if (s := status())["connections_active"] == 2
-                                        and s["unique_ips_active"] == 1 else None))
+                                        and s["unique_ips_seen"] == 1 else None))
                 assert same["unique_ip_history"]["timezone"] == "UTC"
                 assert same["unique_ip_history"]["approximate"] is True
                 for period in ("hour", "day", "week"):
                     assert same["unique_ip_history"][period]["estimate"] == 1
+                # Handshake-only clients are "seen" but not "active" (default 1 MiB threshold).
+                assert same["unique_ips_active"] == 0
+                assert same["unique_ip_history"]["min_bytes"] == 1048576
+                for period in ("hour_active", "day_active", "week_active"):
+                    assert same["unique_ip_history"][period]["estimate"] == 0
                 open_authenticated("127.0.0.2")
-                wait_for(lambda: status()["unique_ips_active"] == 2)
+                wait_for(lambda: status()["unique_ips_seen"] == 2)
                 for stream in streams:
                     stream.close()
                 streams.clear()
                 before = wait_for(lambda: (s if (s := status())["connections_active"] == 0
-                                          and s["unique_ips_active"] == 0 else None))
+                                          and s["unique_ips_seen"] == 0 and s["unique_ips_active"] == 0 else None))
                 history = before["unique_ip_history"]
                 assert history["persistence_enabled"]
                 assert history["persistence_failures"] == history["observation_failures"] == 0
@@ -136,7 +141,7 @@ def run(binary):
                 child = start()
                 wait_for(lambda: request("/v1/health")[0] == 200)
                 after = status()
-                assert after["unique_ips_active"] == 0
+                assert after["unique_ips_active"] == after["unique_ips_seen"] == 0
                 restored = after["unique_ip_history"]
                 assert restored["collection_started_at"] == history["collection_started_at"]
                 for period in ("hour", "day", "week"):

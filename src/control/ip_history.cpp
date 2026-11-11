@@ -141,10 +141,15 @@ bool write_all(int fd, std::string_view data) {
 }
 
 struct StateImage {
+  uint64_t version{2};
   std::array<uint8_t, kKeyBytes> key{};
   detail::HistoryRegisters hour{};
   detail::HistoryRegisters day{};
   detail::HistoryRegisters week{};
+  // Version 2: IPs that crossed the byte threshold. Empty when loaded from v1.
+  detail::HistoryRegisters hour_active{};
+  detail::HistoryRegisters day_active{};
+  detail::HistoryRegisters week_active{};
   int64_t hour_started_at{};
   int64_t day_started_at{};
   int64_t week_started_at{};
@@ -204,10 +209,11 @@ void parse_state(const std::string& text, StateImage& out) {
   if (root.is_discarded() || !root.is_object()) {
     throw std::runtime_error("ip history: state file is not a JSON object");
   }
-  static constexpr std::array<std::string_view, 9> kAllowed = {
+  static constexpr std::array<std::string_view, 12> kAllowed = {
       "version",          "key",              "hour_registers",
       "day_registers",    "week_registers",   "hour_started_at",
-      "day_started_at",   "week_started_at",  "collection_started_at"};
+      "day_started_at",   "week_started_at",  "collection_started_at",
+      "hour_active_registers", "day_active_registers", "week_active_registers"};
   for (auto it = root.begin(); it != root.end(); ++it) {
     bool known = false;
     for (const std::string_view field : kAllowed) {
@@ -218,10 +224,14 @@ void parse_state(const std::string& text, StateImage& out) {
     }
     if (!known) throw std::runtime_error("ip history: state file has an unknown field");
   }
-  if (!root.contains("version") || !root["version"].is_number_unsigned() ||
-      root["version"].get<uint64_t>() != 1) {
+  if (!root.contains("version") || !root["version"].is_number_unsigned()) {
     throw std::runtime_error("ip history: unsupported state file version");
   }
+  const uint64_t version = root["version"].get<uint64_t>();
+  if (version != 1 && version != 2) {
+    throw std::runtime_error("ip history: unsupported state file version");
+  }
+  out.version = version;
   if (!root.contains("key") || !root["key"].is_string()) {
     throw std::runtime_error("ip history: state key is missing");
   }
@@ -232,13 +242,24 @@ void parse_state(const std::string& text, StateImage& out) {
   struct RegisterField {
     const char* name;
     detail::HistoryRegisters* target;
+    bool v2_only;
   };
-  const std::array<RegisterField, 3> register_fields = {{
-      {"hour_registers", &out.hour},
-      {"day_registers", &out.day},
-      {"week_registers", &out.week},
+  const std::array<RegisterField, 6> register_fields = {{
+      {"hour_registers", &out.hour, false},
+      {"day_registers", &out.day, false},
+      {"week_registers", &out.week, false},
+      {"hour_active_registers", &out.hour_active, true},
+      {"day_active_registers", &out.day_active, true},
+      {"week_active_registers", &out.week_active, true},
   }};
   for (const RegisterField& field : register_fields) {
+    if (field.v2_only && version == 1) {
+      // A v1 file predates the active sketches; they start empty.
+      if (root.contains(field.name)) {
+        throw std::runtime_error("ip history: state file has an unknown field");
+      }
+      continue;
+    }
     if (!root.contains(field.name) || !root[field.name].is_string() ||
         !decode_registers(root[field.name].get<std::string>(), *field.target)) {
       throw std::runtime_error("ip history: state registers are invalid");
@@ -264,11 +285,14 @@ void parse_state(const std::string& text, StateImage& out) {
 
 std::string serialize_state(const StateImage& image) {
   json root;
-  root["version"] = 1;
+  root["version"] = 2;
   root["key"] = hex_encode(image.key);
   root["hour_registers"] = hex_encode(image.hour);
   root["day_registers"] = hex_encode(image.day);
   root["week_registers"] = hex_encode(image.week);
+  root["hour_active_registers"] = hex_encode(image.hour_active);
+  root["day_active_registers"] = hex_encode(image.day_active);
+  root["week_active_registers"] = hex_encode(image.week_active);
   root["hour_started_at"] = image.hour_started_at;
   root["day_started_at"] = image.day_started_at;
   root["week_started_at"] = image.week_started_at;
@@ -516,7 +540,7 @@ struct IpHistory::Impl {
   ~Impl();
 
   bool rotate(int64_t unix_seconds);
-  bool observe(const Ip& ip);
+  bool observe(const Ip& ip, bool active);
   IpHistorySnapshot snapshot() const;
   bool checkpoint(bool force);
 
@@ -529,6 +553,9 @@ struct IpHistory::Impl {
   detail::HistoryRegisters hour_{};
   detail::HistoryRegisters day_{};
   detail::HistoryRegisters week_{};
+  detail::HistoryRegisters hour_active_{};
+  detail::HistoryRegisters day_active_{};
+  detail::HistoryRegisters week_active_{};
   detail::CalendarStarts starts_{};
   int64_t collection_started_at_{};
   int64_t last_timestamp_{};
@@ -572,20 +599,24 @@ IpHistory::Impl::Impl(std::filesystem::path path)
       bool stale = false;
       if (loaded.hour_started_at == starts_.hour) {
         hour_ = loaded.hour;
+        hour_active_ = loaded.hour_active;
       } else {
         stale = true;
       }
       if (loaded.day_started_at == starts_.day) {
         day_ = loaded.day;
+        day_active_ = loaded.day_active;
       } else {
         stale = true;
       }
       if (loaded.week_started_at == starts_.week) {
         week_ = loaded.week;
+        week_active_ = loaded.week_active;
       } else {
         stale = true;
       }
-      persisted_version_ = stale ? 0 : 1;
+      // A v1 file is rewritten as v2 by the first checkpoint.
+      persisted_version_ = (stale || loaded.version < 2) ? 0 : 1;
     } else if (RAND_bytes(key_.data(), static_cast<int>(key_.size())) != 1) {
       throw std::runtime_error("ip history: key generation failed");
     }
@@ -633,16 +664,19 @@ bool IpHistory::Impl::rotate(int64_t unix_seconds) {
   bool changed = false;
   if (starts.hour != starts_.hour) {
     hour_.fill(0);
+    hour_active_.fill(0);
     starts_.hour = starts.hour;
     changed = true;
   }
   if (starts.day != starts_.day) {
     day_.fill(0);
+    day_active_.fill(0);
     starts_.day = starts.day;
     changed = true;
   }
   if (starts.week != starts_.week) {
     week_.fill(0);
+    week_active_.fill(0);
     starts_.week = starts.week;
     changed = true;
   }
@@ -650,23 +684,26 @@ bool IpHistory::Impl::rotate(int64_t unix_seconds) {
   return changed;
 }
 
-bool IpHistory::Impl::observe(const Ip& ip) {
+bool IpHistory::Impl::observe(const Ip& ip, bool active) {
   std::lock_guard lock(mutex_);
   detail::HistoryDigest digest{};
   if (!mac_.compute_next(ip, digest)) return false;
   const uint32_t index = detail::hll_index(digest);
   const uint8_t rank = detail::hll_rank(digest);
+  detail::HistoryRegisters& hour = active ? hour_active_ : hour_;
+  detail::HistoryRegisters& day = active ? day_active_ : day_;
+  detail::HistoryRegisters& week = active ? week_active_ : week_;
   bool changed = false;
-  if (rank > hour_[index]) {
-    hour_[index] = rank;
+  if (rank > hour[index]) {
+    hour[index] = rank;
     changed = true;
   }
-  if (rank > day_[index]) {
-    day_[index] = rank;
+  if (rank > day[index]) {
+    day[index] = rank;
     changed = true;
   }
-  if (rank > week_[index]) {
-    week_[index] = rank;
+  if (rank > week[index]) {
+    week[index] = rank;
     changed = true;
   }
   if (changed) ++state_version_;
@@ -679,6 +716,9 @@ StateImage IpHistory::Impl::capture_locked() const {
   image.hour = hour_;
   image.day = day_;
   image.week = week_;
+  image.hour_active = hour_active_;
+  image.day_active = day_active_;
+  image.week_active = week_active_;
   image.hour_started_at = starts_.hour;
   image.day_started_at = starts_.day;
   image.week_started_at = starts_.week;
@@ -690,6 +730,9 @@ IpHistorySnapshot IpHistory::Impl::snapshot() const {
   detail::HistoryRegisters hour;
   detail::HistoryRegisters day;
   detail::HistoryRegisters week;
+  detail::HistoryRegisters hour_active;
+  detail::HistoryRegisters day_active;
+  detail::HistoryRegisters week_active;
   detail::CalendarStarts starts;
   int64_t collection = 0;
   uint64_t failures = 0;
@@ -698,6 +741,9 @@ IpHistorySnapshot IpHistory::Impl::snapshot() const {
     hour = hour_;
     day = day_;
     week = week_;
+    hour_active = hour_active_;
+    day_active = day_active_;
+    week_active = week_active_;
     starts = starts_;
     collection = collection_started_at_;
     failures = persistence_failures_;
@@ -706,6 +752,9 @@ IpHistorySnapshot IpHistory::Impl::snapshot() const {
   result.hour = estimate_count(hour);
   result.day = estimate_count(day);
   result.week = estimate_count(week);
+  result.hour_active = estimate_count(hour_active);
+  result.day_active = estimate_count(day_active);
+  result.week_active = estimate_count(week_active);
   result.hour_started_at = starts.hour;
   result.day_started_at = starts.day;
   result.week_started_at = starts.week;
@@ -779,7 +828,9 @@ bool IpHistory::rotate(int64_t unix_seconds) {
   return impl_->rotate(unix_seconds);
 }
 
-bool IpHistory::observe(const Ip& ip) { return impl_->observe(ip); }
+bool IpHistory::observe(const Ip& ip) { return impl_->observe(ip, false); }
+
+bool IpHistory::observe_active(const Ip& ip) { return impl_->observe(ip, true); }
 
 IpHistorySnapshot IpHistory::snapshot() const { return impl_->snapshot(); }
 

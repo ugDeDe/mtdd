@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
@@ -19,6 +20,31 @@
 #include <utility>
 
 namespace mtdd {
+
+namespace {
+
+// CPUs the process may run on, in ascending order (empty when unknown).
+std::vector<int> allowed_cpus() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (::sched_getaffinity(0, sizeof(set), &set) != 0) return {};
+    std::vector<int> cpus;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+    }
+    return cpus;
+}
+
+// Best effort: a refused pin (container policy, CPU hot-unplug) only loses
+// the locality gain.
+void pin_current_thread(int cpu) noexcept {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+}
+
+}  // namespace
 
 Runtime::RuntimeState::RuntimeState(const Config& config,
                                    control::UserStore& users,
@@ -55,8 +81,17 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
         }
     }
     workers = requested;
+    cpu_affinity = config.cpu_affinity;
+    // A corrupt usage file throws here (fail closed): silently starting from
+    // zero would hand every user a fresh quota.
+    usage_keeper = std::make_unique<control::UsageStateKeeper>(
+        config.usage_state_path, statistics, users);
+    usage_keeper->load();
     const std::size_t per_worker_budget = available / requested;
     shared = std::make_shared<detail::SharedState>(workers, per_worker_budget);
+    shared->me_clients_per_writer.store(config.me_clients_per_writer, std::memory_order_relaxed);
+    shared->me_connections_per_dc.store(config.me_connections_per_dc, std::memory_order_relaxed);
+    set_media_limits(config.media_user_rate_kbps, config.media_total_rate_kbps);
 
     // Prime the process CSPRNG on the constructing thread before any reactor
     // thread exists. OpenSSL 3 performs a one-time DRBG setup on the first
@@ -88,9 +123,40 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     // reactors that were never created (their ack would never arrive).
     statistics.configure_workers(workers);
     barrier.configure_workers(workers);
+    statistics_ = &statistics;
+    statistics.set_device_lister(
+        [weak = std::weak_ptr<detail::SharedState>(shared),
+         window = config.device_window](const std::string& user) {
+            std::vector<control::Statistics::DeviceInfo> out;
+            if (const auto state = weak.lock()) {
+                out = state->devices.list(user, std::chrono::steady_clock::now(), window);
+            }
+            return out;
+        });
+    if (config.suspects) {
+        statistics.set_suspect_lister(
+            [weak = std::weak_ptr<detail::SharedState>(shared),
+             watch = static_cast<double>(config.suspect_watch_score),
+             ban = static_cast<double>(config.suspect_ban_score)]() {
+                std::vector<control::Statistics::SuspectInfo> out;
+                if (const auto state = weak.lock()) {
+                    out = state->suspects.list(
+                        std::chrono::steady_clock::now(),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count(),
+                        watch, ban);
+                }
+                return out;
+            });
+    }
 }
 
 Runtime::RuntimeState::~RuntimeState() {
+    if (statistics_) {
+        statistics_->set_device_lister({});
+        statistics_->set_suspect_lister({});
+    }
     request_stop();
     {
         std::unique_lock lock{run_mutex_};
@@ -101,6 +167,12 @@ Runtime::RuntimeState::~RuntimeState() {
     }
     threads.clear();
     reactors.clear();
+    if (usage_keeper) {
+        usage_keeper->stop();
+        // run() already flushed, but the management API outlives it and may
+        // have reset a quota since; main() stops the API before this runs.
+        usage_keeper->flush();
+    }
 }
 
 void Runtime::RuntimeState::finish_run() noexcept {
@@ -133,10 +205,21 @@ void Runtime::RuntimeState::run_impl() {
         const std::lock_guard lock{failure_mutex};
         if (!failure) failure = std::move(error);
     };
+    if (usage_keeper) usage_keeper->start();
+    // Reactor i on the i-th allowed CPU, only with one reactor per CPU at
+    // most. Every helper thread already exists, so pinning the calling thread
+    // (reactor 0) below cannot leak into threads created later.
+    std::vector<int> cpus;
+    if (cpu_affinity && workers > 1) {
+        cpus = allowed_cpus();
+        if (cpus.size() < workers) cpus.clear();
+    }
     try {
         threads.reserve(workers > 0 ? workers - 1 : 0);
         for (std::size_t index = 1; index < workers; ++index) {
-            threads.emplace_back([this, index, &record] {
+            const int cpu = cpus.empty() ? -1 : cpus[index];
+            threads.emplace_back([this, index, cpu, &record] {
+                if (cpu >= 0) pin_current_thread(cpu);
                 try {
                     reactors[index]->run();
                 } catch (...) {
@@ -153,6 +236,7 @@ void Runtime::RuntimeState::run_impl() {
         threads.clear();
         throw;
     }
+    if (!cpus.empty()) pin_current_thread(cpus.front());
     try {
         reactors.front()->run();
     } catch (...) {
@@ -163,6 +247,9 @@ void Runtime::RuntimeState::run_impl() {
         if (thread.joinable()) thread.join();
     }
     threads.clear();
+    // Final flush on clean shutdown (also on a reactor failure: counters are
+    // still the best known values).
+    if (usage_keeper) usage_keeper->stop();
     std::exception_ptr result;
     {
         const std::lock_guard lock{failure_mutex};
@@ -198,6 +285,42 @@ std::vector<std::uint64_t> Runtime::RuntimeState::replay_rejections_per_worker()
     return counts;
 }
 
+void Runtime::RuntimeState::set_tunables(std::uint32_t me_clients_per_writer,
+                                         std::uint32_t me_connections_per_dc) {
+    if (me_clients_per_writer < 1 || me_clients_per_writer > 1000000) {
+        throw std::invalid_argument("me_clients_per_writer must be in 1..1000000");
+    }
+    if (me_connections_per_dc < 1 || me_connections_per_dc > 24) {
+        throw std::invalid_argument("me_connections_per_dc must be in 1..24");
+    }
+    shared->me_clients_per_writer.store(me_clients_per_writer, std::memory_order_relaxed);
+    shared->me_connections_per_dc.store(me_connections_per_dc, std::memory_order_relaxed);
+    // Release pairs with the reactors' acquire load of the generation.
+    shared->tunables_generation.fetch_add(1, std::memory_order_release);
+}
+
+void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
+                                             std::uint64_t total_kbps) noexcept {
+    // kbit/s -> bytes/s.
+    shared->set_media_rates(user_kbps * 125U, total_kbps * 125U);
+}
+
+void Runtime::RuntimeState::set_ad_tag(const std::array<std::uint8_t, 16>& tag) {
+    if (std::all_of(tag.begin(), tag.end(), [](std::uint8_t byte) { return byte == 0; })) {
+        throw std::invalid_argument("ad_tag must not be all zero");
+    }
+    {
+        std::lock_guard lock(shared->ad_tag_mutex);
+        shared->ad_tag = tag;
+    }
+    // Release pairs with the reactors' acquire load of the generation.
+    shared->ad_tag_generation.fetch_add(1, std::memory_order_release);
+}
+
+void Runtime::RuntimeState::on_reload(std::function<void()> hook) {
+    shared->reload_hook = std::move(hook);
+}
+
 Runtime::Runtime(const Config& config, control::UserStore& users,
                  control::Statistics& statistics, MetadataProvider& metadata,
                  RevisionBarrier& barrier)
@@ -209,6 +332,19 @@ Runtime::~Runtime() = default;
 void Runtime::run() { state_->run(); }
 
 void Runtime::request_stop() noexcept { state_->request_stop(); }
+
+void Runtime::set_tunables(std::uint32_t me_clients_per_writer,
+                           std::uint32_t me_connections_per_dc) {
+    state_->set_tunables(me_clients_per_writer, me_connections_per_dc);
+}
+
+void Runtime::on_reload(std::function<void()> hook) { state_->on_reload(std::move(hook)); }
+
+void Runtime::set_ad_tag(const std::array<std::uint8_t, 16>& tag) { state_->set_ad_tag(tag); }
+
+void Runtime::set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept {
+    state_->set_media_limits(user_kbps, total_kbps);
+}
 
 std::uint16_t Runtime::port() const noexcept { return state_->port(); }
 

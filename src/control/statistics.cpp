@@ -17,17 +17,19 @@
 namespace mtdd::control {
 namespace {
 
-constexpr size_t kRejectReasonCount = 6;
+constexpr size_t kRejectReasonCount = 10;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 9;
+constexpr size_t kApiRouteCount = 21;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
 
 constexpr std::array<const char*, kRejectReasonCount> kRejectLabels = {
     "overload", "rate_limited", "auth_failed",
-    "handshake_timeout", "invalid_request", "other"};
+    "handshake_timeout", "invalid_request", "other",
+    "user_connection_limit", "user_expired", "user_quota_exceeded",
+    "user_ip_limit"};
 
 constexpr std::array<const char*, kHandshakeResultCount> kHandshakeLabels = {
     "success", "failure", "timeout", "replay"};
@@ -38,7 +40,11 @@ constexpr std::array<const char*, kBufferStateCount> kBufferLabels = {
 constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/health", "/v1/ready", "/v1/status", "/v1/users",
     "/v1/users/{name}", "/v1/users/{name}/rotate-secret", "/metrics", "unknown",
-    "/v1/users/{name}/links"};
+    "/v1/users/{name}/links", "/v1/system/info", "/v1/config",
+    "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
+    "/v1/users/{name}/enable", "/v1/users/{name}/disable",
+    "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects",
+    "/v1/ad-tag"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -62,6 +68,10 @@ size_t reject_index(RejectReason reason) {
     case RejectReason::handshake_timeout: return 3;
     case RejectReason::invalid_request: return 4;
     case RejectReason::other: return 5;
+    case RejectReason::user_connection_limit: return 6;
+    case RejectReason::user_expired: return 7;
+    case RejectReason::user_quota_exceeded: return 8;
+    case RejectReason::user_ip_limit: return 9;
   }
   return 5;
 }
@@ -96,6 +106,18 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::metrics: return 6;
     case ApiRoute::unknown: return 7;
     case ApiRoute::user_links: return 8;
+    case ApiRoute::system_info: return 9;
+    case ApiRoute::config: return 10;
+    case ApiRoute::stats_summary: return 11;
+    case ApiRoute::stats_me: return 12;
+    case ApiRoute::stats_users: return 13;
+    case ApiRoute::events: return 14;
+    case ApiRoute::user_enable: return 15;
+    case ApiRoute::user_disable: return 16;
+    case ApiRoute::user_reset_quota: return 17;
+    case ApiRoute::user_devices: return 18;
+    case ApiRoute::suspects: return 19;
+    case ApiRoute::ad_tag: return 20;
   }
   return 7;
 }
@@ -211,6 +233,91 @@ void UserMetrics::add_payload(Direction direction, uint64_t bytes) noexcept {
     payload_s2c_.fetch_add(bytes, std::memory_order_relaxed);
   }
 }
+namespace {
+int64_t payload_total(const std::atomic<uint64_t>& c2s, const std::atomic<uint64_t>& s2c) noexcept {
+  return static_cast<int64_t>(c2s.load(std::memory_order_relaxed) +
+                              s2c.load(std::memory_order_relaxed));
+}
+} // namespace
+uint64_t UserMetrics::quota_used_bytes() const noexcept {
+  const int64_t used = payload_total(payload_c2s_, payload_s2c_) -
+                       quota_base_.load(std::memory_order_relaxed);
+  return used > 0 ? static_cast<uint64_t>(used) : 0;
+}
+void UserMetrics::set_quota_used_bytes(uint64_t value) noexcept {
+  quota_base_.store(payload_total(payload_c2s_, payload_s2c_) - static_cast<int64_t>(value),
+                    std::memory_order_relaxed);
+}
+void UserMetrics::restore_quota(uint64_t used_bytes, int64_t reset_at) noexcept {
+  set_quota_used_bytes(used_bytes);
+  quota_reset_at_.store(reset_at, std::memory_order_relaxed);
+}
+void UserMetrics::reset_quota() noexcept {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  quota_reset_at_.store(
+      static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count()),
+      std::memory_order_relaxed);
+  set_quota_used_bytes(0);
+}
+int64_t UserMetrics::quota_reset_at() const noexcept {
+  return quota_reset_at_.load(std::memory_order_relaxed);
+}
+
+namespace {
+constexpr uint64_t kRateMinBurstBytes = 64 * 1024;
+constexpr int64_t kRateMaxCostNs = 1'000'000'000'000'000;  // ~11.5 days
+
+int64_t rate_ns_for(uint64_t bytes, uint64_t rate) noexcept {
+  const long double ns = static_cast<long double>(bytes) * 1e9L /
+                         static_cast<long double>(rate);
+  if (ns >= static_cast<long double>(kRateMaxCostNs)) return kRateMaxCostNs;
+  return static_cast<int64_t>(ns);
+}
+}  // namespace
+
+void UserMetrics::add_active_connections(int64_t all, int64_t media) noexcept {
+  if (all != 0) active_rate_conns_.fetch_add(all, std::memory_order_relaxed);
+  if (media != 0) active_media_conns_.fetch_add(media, std::memory_order_relaxed);
+  if (all != 0 || media != 0) active_generation_.fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::active_generation() const noexcept {
+  return active_generation_.load(std::memory_order_relaxed);
+}
+int64_t UserMetrics::active_rate_connections() const noexcept {
+  return active_rate_conns_.load(std::memory_order_relaxed);
+}
+int64_t UserMetrics::active_media_connections() const noexcept {
+  return active_media_conns_.load(std::memory_order_relaxed);
+}
+uint64_t UserMetrics::rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept {
+  return std::max(rate_bytes_per_sec, kRateMinBurstBytes);
+}
+int64_t UserMetrics::rate_consume(Direction direction, uint64_t bytes,
+                                  uint64_t rate_bytes_per_sec,
+                                  int64_t now_ns) noexcept {
+  if (rate_bytes_per_sec == 0) return 0;
+  auto& tat = rate_tat_[direction == Direction::client_to_server ? 0 : 1];
+  const int64_t cost = rate_ns_for(bytes, rate_bytes_per_sec);
+  int64_t current = tat.load(std::memory_order_relaxed);
+  int64_t next = 0;
+  do {
+    next = std::max(current, now_ns) + cost;
+  } while (!tat.compare_exchange_weak(current, next, std::memory_order_relaxed,
+                                      std::memory_order_relaxed));
+  const int64_t resume =
+      next - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
+  return resume > now_ns ? resume : 0;
+}
+int64_t UserMetrics::rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
+                                    int64_t now_ns) const noexcept {
+  if (rate_bytes_per_sec == 0) return 0;
+  const int64_t tat =
+      rate_tat_[direction == Direction::client_to_server ? 0 : 1].load(
+          std::memory_order_relaxed);
+  const int64_t resume =
+      tat - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
+  return resume > now_ns ? resume : 0;
+}
 uint64_t UserMetrics::active_connections() const noexcept {
   return active_.load(std::memory_order_relaxed);
 }
@@ -219,6 +326,22 @@ void UserMetrics::set_active_unique_ips(uint64_t value) noexcept {
 }
 uint64_t UserMetrics::active_unique_ips() const noexcept {
   return unique_ips_.load(std::memory_order_relaxed);
+}
+void UserMetrics::set_qualified_unique_ips(uint64_t value) noexcept {
+  qualified_ips_.store(value, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::qualified_unique_ips() const noexcept {
+  return qualified_ips_.load(std::memory_order_relaxed);
+}
+void UserMetrics::set_devices(uint64_t recent, uint64_t connected) noexcept {
+  devices_.store(recent, std::memory_order_relaxed);
+  devices_connected_.store(connected, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::devices() const noexcept {
+  return devices_.load(std::memory_order_relaxed);
+}
+uint64_t UserMetrics::devices_connected() const noexcept {
+  return devices_connected_.load(std::memory_order_relaxed);
 }
 uint64_t UserMetrics::payload_c2s_bytes() const noexcept {
   return payload_c2s_.load(std::memory_order_relaxed);
@@ -368,10 +491,17 @@ struct Statistics::Impl {
   ShardHighWater shard_high_water{};
   std::array<WorkerGauges, kMaxWorkers> gauges;
   mutable std::mutex build_mutex;
+  mutable std::mutex device_mutex;
+  Statistics::DeviceLister device_lister;
+  Statistics::SuspectLister suspect_lister;
+  std::array<std::atomic<uint64_t>, kSuspectSignals> suspect_events{};
+  std::atomic<uint64_t> suspect_shadow_bans{0};
   std::string build_version;
   std::atomic<uint64_t> accepted{0};
   std::atomic<uint64_t> active{0};
   std::atomic<uint64_t> unique_ips{0};
+  std::atomic<uint64_t> qualified_ips{0};
+  std::atomic<uint64_t> unique_ip_min_bytes{0};
   std::atomic<uint64_t> rejected{0};
   mutable std::mutex users_mutex;
   std::unordered_map<std::string, std::shared_ptr<UserMetrics>> users;
@@ -380,6 +510,8 @@ struct Statistics::Impl {
   std::atomic<uint64_t> client_reuses{0};
   std::atomic<uint64_t> backpressure_c2s{0};
   std::atomic<uint64_t> backpressure_s2c{0};
+  std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
+  std::atomic<uint64_t> media_throttled{0};
   std::array<std::atomic<uint64_t>, kApiRouteCount * kApiMethodCount * kApiStatusCount>
       api_cells;
   std::atomic<uint64_t> api_total{0};
@@ -430,6 +562,52 @@ void Statistics::set_build_info(std::string version) {
   impl_->build_version = std::move(version);
 }
 
+void Statistics::set_device_lister(DeviceLister lister) {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  impl_->device_lister = std::move(lister);
+}
+
+std::vector<Statistics::DeviceInfo> Statistics::devices(const std::string& user) const {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  if (!impl_->device_lister) return {};
+  return impl_->device_lister(user);
+}
+
+void Statistics::set_suspect_lister(SuspectLister lister) {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  impl_->suspect_lister = std::move(lister);
+}
+
+std::vector<Statistics::SuspectInfo> Statistics::suspects() const {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  if (!impl_->suspect_lister) return {};
+  return impl_->suspect_lister();
+}
+
+void Statistics::suspect_event(SuspectSignal signal) noexcept {
+  const auto index = static_cast<size_t>(signal);
+  if (index < kSuspectSignals) impl_->suspect_events[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Statistics::suspect_shadow_banned() noexcept {
+  impl_->suspect_shadow_bans.fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* to_string(SuspectSignal signal) noexcept {
+  static constexpr std::array<const char*, kSuspectSignals> kNames{
+      "probe_session", "secret_text", "raw_obfuscated2", "multi_mode", "wrong_secret",
+      "port_check",    "repeat_visits", "junk",          "canary"};
+  const auto index = static_cast<size_t>(signal);
+  return index < kSuspectSignals ? kNames[index] : "unknown";
+}
+
+unsigned suspect_signal_weight(SuspectSignal signal) noexcept {
+  static constexpr std::array<unsigned, kSuspectSignals> kWeights{40, 40, 15, 50, 20,
+                                                                  10, 20, 5,  60};
+  const auto index = static_cast<size_t>(signal);
+  return index < kSuspectSignals ? kWeights[index] : 0;
+}
+
 void Statistics::connection_accepted() noexcept {
   impl_->accepted.fetch_add(1, std::memory_order_relaxed);
   impl_->active.fetch_add(1, std::memory_order_relaxed);
@@ -472,6 +650,14 @@ void Statistics::set_active_unique_ips(uint64_t value) noexcept {
   impl_->unique_ips.store(value, std::memory_order_relaxed);
 }
 
+void Statistics::set_qualified_unique_ips(uint64_t value) noexcept {
+  impl_->qualified_ips.store(value, std::memory_order_relaxed);
+}
+
+void Statistics::set_unique_ip_min_bytes(uint64_t value) noexcept {
+  impl_->unique_ip_min_bytes.store(value, std::memory_order_relaxed);
+}
+
 void Statistics::enable_ip_history(std::string path) {
   if (impl_->ip_history) {
     throw std::logic_error("IP history is already enabled");
@@ -491,9 +677,20 @@ bool Statistics::rotate_ip_history(int64_t unix_seconds) noexcept {
 }
 
 bool Statistics::observe_ip_history(const std::array<std::uint8_t, 16>& ip) noexcept {
+  return observe_history(ip, false);
+}
+
+bool Statistics::observe_ip_history_active(
+    const std::array<std::uint8_t, 16>& ip) noexcept {
+  return observe_history(ip, true);
+}
+
+bool Statistics::observe_history(const std::array<std::uint8_t, 16>& ip,
+                                 bool active) noexcept {
   if (!impl_->ip_history) return false;
   try {
-    const bool observed = impl_->ip_history->observe(ip);
+    const bool observed = active ? impl_->ip_history->observe_active(ip)
+                                 : impl_->ip_history->observe(ip);
     if (!observed) {
       impl_->ip_history_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -550,6 +747,15 @@ void Statistics::set_client_pool(std::size_t worker, uint64_t pooled,
   impl_->client_allocations.store(allocations, std::memory_order_relaxed);
   impl_->client_reuses.store(reuses, std::memory_order_relaxed);
 }
+void Statistics::media_throttled() noexcept {
+  impl_->media_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Statistics::relay_closed(RelayCloseReason reason) noexcept {
+  const auto index = static_cast<std::size_t>(reason);
+  if (index < kRelayCloseReasons) impl_->relay_closes[index].fetch_add(1, std::memory_order_relaxed);
+}
+
 void Statistics::add_backpressure(Direction direction) noexcept {
   if (direction == Direction::client_to_server) {
     impl_->backpressure_c2s.fetch_add(1, std::memory_order_relaxed);
@@ -880,6 +1086,9 @@ StatisticsSnapshot Statistics::snapshot() const {
       impl_->accepted.load(std::memory_order_relaxed);
   out.connections_active = impl_->active.load(std::memory_order_relaxed);
   out.active_unique_ips = impl_->unique_ips.load(std::memory_order_relaxed);
+  out.qualified_unique_ips = impl_->qualified_ips.load(std::memory_order_relaxed);
+  out.unique_ip_min_bytes =
+      impl_->unique_ip_min_bytes.load(std::memory_order_relaxed);
   out.connections_rejected_total =
       impl_->rejected.load(std::memory_order_relaxed);
   for (size_t i = 0; i < kRejectReasonCount; ++i) {
@@ -897,8 +1106,13 @@ StatisticsSnapshot Statistics::snapshot() const {
       UserMetricsSnapshot entry;
       entry.active_connections = metrics->active_connections();
       entry.unique_ips_active = metrics->active_unique_ips();
+      entry.unique_ips_qualified = metrics->qualified_unique_ips();
+      entry.devices = metrics->devices();
+      entry.devices_connected = metrics->devices_connected();
       entry.payload_c2s_bytes = metrics->payload_c2s_bytes();
       entry.payload_s2c_bytes = metrics->payload_s2c_bytes();
+      entry.quota_used_bytes = metrics->quota_used_bytes();
+      entry.quota_reset_at = metrics->quota_reset_at();
       out.users.emplace(name, entry);
     }
   }
@@ -982,6 +1196,14 @@ StatisticsSnapshot Statistics::snapshot() const {
       impl_->backpressure_c2s.load(std::memory_order_relaxed);
   out.backpressure_s2c_total =
       impl_->backpressure_s2c.load(std::memory_order_relaxed);
+  for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
+    out.relay_closes_total[index] = impl_->relay_closes[index].load(std::memory_order_relaxed);
+  }
+  for (size_t index = 0; index < kSuspectSignals; ++index) {
+    out.suspect_events_total[index] = impl_->suspect_events[index].load(std::memory_order_relaxed);
+  }
+  out.suspect_shadow_bans_total = impl_->suspect_shadow_bans.load(std::memory_order_relaxed);
+  out.media_throttled_total = impl_->media_throttled.load(std::memory_order_relaxed);
   out.replay_cache_entries = replay_entries;
   out.api_requests_total = impl_->api_total.load(std::memory_order_relaxed);
   out.me_pending_buffer_bytes = me_pending_bytes;
@@ -1130,11 +1352,31 @@ std::string Statistics::prometheus_text() const {
       << escape_label(snapshot.build_version) << "\"} 1\n";
   append_metric(out, "mtdd_uptime_seconds", "", snapshot.uptime_seconds);
   append_metric(out, "mtdd_connections_active", "", snapshot.connections_active);
-  append_metric(out, "mtdd_unique_ips_active", "", snapshot.active_unique_ips);
+  out << "# HELP mtdd_unique_ips_active Online unique client IPs (IPv6 as /64) "
+         "whose connections moved at least mtdd_unique_ips_min_bytes of payload.\n";
+  out << "# TYPE mtdd_unique_ips_active gauge\n";
+  append_metric(out, "mtdd_unique_ips_active", "", snapshot.qualified_unique_ips);
+  out << "# HELP mtdd_unique_ips_seen Online unique client IPs (IPv6 as /64) "
+         "counted at authenticated handshake, before any traffic.\n";
+  out << "# TYPE mtdd_unique_ips_seen gauge\n";
+  append_metric(out, "mtdd_unique_ips_seen", "", snapshot.active_unique_ips);
+  out << "# HELP mtdd_unique_ips_min_bytes Payload bytes (c2s+s2c) a connection "
+         "must move before its IP counts as active.\n";
+  out << "# TYPE mtdd_unique_ips_min_bytes gauge\n";
+  append_metric(out, "mtdd_unique_ips_min_bytes", "", snapshot.unique_ip_min_bytes);
   const auto& history = snapshot.unique_ip_history;
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"hour\"", history.hour);
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"day\"", history.day);
   append_metric(out, "mtdd_unique_ips_estimate", "period=\"week\"", history.week);
+  out << "# HELP mtdd_unique_ips_active_estimate HyperLogLog estimate of unique "
+         "client IPs that passed the byte threshold in the calendar period.\n";
+  out << "# TYPE mtdd_unique_ips_active_estimate gauge\n";
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"hour\"",
+                history.hour_active);
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"day\"",
+                history.day_active);
+  append_metric(out, "mtdd_unique_ips_active_estimate", "period=\"week\"",
+                history.week_active);
   append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"hour\"",
                 static_cast<uint64_t>(history.hour_started_at));
   append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"day\"",
@@ -1157,12 +1399,24 @@ std::string Statistics::prometheus_text() const {
     append_metric(out, "mtdd_handshakes_total",
                   "result=\"" + escape_label(result) + "\"", value);
   }
+  out << "# HELP mtdd_user_quota_used_bytes Payload bytes (c2s+s2c) counted "
+         "against the user's data quota since the last quota reset.\n";
+  out << "# TYPE mtdd_user_quota_used_bytes gauge\n";
+  for (const auto& [name, metrics] : snapshot.users) {
+    const std::string label = "user=\"" + escape_label(name) + "\"";
+    append_metric(out, "mtdd_user_quota_used_bytes", label,
+                  metrics.quota_used_bytes);
+  }
   for (const auto& [name, metrics] : snapshot.users) {
     const std::string label = "user=\"" + escape_label(name) + "\"";
     append_metric(out, "mtdd_user_connections_active", label,
                   metrics.active_connections);
     append_metric(out, "mtdd_user_unique_ips_active", label,
+                  metrics.unique_ips_qualified);
+    append_metric(out, "mtdd_user_unique_ips_seen", label,
                   metrics.unique_ips_active);
+    append_metric(out, "mtdd_user_devices", label, metrics.devices);
+    append_metric(out, "mtdd_user_devices_connected", label, metrics.devices_connected);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
                   label + ",direction=\"c2s\"", metrics.payload_c2s_bytes);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
@@ -1173,6 +1427,35 @@ std::string Statistics::prometheus_text() const {
                   std::string("state=\"") + kBufferLabels[i] + "\"",
                   snapshot.buffer_bytes[i]);
   }
+  {
+    static constexpr std::array<const char*, kRelayCloseReasons> kNames{
+        "other",   "client_eof",   "client_error", "client_timeout", "idle_timeout",
+        "me_lost", "backpressure", "remote_close", "revoked",        "shutdown",
+        "device_limit"};
+    for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
+      append_metric(out, "mtdd_relay_closes_total",
+                    std::string("reason=\"") + kNames[index] + "\"",
+                    snapshot.relay_closes_total[index]);
+    }
+  }
+  for (std::size_t index = 0; index < kSuspectSignals; ++index) {
+    append_metric(out, "mtdd_suspect_events_total",
+                  std::string("signal=\"") + to_string(static_cast<SuspectSignal>(index)) + "\"",
+                  snapshot.suspect_events_total[index]);
+  }
+  append_metric(out, "mtdd_suspect_shadow_bans_total", "", snapshot.suspect_shadow_bans_total);
+  {
+    // Current suspects grouped by how many distinct signals they matched.
+    std::array<uint64_t, kSuspectSignals + 1> by_matches{};
+    for (const auto& entry : suspects()) {
+      by_matches[std::min<size_t>(entry.matches, kSuspectSignals)] += 1;
+    }
+    for (size_t m = 1; m <= kSuspectSignals; ++m) {
+      append_metric(out, "mtdd_suspects", "matches=\"" + std::to_string(m) + "\"", by_matches[m]);
+    }
+  }
+
+  append_metric(out, "mtdd_media_throttled_total", "", snapshot.media_throttled_total);
   if (snapshot.backpressure_c2s_total != 0) {
     append_metric(out, "mtdd_backpressure_events_total", "direction=\"c2s\"",
                   snapshot.backpressure_c2s_total);

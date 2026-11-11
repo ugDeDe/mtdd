@@ -112,6 +112,188 @@ TEST(Runtime, UniqueIpKeyNormalizesIpv4MappedAndKeepsNativeV6Distinct) {
     EXPECT_FALSE(std::equal(v4.begin(), v4.begin() + 16, native.begin()));
 }
 
+TEST(Runtime, UniqueIpCollapseKeepsIpv4AndMappedAndTruncatesIpv6ToSlash64) {
+    using mtdd::detail::collapse_ip_key;
+    using mtdd::detail::IpKey;
+    const auto key_of = [](const std::array<std::uint8_t, 16>& address) {
+        const auto wire = mtdd::protocol::Endpoint::v6(address, 1).wire20();
+        IpKey key{};
+        std::copy_n(wire.begin(), key.size(), key.begin());
+        return collapse_ip_key(key);
+    };
+    // Same /64, different interface identifiers (privacy-address rotation).
+    const std::array<std::uint8_t, 16> a{0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8};
+    auto b = a;
+    b[8] = 0xfe;
+    b[15] = 0x99;
+    auto other_prefix = a;
+    other_prefix[7] = 3;
+    EXPECT_EQ(key_of(a), key_of(b));
+    EXPECT_NE(key_of(a), key_of(other_prefix));
+    // The collapsed key keeps the /64 and zeroes the host half.
+    const IpKey collapsed = key_of(a);
+    EXPECT_TRUE(std::equal(a.begin(), a.begin() + 8, collapsed.begin()));
+    EXPECT_TRUE(std::all_of(collapsed.begin() + 8, collapsed.end(),
+                            [](std::uint8_t byte) { return byte == 0; }));
+    // IPv4 and IPv4-mapped addresses are untouched, so /32 hosts stay distinct.
+    const auto v4a = mtdd::protocol::Endpoint::v4({192, 0, 2, 1}, 1).wire20();
+    const auto v4b = mtdd::protocol::Endpoint::v4({192, 0, 2, 2}, 1).wire20();
+    IpKey ka{};
+    IpKey kb{};
+    std::copy_n(v4a.begin(), ka.size(), ka.begin());
+    std::copy_n(v4b.begin(), kb.size(), kb.begin());
+    EXPECT_EQ(collapse_ip_key(ka), ka);
+    EXPECT_NE(collapse_ip_key(ka), collapse_ip_key(kb));
+}
+
+// A handshake alone counts as "seen" but not "active" (default 1 MiB).
+TEST(Runtime, UniqueIpHandshakeOnlyIsSeenButNotActive) {
+    Daemon daemon(1, false, [](mtdd::Config& config) {
+        config.handshake_timeout = std::chrono::seconds{10};
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour == 1; }, 2000ms));
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.unique_ip_min_bytes, 1048576U);
+    EXPECT_EQ(snapshot.active_unique_ips, 1U);
+    EXPECT_EQ(snapshot.qualified_unique_ips, 0U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_active, 1U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.day, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.week, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour_active, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.day_active, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.week_active, 0U);
+}
+
+// unique_ip_min_bytes == 0 means active == seen: qualified at handshake.
+TEST(Runtime, UniqueIpMinBytesZeroMakesActiveEqualSeen) {
+    Daemon daemon(1, false, [](mtdd::Config& config) {
+        config.handshake_timeout = std::chrono::seconds{10};
+        config.unique_ip_min_bytes = 0;
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour_active == 1; },
+        2000ms));
+    auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.active_unique_ips, 1U);
+    EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.day_active, 1U);
+    EXPECT_EQ(snapshot.unique_ip_history.week_active, 1U);
+    client.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto current = daemon.services.stats.snapshot();
+            return current.active_unique_ips == 0 && current.qualified_unique_ips == 0;
+        },
+        2000ms));
+    snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(snapshot.unique_ip_history.hour_active, 1U);  // history outlives the session
+}
+
+// The IP becomes active once, on the first connection that crosses the byte
+// threshold; more qualified connections from the same IP do not add to it, and
+// it stays active until the last qualified connection closes.
+TEST(Runtime, UniqueIpBecomesActiveAfterByteThresholdExactlyOnce) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true, [](mtdd::Config& config) {
+        config.unique_ip_min_bytes = 1;
+    }, true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    TestClient first(daemon.port(), secret_bytes());
+    TestClient second(daemon.port(), secret_bytes());
+    TestClient idle(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(idle.valid());
+    ASSERT_TRUE(first.send_hello(0, 21));
+    ASSERT_TRUE(second.send_hello(0, 22));
+    ASSERT_TRUE(idle.send_hello(0, 23));
+    ASSERT_TRUE(first.start_obfuscation(2));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(idle.start_obfuscation(2));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour == 1; }, 2000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.active_unique_ips, 1U);
+        EXPECT_EQ(snapshot.qualified_unique_ips, 0U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour_active, 0U);
+    }
+
+    ASSERT_TRUE(first.send_message(burst_payload(0)));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().qualified_unique_ips == 1; }, 3000ms));
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().unique_ip_history.hour_active == 1; },
+        2000ms));
+    ASSERT_TRUE(second.send_message(burst_payload(1)));
+    ASSERT_TRUE(first.send_message(burst_payload(2)));
+    const std::uint64_t floor = burst_payload(0).size() * 3;
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.users.at("alice").payload_c2s_bytes >= floor;
+        },
+        3000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.active_unique_ips, 1U);
+        EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+        EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.day_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.week_active, 1U);
+        EXPECT_EQ(snapshot.unique_ip_history.hour, 1U);
+    }
+
+    // Closing a connection that never qualified, then one of two qualified
+    // ones, must keep the IP active.
+    idle.close();
+    first.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.users.at("alice").active_connections == 1;
+        },
+        2000ms));
+    {
+        const auto snapshot = daemon.services.stats.snapshot();
+        EXPECT_EQ(snapshot.qualified_unique_ips, 1U);
+        EXPECT_EQ(snapshot.users.at("alice").unique_ips_qualified, 1U);
+    }
+    // A half-closed client with an unanswered ME request is held until
+    // shutdown_timeout (2 s in the fixture), so wait past it.
+    second.close();
+    ASSERT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            return snapshot.active_unique_ips == 0 && snapshot.qualified_unique_ips == 0;
+        },
+        5000ms))
+        << "active=" << daemon.services.stats.snapshot().active_unique_ips
+        << " qualified=" << daemon.services.stats.snapshot().qualified_unique_ips
+        << " conns=" << daemon.services.stats.snapshot().users.at("alice").active_connections;
+    const auto after = daemon.services.stats.snapshot();
+    EXPECT_EQ(after.users.at("alice").unique_ips_qualified, 0U);
+    EXPECT_EQ(after.unique_ip_history.hour_active, 1U);
+    EXPECT_EQ(after.ip_history_observation_failures, 0U);
+}
+
 TEST(Runtime, UniqueIpsShutdownClearsActiveCounts) {
     Daemon daemon(1, false, [](mtdd::Config& config) {
         config.handshake_timeout = std::chrono::seconds{10};
@@ -228,6 +410,35 @@ TEST(Runtime, FullRelayThroughFakeMiddleEnd) {
     ASSERT_NE(snapshot.me_dcs.find("2"), snapshot.me_dcs.end());
     EXPECT_TRUE(snapshot.me_dcs.at("2").connected);
     EXPECT_GE(snapshot.me_dcs.at("2").requests_success, 1U);
+}
+
+// Live ad-tag override: an ME session already open when the override arrives
+// carries the new tag in its next RPC_PROXY_REQ, without a reconnect.
+TEST(Runtime, LiveAdTagOverrideReachesOpenMiddleEndSession) {
+    // Idle timeout well above the housekeeping wait below.
+    FakeMe me{me_secret(), 1, 0ms, 1, 0ms, 0ms, false, 0, 10000};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    std::array<std::uint8_t, 16> pool_tag{};
+    for (std::size_t i = 0; i < pool_tag.size(); ++i) pool_tag[i] = static_cast<std::uint8_t>(0xc0 + i);
+    ASSERT_NE(pool_tag, daemon.services.config.ad_tag);
+    EXPECT_THROW(daemon.set_ad_tag(std::array<std::uint8_t, 16>{}), std::invalid_argument);
+    daemon.set_ad_tag(pool_tag);
+    // The reactor picks the override up on its housekeeping tick.
+    std::this_thread::sleep_for(1500ms);
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+    ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+    const auto observation = me.future().get();
+    ASSERT_TRUE(observation.ok);
+    EXPECT_EQ(observation.ad_tag, pool_tag);
 }
 
 // Late answers for conn ids no client owns must release the remote mapping with
@@ -1003,3 +1214,134 @@ TEST(Runtime, SeparateSignedDcQueuesAndAnswersStayIsolated) {
 }
 
 } // namespace
+
+namespace {
+// Fetches `count` 128 KiB answers from media DC -2, one request at a time, and
+// returns the elapsed time (or a negative duration on failure).
+std::chrono::milliseconds fetch_media(std::uint64_t user_kbps, std::size_t count,
+                                      std::uint64_t* throttled = nullptr) {
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    FakeMe me{me_secret(), 100000, 0ms, 1, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.media_user_rate_kbps = user_kbps;
+        config.idle_timeout = 60s;
+    });
+    if (!daemon.services.add_user("alice", std::string(kSecretHex))) return -1ms;
+    if (!wait_for([&] { return daemon.services.stats.ready(); }, 4s)) return -1ms;
+    TestClient client(daemon.port(), secret_bytes());
+    if (!client.valid() || !client.send_hello() || !client.start_obfuscation(-2)) return -1ms;
+    const auto started = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!client.send_message(burst_payload(index))) return -1ms;
+        Bytes response;
+        if (!client.read_message(response, 10000) || response.size() != kAnswer) return -1ms;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    if (throttled != nullptr) *throttled = daemon.services.stats.snapshot().media_throttled_total;
+    return elapsed;
+}
+} // namespace
+
+TEST(Runtime, MediaUserRateLimitSlowsDownloadsWithoutDroppingThem) {
+    // 12 x 128 KiB = 1.5 MiB. Unlimited this is a loopback copy.
+    const auto unlimited = fetch_media(0, 12);
+    ASSERT_GE(unlimited.count(), 0);
+    EXPECT_LT(unlimited, 1500ms);
+    // 4000 kbit/s = 500 KB/s with a one-second burst: >= ~2 s for the rest.
+    std::uint64_t throttled = 0;
+    const auto limited = fetch_media(4000, 12, &throttled);
+    ASSERT_GE(limited.count(), 0) << "a shaped download must complete, not be dropped";
+    EXPECT_GE(limited, 1800ms);
+    EXPECT_LT(limited, 8000ms);
+    EXPECT_GE(throttled, 1U);
+}
+
+TEST(Runtime, MediaUserRateIsSplitEvenlyAcrossConnections) {
+    // Two parallel media connections of one user share a 4000 kbit/s
+    // (500 KB/s) limit. Each fetches 1 MiB: neither may starve the other, and
+    // together they cannot beat the user limit by much.
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    constexpr std::size_t kCount = 8;
+    FakeMe me{me_secret(), 100000, 0ms, 2, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.media_user_rate_kbps = 4000;
+        config.idle_timeout = 60s;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::array<std::chrono::milliseconds, 2> elapsed{-1ms, -1ms};
+    const auto start = std::chrono::steady_clock::now();
+    const auto fetch = [&](std::size_t slot, std::uint8_t variant) {
+        TestClient client(daemon.port(), secret_bytes());
+        if (!client.valid() || !client.send_hello(0, variant) || !client.start_obfuscation(-2)) {
+            return;
+        }
+        for (std::size_t index = 0; index < kCount; ++index) {
+            if (!client.send_message(burst_payload(index))) return;
+            Bytes response;
+            if (!client.read_message(response, 15000) || response.size() != kAnswer) return;
+        }
+        elapsed[slot] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+    };
+    std::thread first(fetch, 0, 0);
+    std::thread second(fetch, 1, 1);
+    first.join();
+    second.join();
+    ASSERT_GE(elapsed[0].count(), 0) << "first connection did not complete";
+    ASSERT_GE(elapsed[1].count(), 0) << "second connection did not complete";
+    const auto slowest = std::max(elapsed[0], elapsed[1]);
+    const auto fastest = std::min(elapsed[0], elapsed[1]);
+    // 2 MiB at 500 KB/s with a one-second burst per connection: >= ~2 s.
+    EXPECT_GE(slowest, 1800ms);
+    EXPECT_LT(slowest, 12000ms);
+    // Even split: the two connections finish close together.
+    EXPECT_LT(static_cast<double>(slowest.count()),
+              2.0 * static_cast<double>(fastest.count()))
+        << "fastest=" << fastest.count() << "ms slowest=" << slowest.count() << "ms";
+}
+
+TEST(Runtime, DeviceLimitClosesNewAuthKeyOnTheMiddleEndPath) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    mtdd::control::CreateUserRequest request;
+    request.name = "alice";
+    request.secret = std::string(kSecretHex);
+    request.policy.max_devices = 1;
+    ASSERT_TRUE(daemon.services.store->create_user(request).ok());
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+    // burst_payload(0) starts with a non-zero auth_key_id (00 01 01 ...).
+    const auto keyed = [](std::uint8_t key) {
+        Bytes payload = burst_payload(0);
+        if (key != 0) payload[1] = key;
+        return payload;
+    };
+
+    TestClient first(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(first.send_hello());
+    ASSERT_TRUE(first.start_obfuscation(2));
+    const Bytes first_request = keyed(0);
+    ASSERT_TRUE(first.send_message(first_request));
+    ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(me.future().get().inner, first_request);
+    EXPECT_EQ(daemon.services.stats.user("alice")->devices(), 1U);
+
+    TestClient second(daemon.port(), secret_bytes());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(second.send_hello(0, 1));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(second.send_message(keyed(0x22)));
+    EXPECT_TRUE(second.wait_closed_for(3000));
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(snapshot.relay_closes_total[static_cast<std::size_t>(
+                  mtdd::control::RelayCloseReason::device_limit)],
+              1U);
+    EXPECT_EQ(snapshot.users.at("alice").devices, 1U);
+}

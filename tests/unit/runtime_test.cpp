@@ -205,6 +205,25 @@ TEST(Runtime, WarmupFallsBackToAlternateDc) {
         5s));
 }
 
+TEST(Runtime, WarmupConnectsEveryPrimaryDcWithoutClients) {
+    FakeMe primary{me_secret()};
+    FakeMe secondary{me_secret()};
+    Daemon daemon(primary.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for 2 127.0.0.1:" << primary.port() << ";\n";
+        file << "proxy_for 4 127.0.0.1:" << secondary.port() << ";\n";
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    const auto connected = [&](const char* dc) {
+        const auto snapshot = daemon.services.stats.snapshot();
+        const auto found = snapshot.me_dcs.find(dc);
+        return found != snapshot.me_dcs.end() && found->second.connected;
+    };
+    EXPECT_TRUE(wait_for([&] { return connected("2") && connected("4"); }, 5s));
+    EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 0U);
+}
+
 TEST(Runtime, BurstIsChunkedThroughSharedMiddleEndWriter) {
     FakeMe me{me_secret(), kBurstCount, 120ms};
     Daemon daemon(me.port(), true);
@@ -258,6 +277,46 @@ TEST(Runtime, ReadinessDropsAndRecoversAcrossMeReconnect) {
     ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
     EXPECT_TRUE(wait_for([&] { return !daemon.services.stats.ready(); }, 4s));
     EXPECT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 6s));
+}
+
+TEST(Runtime, RelayCloseReasonsAreCounted) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    const auto closes = [&](mtdd::control::RelayCloseReason reason) {
+        return daemon.services.stats.snapshot()
+            .relay_closes_total[static_cast<std::size_t>(reason)];
+    };
+    {
+        TestClient client(daemon.port(), secret_bytes());
+        ASSERT_TRUE(client.valid());
+        ASSERT_TRUE(client.send_hello());
+        ASSERT_TRUE(client.start_obfuscation(2));
+        ASSERT_TRUE(client.send_message(burst_payload(0)));
+        Bytes response;
+        ASSERT_TRUE(client.read_message(response, 3000));
+        client.close();
+    }
+    EXPECT_TRUE(wait_for(
+        [&] { return closes(mtdd::control::RelayCloseReason::client_eof) == 1; }, 3s));
+    EXPECT_EQ(closes(mtdd::control::RelayCloseReason::other), 0U);
+
+    // A user revocation is attributed to "revoked", not to the peer.
+    TestClient revoked(daemon.port(), secret_bytes());
+    ASSERT_TRUE(revoked.valid());
+    ASSERT_TRUE(revoked.send_hello(0, 1));
+    ASSERT_TRUE(revoked.start_obfuscation(2));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.snapshot().connections_active == 1; },
+                         3s));
+    ASSERT_TRUE(daemon.services.store->delete_user(mtdd::control::DeleteUserRequest{"alice", {}})
+                    .ok());
+    EXPECT_TRUE(revoked.wait_closed_for(3000));
+    EXPECT_TRUE(wait_for(
+        [&] { return closes(mtdd::control::RelayCloseReason::revoked) == 1; }, 3s));
+    const auto metrics = daemon.services.stats.prometheus_text();
+    EXPECT_NE(metrics.find("mtdd_relay_closes_total{reason=\"client_eof\"} 1"),
+              std::string::npos);
 }
 
 TEST(Runtime, FailedDcDoesNotCollapseOtherReadyDcOrItsClient) {
@@ -615,6 +674,38 @@ TEST(RuntimeDrain, AwaitingReplyEofHonorsReadEofDeadline) {
     EXPECT_GE(EofDrainCounts::read().closes, 1U);
 }
 
+// With the default 10 s shutdown_timeout, a half-closed client whose only
+// pending work is an unanswered ME request is kept just for the short reply
+// grace (kEofReplyGrace), not the whole shutdown_timeout.
+TEST(RuntimeDrain, AwaitingReplyEofUsesShortReplyGrace) {
+    FakeMe me{me_secret(), 1, 8000ms};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+    std::this_thread::sleep_for(250ms);
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_EQ(::shutdown(client.fd(), SHUT_WR), 0);
+
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 1U)
+        << "awaiting-reply EOF closed before the reply grace";
+    ASSERT_TRUE(wait_for(
+        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 3000ms));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, 1800ms);
+    EXPECT_LT(elapsed, 3500ms);
+    EXPECT_EQ(daemon.services.stats.snapshot()
+                  .relay_closes_total[static_cast<std::size_t>(
+                      mtdd::control::RelayCloseReason::client_eof)],
+              1U);
+}
+
 // A delayed ME reply is the only progress event. The half-closed client must be
 // retained until that reply is delivered and then released without any further
 // client readiness event.
@@ -934,26 +1025,94 @@ TEST(Runtime, FallbackConnectRefusalClosesPairNotProcess) {
         [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
 }
 
-TEST(Runtime, MaskingClosesProbeForForeignServerName) {
-    // Auto masking is on and no fixed target is configured: a probe whose SNI
-    // does not belong to tls_domain must be closed without touching the network.
-    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
-    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+namespace {
+
+struct MaskingEndpointScope {
+    explicit MaskingEndpointScope(std::uint16_t port) {
+        mtdd::detail::set_masking_endpoint_override(
+            mtdd::detail::DirectEndpointOverride{"127.0.0.1", port});
+    }
+    ~MaskingEndpointScope() { mtdd::detail::set_masking_endpoint_override(std::nullopt); }
+    MaskingEndpointScope(const MaskingEndpointScope&) = delete;
+    MaskingEndpointScope& operator=(const MaskingEndpointScope&) = delete;
+};
+
+// Sends `wire` and expects the masking target (an echo server) to return it.
+void expect_relayed_to_mask_domain(Daemon& daemon, EchoBackend& echo, const Bytes& wire) {
     const int fd = connect_loopback(daemon.port());
     ASSERT_GE(fd, 0);
+    ASSERT_TRUE(send_all(fd, wire));
+    Bytes echoed(wire.size());
+    EXPECT_TRUE(recv_exact(fd, echoed.data(), echoed.size(), 3000));
+    EXPECT_EQ(echoed, wire);
+    ::close(fd);
+    EXPECT_GE(echo.accepted(), 1U);
+}
+
+} // namespace
+
+TEST(Runtime, MaskingRelaysForeignServerNameToTheMaskDomain) {
+    // No fixed target: a probe whose SNI does not belong to tls_domain is
+    // answered by the real tls_domain site, never closed with an RST.
+    EchoBackend echo;
+    MaskingEndpointScope scope(echo.port());
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
     A16 wrong{};
     for (std::size_t i = 0; i < wrong.size(); ++i) wrong[i] = 0xaa;
     const auto timestamp = static_cast<std::uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
-    const Bytes wire = make_client_hello(wrong, timestamp, "foreign.test", 3);
-    ASSERT_TRUE(send_all(fd, wire));
-    EXPECT_TRUE(wait_closed(fd, 3000));
-    ::close(fd);
+    expect_relayed_to_mask_domain(daemon, echo,
+                                  make_client_hello(wrong, timestamp, "foreign.test", 3));
     EXPECT_GE(stat_counter(daemon.services.stats, "handshakes", "failure"), 1U);
+}
+
+TEST(Runtime, PersonalTlsDomainAuthenticatesOnlyOnItsOwnSni) {
+    // alice has a personal tls_domain: her ClientHello is accepted on that SNI
+    // and refused on the global one (masking off: plain close). bob has none.
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = false; });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    mtdd::control::UpdateUserRequest update;
+    update.name = "alice";
+    update.policy.tls_domain = std::string("front.test");
+    ASSERT_TRUE(daemon.services.store->update_user(update).ok());
+
+    const auto timestamp = static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const auto secret = secret_bytes();
+
+    const int own = connect_loopback(daemon.port());
+    ASSERT_GE(own, 0);
+    ASSERT_TRUE(send_all(own, make_client_hello(secret, timestamp, "front.test", 0)));
+    Bytes header(5);
+    ASSERT_TRUE(recv_exact(own, header.data(), header.size(), 3000));
+    EXPECT_EQ(header[0], 0x16);  // ServerHello record: authenticated
+    ::close(own);
+
+    const int global = connect_loopback(daemon.port());
+    ASSERT_GE(global, 0);
+    ASSERT_TRUE(send_all(global, make_client_hello(secret, timestamp + 1, "example.com", 0)));
+    EXPECT_TRUE(wait_closed(global, 3000));
+    ::close(global);
+}
+
+TEST(Runtime, MaskingRelaysNonTlsProbeToTheMaskDomain) {
+    // Plain text (an HTTP request, or a proxy secret sent as text by a crude
+    // scanner) reaches the real site too.
+    EchoBackend echo;
+    MaskingEndpointScope scope(echo.port());
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.masking = true; });
+    for (const std::string& text :
+         {std::string("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+          std::string("eedddddddddddddddddddddddddddddddd6d2e6265626f6f2e7275")}) {
+        expect_relayed_to_mask_domain(daemon, echo, Bytes(text.begin(), text.end()));
+    }
     EXPECT_TRUE(wait_for(
-        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
+        [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 3000ms));
 }
 
 TEST(Runtime, MaskingDisabledClosesProbeWithoutFixedTarget) {
@@ -1120,3 +1279,11 @@ TEST(Runtime, FallbackStalledDrainClosesWithinIdleDeadline) {
 
 
 } // namespace
+
+TEST(Runtime, SetTunablesValidatesRanges) {
+    FakeMe me{me_secret()};
+    Daemon daemon(me.port(), true);
+    EXPECT_NO_THROW(daemon.set_tunables(1500, 6));
+    EXPECT_THROW(daemon.set_tunables(0, 6), std::invalid_argument);
+    EXPECT_THROW(daemon.set_tunables(400, 25), std::invalid_argument);
+}

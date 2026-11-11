@@ -6,6 +6,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -15,6 +16,34 @@
 #endif
 
 namespace mtdd::protocol {
+
+RandomFn buffered_random() {
+  struct Pool {
+    std::array<std::uint8_t, 16384> bytes{};
+    std::size_t used{16384};
+    ~Pool() { OPENSSL_cleanse(bytes.data(), bytes.size()); }
+  };
+  auto pool = std::make_shared<Pool>();
+  return [pool](std::span<std::uint8_t> out) {
+    if (out.empty()) return;
+    if (out.size() > 4096) {
+      if (RAND_bytes(out.data(), static_cast<int>(out.size())) != 1) {
+        throw std::runtime_error("openssl: RAND_bytes failed");
+      }
+      return;
+    }
+    if (pool->bytes.size() - pool->used < out.size()) {
+      if (RAND_bytes(pool->bytes.data(), static_cast<int>(pool->bytes.size())) != 1) {
+        throw std::runtime_error("openssl: RAND_bytes failed");
+      }
+      pool->used = 0;
+    }
+    std::memcpy(out.data(), pool->bytes.data() + pool->used, out.size());
+    // Served bytes are erased so the block never hands out a value twice.
+    OPENSSL_cleanse(pool->bytes.data() + pool->used, out.size());
+    pool->used += out.size();
+  };
+}
 
 RandomFn system_random() {
   return [](std::span<std::uint8_t> out) {
@@ -82,6 +111,66 @@ std::array<std::uint8_t, 32> hmac_sha256(std::span<const std::uint8_t> key,
       len != out.size()) {
     fail("hmac");
   }
+  return out;
+}
+
+struct HmacSha256Key::Impl {
+  EVP_MD_CTX* inner{nullptr};
+  EVP_MD_CTX* outer{nullptr};
+  ~Impl() {
+    EVP_MD_CTX_free(inner);
+    EVP_MD_CTX_free(outer);
+  }
+};
+
+HmacSha256Key::HmacSha256Key(std::span<const std::uint8_t, 16> key) : impl_(std::make_unique<Impl>()) {
+  std::copy(key.begin(), key.end(), key_.begin());
+  std::array<std::uint8_t, 64> ipad{};
+  std::array<std::uint8_t, 64> opad{};
+  ipad.fill(0x36);
+  opad.fill(0x5c);
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    ipad[i] = static_cast<std::uint8_t>(ipad[i] ^ key[i]);
+    opad[i] = static_cast<std::uint8_t>(opad[i] ^ key[i]);
+  }
+  impl_->inner = EVP_MD_CTX_new();
+  impl_->outer = EVP_MD_CTX_new();
+  const bool ok = impl_->inner != nullptr && impl_->outer != nullptr &&
+                  EVP_DigestInit_ex(impl_->inner, EVP_sha256(), nullptr) == 1 &&
+                  EVP_DigestUpdate(impl_->inner, ipad.data(), ipad.size()) == 1 &&
+                  EVP_DigestInit_ex(impl_->outer, EVP_sha256(), nullptr) == 1 &&
+                  EVP_DigestUpdate(impl_->outer, opad.data(), opad.size()) == 1;
+  secure_zero(ipad);
+  secure_zero(opad);
+  if (!ok) {
+    secure_zero(key_);
+    fail("hmac key");
+  }
+}
+
+HmacSha256Key::~HmacSha256Key() { secure_zero(key_); }
+HmacSha256Key::HmacSha256Key(HmacSha256Key&&) noexcept = default;
+HmacSha256Key& HmacSha256Key::operator=(HmacSha256Key&&) noexcept = default;
+
+std::array<std::uint8_t, 32> HmacSha256Key::mac(std::span<const std::uint8_t> data) const {
+  if (!impl_) fail("hmac key moved-from");
+  struct Ctx {
+    EVP_MD_CTX* value{EVP_MD_CTX_new()};
+    ~Ctx() { EVP_MD_CTX_free(value); }
+  } ctx;
+  std::array<std::uint8_t, 32> inner{};
+  std::array<std::uint8_t, 32> out{};
+  unsigned int len = 0;
+  if (ctx.value == nullptr || EVP_MD_CTX_copy_ex(ctx.value, impl_->inner) != 1 ||
+      EVP_DigestUpdate(ctx.value, data.data(), data.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx.value, inner.data(), &len) != 1 || len != inner.size() ||
+      EVP_MD_CTX_copy_ex(ctx.value, impl_->outer) != 1 ||
+      EVP_DigestUpdate(ctx.value, inner.data(), inner.size()) != 1 ||
+      EVP_DigestFinal_ex(ctx.value, out.data(), &len) != 1 || len != out.size()) {
+    secure_zero(inner);
+    fail("hmac");
+  }
+  secure_zero(inner);
   return out;
 }
 
@@ -180,6 +269,109 @@ std::uint32_t crc32c_portable_impl(std::span<const std::uint8_t> data) {
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define MTDD_HAVE_SSE42_CRC32C 1
 
+#if defined(__x86_64__)
+// Three-way parallel CRC-32C (the scheme of Mark Adler's crc32c.c): the crc32
+// instruction has a latency of 3 cycles but a throughput of one per cycle, so
+// one dependent chain runs at a third of the possible speed. Three independent
+// chains over consecutive blocks are combined by shifting the earlier CRCs
+// over the later blocks' length with zero-operator tables.
+constexpr std::size_t kCrcLongBlock = 8192;
+constexpr std::size_t kCrcShortBlock = 256;
+using CrcShiftTable = std::array<std::array<std::uint32_t, 256>, 4>;
+
+std::uint32_t gf2_matrix_times(const std::uint32_t* mat, std::uint32_t vec) {
+  std::uint32_t sum = 0;
+  while (vec != 0) {
+    if ((vec & 1u) != 0) sum ^= *mat;
+    vec >>= 1;
+    ++mat;
+  }
+  return sum;
+}
+
+void gf2_matrix_square(std::uint32_t* square, const std::uint32_t* mat) {
+  for (int n = 0; n < 32; ++n) square[n] = gf2_matrix_times(mat, mat[n]);
+}
+
+// Operator applying `len` zero bytes to a CRC; `len` is a power of two.
+void crc32c_zeros_op(std::uint32_t* even, std::size_t len) {
+  std::uint32_t odd[32];
+  odd[0] = kCrc32cPoly;  // one zero bit
+  std::uint32_t row = 1;
+  for (int n = 1; n < 32; ++n) {
+    odd[n] = row;
+    row <<= 1;
+  }
+  gf2_matrix_square(even, odd);  // two zero bits
+  gf2_matrix_square(odd, even);  // four zero bits
+  do {
+    gf2_matrix_square(even, odd);  // one zero byte, then 4, 16, ...
+    len >>= 1;
+    if (len == 0) return;
+    gf2_matrix_square(odd, even);  // 2, 8, 32, ... zero bytes
+    len >>= 1;
+  } while (len != 0);
+  for (int n = 0; n < 32; ++n) even[n] = odd[n];
+}
+
+CrcShiftTable crc32c_zeros(std::size_t len) {
+  std::uint32_t op[32];
+  crc32c_zeros_op(op, len);
+  CrcShiftTable zeros{};
+  for (std::uint32_t n = 0; n < 256; ++n) {
+    zeros[0][n] = gf2_matrix_times(op, n);
+    zeros[1][n] = gf2_matrix_times(op, n << 8);
+    zeros[2][n] = gf2_matrix_times(op, n << 16);
+    zeros[3][n] = gf2_matrix_times(op, n << 24);
+  }
+  return zeros;
+}
+
+std::uint32_t crc32c_shift(const CrcShiftTable& zeros, std::uint32_t crc) {
+  return zeros[0][crc & 0xffu] ^ zeros[1][(crc >> 8) & 0xffu] ^ zeros[2][(crc >> 16) & 0xffu] ^
+         zeros[3][crc >> 24];
+}
+
+const CrcShiftTable& crc32c_long_shift() {
+  static const CrcShiftTable table = crc32c_zeros(kCrcLongBlock);
+  return table;
+}
+
+const CrcShiftTable& crc32c_short_shift() {
+  static const CrcShiftTable table = crc32c_zeros(kCrcShortBlock);
+  return table;
+}
+
+std::uint64_t load_u64(const std::uint8_t* p) {
+  std::uint64_t word = 0;
+  std::memcpy(&word, p, sizeof(word));
+  return word;
+}
+
+// `crc0` is the running (pre-inverted) state; returns it after `blocks` of
+// three `block`-byte runs.
+__attribute__((target("sse4.2"))) std::uint64_t crc32c_three_way(
+    std::uint64_t crc0, const std::uint8_t*& next, std::size_t& len, std::size_t block,
+    const CrcShiftTable& shift) {
+  while (len >= 3 * block) {
+    std::uint64_t crc1 = 0;
+    std::uint64_t crc2 = 0;
+    const std::uint8_t* const end = next + block;
+    do {
+      crc0 = _mm_crc32_u64(crc0, load_u64(next));
+      crc1 = _mm_crc32_u64(crc1, load_u64(next + block));
+      crc2 = _mm_crc32_u64(crc2, load_u64(next + 2 * block));
+      next += 8;
+    } while (next < end);
+    crc0 = crc32c_shift(shift, static_cast<std::uint32_t>(crc0)) ^ crc1;
+    crc0 = crc32c_shift(shift, static_cast<std::uint32_t>(crc0)) ^ crc2;
+    next += 2 * block;
+    len -= 3 * block;
+  }
+  return crc0;
+}
+#endif
+
 // Only this function carries the sse4.2 target attribute, so the translation unit
 // (and therefore the portable binary) never requires SSE4.2 to load.
 // _mm_crc32_u64 exists only on x86-64; 32-bit x86 (__i386__) uses the 32-bit
@@ -188,6 +380,13 @@ __attribute__((target("sse4.2"))) std::uint32_t crc32c_sse42(
     std::span<const std::uint8_t> data) {
 #if defined(__x86_64__)
   std::uint64_t c = 0xffffffffu;
+  if (data.size() >= 3 * kCrcShortBlock) {
+    const std::uint8_t* next = data.data();
+    std::size_t len = data.size();
+    c = crc32c_three_way(c, next, len, kCrcLongBlock, crc32c_long_shift());
+    c = crc32c_three_way(c, next, len, kCrcShortBlock, crc32c_short_shift());
+    data = data.subspan(data.size() - len);
+  }
   while (data.size() >= 8) {
     std::uint64_t word = 0;
     std::memcpy(&word, data.data(), sizeof(word));
@@ -264,6 +463,17 @@ void AesCtr::apply(std::span<std::uint8_t> data) {
   int out_len = 0;
   // CTR has no buffered partial output; EVP permits exact input/output aliasing.
   if (EVP_EncryptUpdate(impl_->ctx.ctx, data.data(), &out_len, data.data(), size) != 1 ||
+      out_len != size) {
+    fail("aes-256-ctr update");
+  }
+}
+
+void AesCtr::apply(std::span<const std::uint8_t> in, std::span<std::uint8_t> out) {
+  if (in.size() != out.size()) throw std::invalid_argument("aes-256-ctr: in/out size mismatch");
+  if (in.empty()) return;
+  const int size = update_size(in.size());
+  int out_len = 0;
+  if (EVP_EncryptUpdate(impl_->ctx.ctx, out.data(), &out_len, in.data(), size) != 1 ||
       out_len != size) {
     fail("aes-256-ctr update");
   }

@@ -90,7 +90,9 @@ TEST(HttpStatusTest, StatusReportsActualRuntimeStatistics) {
   alice->add_payload(Direction::client_to_server, 11);
   alice->add_payload(Direction::server_to_client, 22);
   alice->set_active_unique_ips(2);
+  alice->set_qualified_unique_ips(1);
   h.stats().set_active_unique_ips(4);
+  h.stats().set_qualified_unique_ips(3);
   h.stats().me_connected(3, true);
   h.stats().me_pending_buffer_bytes(4096);
 
@@ -107,7 +109,8 @@ TEST(HttpStatusTest, StatusReportsActualRuntimeStatistics) {
   EXPECT_EQ(data["users_enabled"], 1);
   EXPECT_TRUE(data["uptime_seconds"].is_number_unsigned());
   EXPECT_EQ(data["connections_active"], 1);
-  EXPECT_EQ(data["unique_ips_active"], 4);
+  EXPECT_EQ(data["unique_ips_active"], 3);
+  EXPECT_EQ(data["unique_ips_seen"], 4);
   EXPECT_EQ(data["connections_accepted_total"], 2);
   EXPECT_EQ(data["connections_rejected_total"], 1);
   EXPECT_EQ(data["handshakes_total"], 1);
@@ -120,7 +123,8 @@ TEST(HttpStatusTest, StatusReportsActualRuntimeStatistics) {
   ASSERT_EQ(user.status, 200);
   auto user_data = parse_json(user)["data"]["user"];
   EXPECT_EQ(user_data["stats"]["active_connections"], 1);
-  EXPECT_EQ(user_data["stats"]["unique_ips_active"], 2);
+  EXPECT_EQ(user_data["stats"]["unique_ips_active"], 1);
+  EXPECT_EQ(user_data["stats"]["unique_ips_seen"], 2);
   EXPECT_EQ(user_data["stats"]["payload_bytes_c2s"], 11);
   EXPECT_EQ(user_data["stats"]["payload_bytes_s2c"], 22);
 }
@@ -131,6 +135,8 @@ TEST(HttpHistoryTest, StatusExposesCalendarEstimateContract) {
   ASSERT_TRUE(h.stats().observe_ip_history({1}));
   ASSERT_TRUE(h.stats().observe_ip_history({1}));
   ASSERT_TRUE(h.stats().observe_ip_history({2}));
+  ASSERT_TRUE(h.stats().observe_ip_history_active({1}));
+  h.stats().set_unique_ip_min_bytes(1048576);
 
   auto response = h.req("GET", "/v1/status");
   ASSERT_EQ(response.status, 200);
@@ -140,6 +146,10 @@ TEST(HttpHistoryTest, StatusExposesCalendarEstimateContract) {
   EXPECT_EQ(history["hour"]["estimate"], 2);
   EXPECT_EQ(history["day"]["estimate"], 2);
   EXPECT_EQ(history["week"]["estimate"], 2);
+  EXPECT_EQ(history["hour_active"]["estimate"], 1);
+  EXPECT_EQ(history["day_active"]["estimate"], 1);
+  EXPECT_EQ(history["week_active"]["estimate"], 1);
+  EXPECT_EQ(history["min_bytes"], 1048576);
   EXPECT_EQ(history["hour"]["started_at"], kHistoryTue1030 - 1800);
   EXPECT_TRUE(history["approximate"].get<bool>());
   EXPECT_DOUBLE_EQ(history["relative_standard_error"].get<double>(), 0.0325);

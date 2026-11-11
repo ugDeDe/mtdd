@@ -118,7 +118,9 @@ void Runtime::Impl::pump_me_out(MeConn& me) {
         }
     }
     if (me.fd.valid() && !me.out->empty()) {
-        const auto result = me.out->flush_to(me.fd.get(), detail::kWriteBatch);
+        // Requests of a whole reactor iteration are written at once.
+        const auto result =
+            me.out->flush_to(me.fd.get(), std::max(detail::kWriteBatch, me.out->bytes()));
         if (result.status == io::FlushStatus::error) {
             defer_me_failure(me);
             return;
@@ -127,6 +129,74 @@ void Runtime::Impl::pump_me_out(MeConn& me) {
     }
     reaccount(me);
     update_me_interest(me);
+}
+
+bool Runtime::Impl::stage_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes) {
+    if (bytes.empty()) return true;
+    if (!me.out) return false;
+    std::size_t moved = 0;
+    if (me.frames.empty()) {
+        // FIFO: bytes go to `out` only while nothing is waiting in `frames`.
+        const std::size_t space = me.out->max_bytes() - me.out->bytes();
+        moved = std::min(space, bytes.size());
+        if (moved != 0 && me.out->append(bytes.first(moved)) != io::AppendStatus::ok) return false;
+    }
+    if (moved == bytes.size()) return true;
+    // The output queue is full: the remainder waits in `frames`, which also
+    // stops pump_c2s/pump_me_ready_queue until EPOLLOUT drains it.
+    try {
+        const auto rest = bytes.subspan(moved);
+        me.frames.push_back(StagedFrame{std::vector<std::uint8_t>(rest.begin(), rest.end()), 0});
+        me.frame_bytes += rest.size();
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
+}
+
+void Runtime::Impl::schedule_me_flush(MeConn& me) {
+    if (me.flush_pending) return;
+    try {
+        me_flush_tokens_.push_back(me.token);
+    } catch (const std::bad_alloc&) {
+        pump_me_out(me);  // cannot defer: write now
+        return;
+    }
+    me.flush_pending = true;
+}
+
+void Runtime::Impl::flush_pending_me(Time now) {
+    // A flush can resume clients waiting in ready_clients (their requests were
+    // held while `out` was full), which stages more; a few rounds settle it,
+    // and anything left is written without resuming (EPOLLOUT/ready wake).
+    constexpr int kRounds = 4;
+    for (int round = 0; round <= kRounds && !me_flush_tokens_.empty(); ++round) {
+        me_flush_batch_.clear();
+        me_flush_batch_.swap(me_flush_tokens_);
+        for (const std::uint64_t token : me_flush_batch_) {
+            const auto found = me_by_token_.find(token);
+            if (found == me_by_token_.end() || found->second == nullptr) continue;
+            MeConn& me = *found->second;
+            if (!me.flush_pending) continue;
+            me.flush_pending = false;
+            try {
+                pump_me_out(me);
+                if (round < kRounds && me.state == MeConn::State::ready && !me.failure_deferred &&
+                    !me.ready_clients.empty()) {
+                    pump_me_ready_queue(me, now);
+                } else {
+                    arm_me_ready_wake(me, now);
+                }
+                update_me_interest(me);
+            } catch (const std::exception&) {
+                try {
+                    fail_me(me, now);
+                } catch (...) {
+                }
+            }
+        }
+    }
+    me_flush_batch_.clear();
 }
 
 void Runtime::Impl::publish_me_queue(MeConn& me) {
@@ -378,6 +448,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     const std::size_t required = payload.size() * 2 + 64U * 1024U;
     if (!budget_allows(required)) {
         stats_.add_backpressure(control::Direction::server_to_client);
+        note_close(client, control::RelayCloseReason::backpressure);
         defer_close(client.token);
         return;
     }
@@ -386,19 +457,21 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         // transport header/padding is written directly into the TLS record body
         // (byte-identical wire for the same random stream), so no separate
         // frame buffer and no second full-payload copy are needed.
-        wire_buffer_.clear();
-        if (client.tls->send_transport_message(client.tls->proto_tag(), payload, wire_buffer_,
-                                               random_) != protocol::Status::Ok) {
+        // Answers decoded in the same ME read are appended to one open TLS
+        // record per client and written once by flush_s2c_batches().
+        if (client.tls->send_transport_message(client.tls->proto_tag(), payload,
+                                               client.s2c_batch, random_,
+                                               &client.s2c_open_record) !=
+            protocol::Status::Ok) {
             defer_close(client.token);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
             return;
         }
-        if (!push_client_wire(client, wire_buffer_)) {
-            stats_.add_backpressure(control::Direction::server_to_client);
-            defer_close(client.token);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
+        if (!client.in_s2c_batch) {
+            client.in_s2c_batch = true;
+            s2c_batch_tokens_.push_back(client.token);
+        }
+        if (client.s2c_batch.size() >= detail::kS2cBatchFlushBytes &&
+            !finish_s2c_batch(client, false)) {
             return;
         }
     } catch (const std::bad_alloc&) {
@@ -422,11 +495,18 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         return;
     }
     client.metrics->add_payload(control::Direction::server_to_client, payload.size());
+    note_activity(client, payload.size());
+    note_ip_payload(client, payload.size());
+    // ME shares one socket across users, so s2c cannot be gated at the source.
+    // Charge the bucket anyway: an overdrawn bucket pauses this client's c2s
+    // reads (see update_client_interest), which throttles request-driven
+    // downloads. A single answer can still exceed the rate momentarily.
+    if (client.rate_down != 0) {
+        charge_rate(client, control::Direction::server_to_client, payload.size(), now);
+    }
     client.awaiting_reply = false;
     ++me.ans_delivered;
     stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::delivered);
-    detail::trim_scratch(wire_buffer_);
-    reaccount_shared();
 }
 
 void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
@@ -453,17 +533,16 @@ void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
     try {
         frame_buffer_.clear();
         protocol::encode_quick_ack(client.tls->proto_tag(), confirm, frame_buffer_);
-        wire_buffer_.clear();
-        if (client.tls->send(frame_buffer_, wire_buffer_) != protocol::Status::Ok) {
+        // Same ordered stream as payload answers of this ME read.
+        if (client.tls->send(frame_buffer_, client.s2c_batch, &client.s2c_open_record) !=
+            protocol::Status::Ok) {
             defer_close(client.token);
             detail::trim_scratch(frame_buffer_);
-            detail::trim_scratch(wire_buffer_);
-            reaccount_shared();
             return;
         }
-        if (!push_client_wire(client, wire_buffer_)) {
-            stats_.add_backpressure(control::Direction::server_to_client);
-            defer_close(client.token);
+        if (!client.in_s2c_batch) {
+            client.in_s2c_batch = true;
+            s2c_batch_tokens_.push_back(client.token);
         }
     } catch (const std::bad_alloc&) {
         defer_close(client.token);
@@ -473,8 +552,6 @@ void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
         defer_me_failure(me);
     }
     detail::trim_scratch(frame_buffer_);
-    detail::trim_scratch(wire_buffer_);
-    reaccount_shared();
 }
 
 void Runtime::Impl::MeSink::on_proxy_payload(const detail::ConnId& id,
@@ -502,7 +579,12 @@ void Runtime::Impl::MeSink::on_quick_ack(const detail::ConnId& id,
 void Runtime::Impl::MeSink::on_remote_close(const detail::ConnId& id) {
     try {
         const auto found = impl->clients_by_conn_.find(id);
-        if (found != impl->clients_by_conn_.end()) impl->defer_close(found->second);
+        if (found == impl->clients_by_conn_.end()) return;
+        const auto client = impl->clients_.find(found->second);
+        if (client != impl->clients_.end()) {
+            note_close(*client->second, control::RelayCloseReason::remote_close);
+        }
+        impl->defer_close(found->second);
     } catch (...) {
     }
 }

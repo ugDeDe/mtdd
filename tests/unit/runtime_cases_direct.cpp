@@ -178,7 +178,10 @@ TEST(Runtime, DirectBudgetPauseStopsReactorSpinAndResumes) {
     DirectEndpointScope endpoint(dc.port());
     Daemon daemon(1, true, [](mtdd::Config& config) {
         enable_direct(2, config);
-        config.global_buffer_bytes = 400U * 1024U;
+        // DC reads stop once the 256 KiB client queue is full; the budget must
+        // be below queue + one read reservation (~96 KiB) so the budget gate,
+        // not only the queue limit, is what pauses the DC socket.
+        config.global_buffer_bytes = 300U * 1024U;
         config.connection_queue_bytes = 256U * 1024U;
         config.handshake_timeout = 10s;
     });
@@ -863,7 +866,8 @@ TEST(Runtime, PerUserConnectionCapIsGlobalAcrossReactors) {
     }
     EXPECT_EQ(established, 1U) << "per-user cap admitted more than one session";
     EXPECT_EQ(daemon.services.stats.snapshot().users.at("alice").active_connections, 1U);
-    EXPECT_GE(stat_counter(daemon.services.stats, "rejected", "overload"), kAttempts - 1);
+    EXPECT_GE(stat_counter(daemon.services.stats, "rejected", "user_connection_limit"),
+              kAttempts - 1);
 
     const auto counts = daemon.accepted_per_worker();
     EXPECT_EQ(std::accumulate(counts.begin(), counts.end(), std::uint64_t{0}), kAttempts);
