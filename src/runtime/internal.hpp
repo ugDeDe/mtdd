@@ -60,9 +60,15 @@ inline constexpr std::size_t kEpollBatch = 512;
 // Sockets accepted per listener readiness event. Bounded so a connection burst
 // cannot monopolise one reactor; the listen backlog holds the remainder.
 inline constexpr std::size_t kAcceptBatch = 128;
-// Masking-target DNS cache lifetime; probes are rare, so a blocking resolve
-// on the reactor at TTL expiry is an acceptable trade-off (documented).
+// Masking-target DNS refresh period. Names are resolved by MaskingResolver's
+// background thread, never on a reactor. A failed lookup is retried after
+// kMaskingResolveRetryMin, doubling up to kMaskingResolveRetryMax, while the
+// last good address keeps being served. kMaskingResolvePoll bounds how late
+// a personal tls_domain change is picked up.
 inline constexpr std::chrono::seconds kFallbackResolveTtl{300};
+inline constexpr std::chrono::seconds kMaskingResolveRetryMin{5};
+inline constexpr std::chrono::seconds kMaskingResolveRetryMax{60};
+inline constexpr std::chrono::seconds kMaskingResolvePoll{1};
 inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
 // A client's coalesced ME answers are handed to its queue once they reach this
 // size even before the ME read ends, bounding the per-read staging copy.
@@ -224,6 +230,71 @@ void set_direct_endpoint_override(std::optional<DirectEndpointOverride> value);
 // Test-only: every automatic masking target (SNI name or tls_domain) dials
 // this endpoint instead, so tests never resolve or reach the real domain.
 void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value);
+// Test-only masking DNS seam, so tests never resolve real names. `resolve`
+// replaces io::resolve_numeric_host, `refresh` replaces kFallbackResolveTtl,
+// and a nonzero `port` replaces 443 for the automatic (SNI/tls_domain)
+// targets. Production never installs it.
+struct MaskingResolveHooks {
+    std::function<std::optional<std::string>(const std::string&)> resolve;
+    std::chrono::milliseconds refresh{kFallbackResolveTtl};
+    std::uint16_t port{0};
+};
+void set_masking_resolve_hooks_for_test(std::optional<MaskingResolveHooks> hooks);
+
+// Masking-target DNS: one helper thread per runtime, shared by all reactors.
+// It keeps the configured names (fallback_host when it is a hostname,
+// otherwise tls_domain and every personal tls_domain of the current user
+// snapshot) resolved in a keyed cache and refreshes them in the background.
+// Reactors only call address(), a short locked map lookup; the lock is never
+// held across a lookup. Owned by Runtime::RuntimeState, which starts it before
+// the reactors run and stops it when they finish.
+class MaskingResolver {
+public:
+    MaskingResolver(const Config& config, control::UserStore& users);
+    ~MaskingResolver();
+    MaskingResolver(const MaskingResolver&) = delete;
+    MaskingResolver& operator=(const MaskingResolver&) = delete;
+
+    // No thread when no configured target is a hostname.
+    void start();
+    // Waits for at most the one lookup in flight. Idempotent.
+    void stop() noexcept;
+    // Cached address of `host`, or empty (then the thread is woken to pick up
+    // a newly configured name). Never blocks on DNS.
+    std::string address(std::string_view host);
+
+private:
+    using Clock = std::chrono::steady_clock;
+    struct Entry {
+        std::string address;  // last good answer; empty until the first one
+        Clock::time_point next_attempt;
+        std::chrono::milliseconds backoff;
+    };
+    bool needed() const;
+    void run();
+    // Thread only: the configured names, or nullopt when unchanged.
+    std::optional<std::vector<std::string>> configured_names();
+
+    control::UserStore& users_;
+    const std::string tls_domain_;
+    const std::string fallback_host_;
+    const std::uint16_t fallback_port_;
+    const bool masking_;
+    std::function<std::optional<std::string>(const std::string&)> resolve_;
+    std::chrono::milliseconds refresh_{kFallbackResolveTtl};
+    std::chrono::milliseconds retry_min_{kMaskingResolveRetryMin};
+    // configured_names() state (thread only).
+    std::shared_ptr<const control::UserSnapshot> names_snapshot_;
+    bool names_overridden_{false};
+    bool names_valid_{false};
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::unordered_map<std::string, Entry> entries_;  // guarded by mutex_
+    bool kicked_{false};                              // guarded by mutex_
+    bool stop_{false};                                // guarded by mutex_
+    std::thread thread_;
+};
 
 // Test-only fault injection. Production never calls these; they let the local
 // tests prove failure paths without touching sockets or real crypto.
@@ -1300,7 +1371,8 @@ struct Runtime::Impl {
     void defer_close_conn(const detail::ConnId& id);
     bool fallback_enabled() const noexcept;
     bool masking_enabled() const noexcept;  // automatic SNI masking for probes
-    std::string ensure_fallback_address(Time now, std::string_view host);
+    // Literal host, else its cached address or empty (never resolves).
+    std::string fallback_address(std::string_view host);
     // `prefetched` is queued to the backend verbatim; `client_hello` (the
     // reassembled ClientHello, when it differs) selects the SNI target.
     bool start_fallback(Client& client, std::span<const std::uint8_t> prefetched, Time now,
@@ -1434,11 +1506,10 @@ struct Runtime::Impl {
     std::vector<Client*> free_clients_;
     std::size_t client_pool_limit_{0};
     std::map<std::int16_t, DcPool> me_pool_;
-    // Masking-target DNS cache keyed by hostname; refreshed on probe when
-    // older than kFallbackResolveTtl. Literal IPs bypass it entirely.
-    std::string fallback_cache_host_;
-    std::string fallback_address_;
-    Time fallback_resolved_at_{};
+    // Masking-target DNS cache, owned by RuntimeState (null for a reactor
+    // built without one: hostname targets then never resolve). Literal IPs
+    // bypass it entirely.
+    detail::MaskingResolver* masking_dns_{nullptr};
     // Stable identity for deferred failures and deadline/target lookups. Raw
     // pointers are valid while the owning DcPool holds the connection.
     std::unordered_map<std::uint64_t, MeConn*> me_by_token_;
@@ -1580,6 +1651,8 @@ public:
     // Config::cpu_affinity: reactors pin themselves at run() (run_impl).
     bool cpu_affinity{false};
     std::shared_ptr<detail::SharedState> shared;
+    // Declared before `reactors` so it outlives them (they hold raw pointers).
+    std::unique_ptr<detail::MaskingResolver> masking_dns;
     std::vector<std::unique_ptr<Impl>> reactors;
     std::vector<std::thread> threads;
     // Quota counter persistence (no-op without Config::usage_state_path).

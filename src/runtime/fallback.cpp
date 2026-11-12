@@ -3,12 +3,15 @@
 //   1. Explicitly configured destination (fallback_host/fallback_port) —
 //      byte relay there, preserving the historical behavior for deployments
 //      that pin a fixed backend.
-//   2. Otherwise: a probe whose SNI matches the configured FakeTLS domain
-//      (or a subdomain of it) is relayed to the real server of that name on
-//      443, so active probes receive a genuine certificate for the covered
-//      name.
+//   2. Otherwise: a probe whose SNI matches a configured FakeTLS domain (or
+//      a subdomain of it) is relayed to the real server of that configured
+//      name on 443, so active probes receive a genuine certificate for the
+//      covered name; any other probe goes to the global tls_domain.
 //   3. Otherwise the probe is closed.
 // This is deliberately a byte relay, not a TLS/HTTP implementation.
+//
+// Target names are resolved only by MaskingResolver's background thread; a
+// reactor reads its cache and never calls getaddrinfo.
 #include "internal.hpp"
 
 #include <sys/socket.h>
@@ -59,12 +62,185 @@ std::optional<detail::DirectEndpointOverride> masking_override() {
     std::lock_guard<std::mutex> lock(g_masking_override_mutex);
     return g_masking_override;
 }
+std::optional<detail::MaskingResolveHooks> g_masking_hooks;
+
+std::optional<detail::MaskingResolveHooks> masking_hooks() {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    return g_masking_hooks;
+}
 }  // namespace
 
 namespace detail {
 void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value) {
     std::lock_guard<std::mutex> lock(g_masking_override_mutex);
     g_masking_override = std::move(value);
+}
+
+void set_masking_resolve_hooks_for_test(std::optional<MaskingResolveHooks> hooks) {
+    std::lock_guard<std::mutex> lock(g_masking_override_mutex);
+    g_masking_hooks = std::move(hooks);
+}
+
+namespace {
+// Cache key: DNS names compare case-insensitively, a trailing dot is noise.
+std::string dns_key(std::string_view name) {
+    auto key = to_lower(name);
+    if (!key.empty() && key.back() == '.') key.pop_back();
+    return key;
+}
+}  // namespace
+
+MaskingResolver::MaskingResolver(const Config& config, control::UserStore& users)
+    : users_(users),
+      tls_domain_(config.tls_domain),
+      fallback_host_(config.fallback_host),
+      fallback_port_(config.fallback_port),
+      masking_(config.masking) {
+    const auto hooks = masking_hooks();
+    if (hooks && hooks->resolve) {
+        resolve_ = hooks->resolve;
+        refresh_ = hooks->refresh;
+    } else {
+        resolve_ = [](const std::string& name) { return io::resolve_numeric_host(name); };
+    }
+    retry_min_ = std::min<std::chrono::milliseconds>(kMaskingResolveRetryMin, refresh_);
+}
+
+MaskingResolver::~MaskingResolver() { stop(); }
+
+bool MaskingResolver::needed() const {
+    if (fallback_port_ != 0) return !io::is_numeric_address(fallback_host_);
+    return masking_ && !tls_domain_.empty();
+}
+
+void MaskingResolver::start() {
+    if (thread_.joinable() || !needed()) return;
+    thread_ = std::thread([this] { run(); });
+}
+
+void MaskingResolver::stop() noexcept {
+    {
+        const std::lock_guard lock{mutex_};
+        stop_ = true;
+    }
+    wake_.notify_all();
+    // Bounded by the one lookup the thread may be inside.
+    if (thread_.joinable()) {
+        try {
+            thread_.join();
+        } catch (...) {
+        }
+    }
+}
+
+std::string MaskingResolver::address(std::string_view host) {
+    const auto key = dns_key(host);
+    {
+        const std::lock_guard lock{mutex_};
+        const auto found = entries_.find(key);
+        if (found != entries_.end() && !found->second.address.empty()) {
+            return found->second.address;
+        }
+        kicked_ = true;
+    }
+    // A wake-up only: the thread re-reads the configured names (a personal
+    // domain may have just been added) and still honours each name's backoff,
+    // so a probe flood cannot become a DNS flood.
+    wake_.notify_one();
+    return {};
+}
+
+std::optional<std::vector<std::string>> MaskingResolver::configured_names() {
+    const bool overridden = masking_override().has_value();
+    std::shared_ptr<const control::UserSnapshot> snapshot;
+    if (fallback_port_ == 0 && masking_ && !overridden) snapshot = users_.snapshot();
+    if (names_valid_ && snapshot == names_snapshot_ && overridden == names_overridden_) {
+        return std::nullopt;
+    }
+    std::vector<std::string> names;
+    const auto add = [&names](std::string_view name) {
+        if (name.empty() || io::is_numeric_address(name)) return;
+        auto key = dns_key(name);
+        if (std::find(names.begin(), names.end(), key) == names.end()) {
+            names.push_back(std::move(key));
+        }
+    };
+    if (fallback_port_ != 0) {
+        add(fallback_host_);
+    } else if (masking_ && !tls_domain_.empty() && !overridden) {
+        // The test endpoint override replaces every automatic target, so
+        // nothing needs resolving while it is installed.
+        add(tls_domain_);
+        if (snapshot) {
+            for (const auto& user : snapshot->users) add(user.policy.tls_domain);
+        }
+    }
+    names_snapshot_ = std::move(snapshot);
+    names_overridden_ = overridden;
+    names_valid_ = true;
+    return names;
+}
+
+void MaskingResolver::run() {
+    std::unique_lock lock{mutex_};
+    while (!stop_) {
+        kicked_ = false;
+        lock.unlock();
+        std::optional<std::vector<std::string>> names;
+        try {
+            names = configured_names();
+        } catch (...) {
+            // Allocation failure: keep the current set, retry next wake-up.
+        }
+        lock.lock();
+        if (stop_) break;
+        auto now = Clock::now();
+        if (names) {
+            // Evict names no longer configured; new names are due at once.
+            std::erase_if(entries_, [&names](const auto& item) {
+                return std::find(names->begin(), names->end(), item.first) == names->end();
+            });
+            for (const auto& name : *names) entries_.try_emplace(name, Entry{{}, now, {}});
+        }
+        std::string due;
+        Clock::time_point next = now + kMaskingResolvePoll;
+        for (const auto& [name, entry] : entries_) {
+            if (entry.next_attempt <= now) {
+                due = name;
+                break;
+            }
+            next = std::min(next, entry.next_attempt);
+        }
+        if (due.empty()) {
+            wake_.wait_until(lock, next, [this] { return stop_ || kicked_; });
+            continue;
+        }
+        // Never hold the lock across the lookup: reactors keep reading the
+        // cache (and its stale addresses) meanwhile.
+        lock.unlock();
+        std::optional<std::string> resolved;
+        try {
+            resolved = resolve_(due);
+        } catch (...) {
+        }
+        lock.lock();
+        now = Clock::now();
+        const auto found = entries_.find(due);
+        if (found == entries_.end()) continue;  // evicted meanwhile
+        auto& entry = found->second;
+        if (resolved && !resolved->empty()) {
+            entry.address = std::move(*resolved);
+            entry.backoff = {};
+            entry.next_attempt = now + refresh_;
+        } else {
+            // Stale-while-revalidate: the last good address stays served.
+            entry.backoff = entry.backoff.count() == 0
+                                ? retry_min_
+                                : std::min<std::chrono::milliseconds>(entry.backoff * 2,
+                                                                      kMaskingResolveRetryMax);
+            entry.next_attempt = now + entry.backoff;
+        }
+    }
 }
 }  // namespace detail
 
@@ -118,19 +294,12 @@ std::string Runtime::Impl::domain_for_sni(std::string_view sni) {
     return {};
 }
 
-std::string Runtime::Impl::ensure_fallback_address(Time now, std::string_view host) {
+std::string Runtime::Impl::fallback_address(std::string_view host) {
     // Literal addresses (the historical loopback backend) bypass DNS entirely.
     if (io::is_numeric_address(host)) return std::string(host);
-    const bool fresh = fallback_cache_host_ == host && !fallback_address_.empty() &&
-                       now - fallback_resolved_at_ < detail::kFallbackResolveTtl;
-    if (!fresh) {
-        const auto resolved = io::resolve_numeric_host(host);
-        if (!resolved) return {};
-        fallback_cache_host_ = std::string(host);
-        fallback_address_ = *resolved;
-        fallback_resolved_at_ = now;
-    }
-    return fallback_address_;
+    // Never resolves here: a cache miss closes the probe (as a failed
+    // resolution always did) and asks the background resolver for the name.
+    return masking_dns_ ? masking_dns_->address(host) : std::string{};
 }
 
 bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t> prefetched,
@@ -172,17 +341,16 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
     client.backend_token = add_target(Target{Kind::fallback_backend, nullptr, client.token});
     std::vector<std::pair<std::string, std::uint16_t>> targets;
     if (fallback_enabled()) {
-        targets.emplace_back(ensure_fallback_address(now, config_.fallback_host),
-                             config_.fallback_port);
+        targets.emplace_back(config_.fallback_host, config_.fallback_port);
     } else if (config_.masking && !config_.tls_domain.empty()) {
         const auto sni =
             protocol::client_hello_sni(client_hello.empty() ? prefetched : client_hello);
         const std::string ours = sni ? domain_for_sni(*sni) : std::string{};
         if (!ours.empty()) {
-            targets.emplace_back(*sni, 443U);
-            if (to_lower(*sni) != to_lower(ours)) {
-                targets.emplace_back(ours, 443U);
-            }
+            // The configured name, also for a subdomain SNI: a name chosen by
+            // the client is never resolved, so a probe cannot make the proxy
+            // look up arbitrary names.
+            targets.emplace_back(ours, 443U);
         } else {
             // A foreign or missing SNI, or bytes that are not TLS at all: the
             // real site of tls_domain answers, as it would if the probe had
@@ -202,8 +370,11 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
     const auto override_target = fallback_enabled() ? std::nullopt : masking_override();
     for (const auto& [host, target_port] : targets) {
         const std::string address =
-            override_target ? override_target->host : ensure_fallback_address(now, host);
-        const std::uint16_t port = override_target ? override_target->port : target_port;
+            override_target ? override_target->host : fallback_address(host);
+        std::uint16_t port = override_target ? override_target->port : target_port;
+        if (!override_target && !fallback_enabled()) {
+            if (const auto hooks = masking_hooks(); hooks && hooks->port != 0) port = hooks->port;
+        }
         if (address.empty()) continue;
         auto attempt = io::connect_tcp(address, port);
         if (client.watched) {
