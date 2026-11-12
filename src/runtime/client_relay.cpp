@@ -306,8 +306,50 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
         detail::trim_scratch(me_encode_buffer_);
         reaccount_shared();
     }
+    // This is the path that drains c2s: resume a paused client here, without
+    // waiting for a timer.
+    if (client.c2s_backpressured) update_c2s_backpressure(client);
     // Queue membership is the caller's job (enqueue_ready). pump_c2s only
     // drains; this is what removed the base tree's double re-enqueue.
+}
+
+// Pauses/resumes client reads on the upstream backlog, with hysteresis.
+//
+// One read event admits at most kReadBatch wire bytes, and FakeTLS emits only
+// whole records, so it can additionally complete one record buffered by an
+// earlier event: the plaintext produced is below kReadBatch +
+// kFakeTlsMaxRecordBody. On the ME route the transport decoder can also
+// complete a message whose bytes it buffered earlier, so its buffered() bytes
+// are added. Reading is allowed only while backlog <= high with
+// high <= hard_limit - slack, so an admitted event can never push the backlog
+// past the hard limit that feed_client_tls() enforces (that close is only a
+// backstop). Reads resume at high / 2.
+void Runtime::Impl::update_c2s_backpressure(Client& client) {
+    std::size_t backlog = 0;
+    std::size_t hard_limit = 0;
+    std::size_t target = 0;
+    std::size_t slack = detail::kReadBatch + protocol::kFakeTlsMaxRecordBody;
+    if (client.route == Client::Route::direct) {
+        if (!client.direct_out) return;
+        backlog = client.direct_out->bytes();
+        hard_limit = client.direct_out->max_bytes();
+        target = hard_limit;
+    } else {
+        backlog = client.c2s_capacity;
+        hard_limit = std::max(config_.connection_queue_bytes, config_.max_frame_bytes + 4096);
+        target = config_.connection_queue_bytes;
+        if (client.decoder) slack += client.decoder->buffered();
+    }
+    const std::size_t high = std::min(target, hard_limit > slack ? hard_limit - slack : 0);
+    if (!client.c2s_backpressured) {
+        if (backlog <= high) return;
+        client.c2s_backpressured = true;
+        stats_.add_backpressure(control::Direction::client_to_server);
+    } else {
+        if (backlog > high / 2) return;
+        client.c2s_backpressured = false;
+    }
+    update_client_interest(client);
 }
 
 void Runtime::Impl::schedule_client_deadline(Client& client, Time now) {

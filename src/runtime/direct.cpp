@@ -275,6 +275,8 @@ void Runtime::Impl::flush_direct(Client& client) {
         }
         if (result.status == io::FlushStatus::would_block) break;
     }
+    // The upstream drain path resumes client reads paused on direct_out.
+    if (client.c2s_backpressured) update_c2s_backpressure(client);
     update_direct_interest(client);
 }
 

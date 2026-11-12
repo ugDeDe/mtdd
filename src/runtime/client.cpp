@@ -364,6 +364,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
+    if (client.c2s_backpressured) return;  // resumed by flush_direct()/pump_c2s()
     if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
     if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
@@ -398,7 +399,8 @@ void Runtime::Impl::read_client(Client& client, Time now) {
                                  now);
             if (clients_.find(token) == clients_.end()) return;
             if (client.phase == Client::Phase::fallback) return;
-            if (client.rate_pause_c2s) break;
+            // Leave the rest in the kernel once the upstream queue is full.
+            if (client.rate_pause_c2s || client.c2s_backpressured) break;
             // A short read drained the socket. The listener is level-triggered
             // and EPOLLIN stays armed until recv()==0, so new bytes or a FIN
             // raise another event; probing again only returned EAGAIN (~40% of
@@ -803,6 +805,8 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             append_status = client.direct_out->append(plain_buffer_);
         }
         if (append_status != io::AppendStatus::ok) {
+            // Backstop only: update_c2s_backpressure() stops reading before
+            // one more read event could overflow direct_out.
             stats_.add_backpressure(control::Direction::client_to_server);
             close_client(token);
             return;
@@ -820,6 +824,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         client.awaiting_reply = true;
         client.last_forward_at = now;
         reaccount(client);
+        update_c2s_backpressure(client);
         // Coalesce all records read in this reactor event into one upstream
         // flush. handle_client() flushes after read_client() returns, so a
         // successful immediate write does not add/remove EPOLLOUT first.
@@ -872,6 +877,8 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
                 }
             }
             const std::size_t bytes = message.data.capacity();
+            // The capacity check is a backstop: update_c2s_backpressure() stops
+            // reading before one more read event could exceed cap_limit.
             if (client.c2s_capacity + bytes > cap_limit ||
                 !budget_allows(bytes + detail::kMeEncodeOverhead)) {
                 stats_.add_backpressure(control::Direction::client_to_server);
@@ -893,6 +900,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         pump_c2s(client, now);
         if (clients_.find(token) == clients_.end()) return;
         enqueue_ready(client);
+        update_c2s_backpressure(client);
     }
     detail::trim_scratch(wire_buffer_);
     detail::trim_scratch(plain_buffer_);

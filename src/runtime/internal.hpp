@@ -937,6 +937,11 @@ struct Runtime::Impl {
         bool rate_pause_c2s{false};
         bool rate_pause_s2c{false};
         bool rate_listed{false};
+        // Upstream (client->server) backpressure: direct_out (Direct) or the
+        // undelivered c2s backlog (ME) passed its high watermark, so client
+        // reads stop (EPOLLIN removed) until flush_direct()/pump_c2s() drains
+        // it to the low watermark. See update_c2s_backpressure().
+        bool c2s_backpressured{false};
         // Raw-TLS fallback pair state (phase == fallback). `out` is the
         // backend->client queue; c2b is client->backend.
         io::UniqueFd backend;
@@ -1295,6 +1300,7 @@ struct Runtime::Impl {
                           bool rearm_interest = true);
     bool client_wants_write(const Client& client) const noexcept;
     void pump_c2s(Client& client, Time now);
+    void update_c2s_backpressure(Client& client);
     // Direct Telegram DC route (opt-in, authenticated clients only).
     bool direct_route_enabled(std::int16_t dc) const noexcept;
     bool start_direct(Client& client, std::int16_t dc, Time now);

@@ -656,12 +656,13 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // it temporarily; the unpause path re-arms it so the tail is preserved.
     // A rate-limited direction stops reading its source. On the ME route the
     // shared ME socket cannot be paused per user, so a drained s2c bucket
-    // throttles the requests that drive downloads (c2s) instead.
+    // throttles the requests that drive downloads (c2s) instead. Upstream
+    // backpressure (c2s_backpressured) stops reading until the queue drains.
     const bool rate_paused =
         client.rate_pause_c2s ||
         (client.rate_pause_s2c && client.route != Client::Route::direct);
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested && !rate_paused) {
+        !client.close_requested && !rate_paused && !client.c2s_backpressured) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
