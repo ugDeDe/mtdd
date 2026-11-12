@@ -183,6 +183,9 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   if (diff < -static_cast<std::int64_t>(skew_seconds) || diff > static_cast<std::int64_t>(skew_seconds)) {
     crypto::secure_zero(digest);
     crypto::secure_zero(hmac_input);
+    // Only after the HMAC matched, and nothing else: the caller measures the
+    // skew. The key and canonical HMAC are wiped by wipe_keys.
+    out.timestamp = mask;
     return HelloStatus::ClockSkew;
   }
 

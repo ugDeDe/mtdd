@@ -1005,6 +1005,7 @@ struct ControlServer::Impl {
     data["connections_rejected_by_reason"] = snapshot.rejected_by_reason;
     data["handshakes_total"] = handshakes_total;
     data["handshakes_by_result"] = snapshot.handshakes_by_result;
+    data["handshake_clock_skew_total"] = snapshot.hello_clock_skew_total;
     data["api_requests_total"] = snapshot.api_requests_total;
     data["buffer_bytes"] = {{"queued", snapshot.buffer_bytes[0]},
                             {"pending_write", snapshot.buffer_bytes[1]},

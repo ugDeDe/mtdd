@@ -71,6 +71,21 @@ bool fallback_target_valid(std::string_view host) {
 
 namespace detail {
 
+namespace {
+std::mutex g_replay_capacity_mutex;
+std::optional<std::size_t> g_replay_capacity;
+}  // namespace
+
+void set_replay_capacity_for_test(std::optional<std::size_t> value) {
+    const std::lock_guard lock{g_replay_capacity_mutex};
+    g_replay_capacity = value;
+}
+
+std::size_t replay_capacity() {
+    const std::lock_guard lock{g_replay_capacity_mutex};
+    return g_replay_capacity.value_or(kReplayCapacity);
+}
+
 ReplayCache::Outcome ReplayCache::insert(const std::array<std::uint8_t, 32>& key,
                                          std::chrono::steady_clock::time_point now) {
     const std::lock_guard lock{mutex_};
@@ -95,6 +110,23 @@ void ReplayCache::evict_locked(std::chrono::steady_clock::time_point now) {
         const auto found = entries_.find(key);
         if (found != entries_.end() && found->second == stamp) entries_.erase(found);
     }
+}
+
+bool SkewSeenCache::insert(const std::array<std::uint8_t, 32>& digest,
+                           std::chrono::steady_clock::time_point now) {
+    const std::lock_guard lock{mutex_};
+    while (!order_.empty() && (now - order_.front().second >= kSkewSeenRetention ||
+                               entries_.size() >= kSkewSeenCapacity)) {
+        const auto found = entries_.find(order_.front().first);
+        if (found != entries_.end() && found->second == order_.front().second) {
+            entries_.erase(found);
+        }
+        order_.pop_front();
+    }
+    if (entries_.find(digest) != entries_.end()) return false;
+    entries_.emplace(digest, now);
+    order_.emplace_back(digest, now);
+    return true;
 }
 
 std::size_t ReplayCache::size() const noexcept {

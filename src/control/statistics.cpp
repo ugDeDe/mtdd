@@ -38,6 +38,12 @@ constexpr std::array<const char*, kBudgetRefusalKinds> kBudgetRefusalLabels = {
 constexpr std::array<const char*, kHandshakeResultCount> kHandshakeLabels = {
     "success", "failure", "timeout", "replay"};
 
+// Index = side * kClockSkewBuckets + bucket.
+constexpr std::array<const char*, 2> kClockSkewSideLabels = {"behind", "ahead"};
+constexpr std::array<const char*, kClockSkewBuckets> kClockSkewBucketLabels = {
+    "le_300s", "le_600s", "le_1200s", "gt_1200s"};
+constexpr std::array<uint64_t, kClockSkewBuckets - 1> kClockSkewBucketLimits = {300, 600, 1200};
+
 constexpr std::array<const char*, kBufferStateCount> kBufferLabels = {
     "queued", "pending_write", "relay"};
 
@@ -522,6 +528,7 @@ struct Statistics::Impl {
   std::atomic<uint64_t> backpressure_c2s{0};
   std::atomic<uint64_t> backpressure_s2c{0};
   std::array<std::atomic<uint64_t>, kBudgetRefusalKinds> budget_refusals{};
+  std::array<std::atomic<uint64_t>, 2 * kClockSkewBuckets> hello_clock_skew{};
   std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
   std::atomic<uint64_t> media_throttled{0};
   std::array<std::atomic<uint64_t>, kApiRouteCount * kApiMethodCount * kApiStatusCount>
@@ -780,6 +787,17 @@ void Statistics::budget_refusal(BudgetRefusal kind) noexcept {
   if (index < kBudgetRefusalKinds) {
     impl_->budget_refusals[index].fetch_add(1, std::memory_order_relaxed);
   }
+}
+void Statistics::hello_clock_skew(int64_t skew_seconds) noexcept {
+  const size_t side = skew_seconds > 0 ? 0 : 1;
+  const uint64_t magnitude = skew_seconds < 0 ? 0 - static_cast<uint64_t>(skew_seconds)
+                                              : static_cast<uint64_t>(skew_seconds);
+  size_t bucket = 0;
+  while (bucket < kClockSkewBucketLimits.size() && magnitude > kClockSkewBucketLimits[bucket]) {
+    ++bucket;
+  }
+  impl_->hello_clock_skew[side * kClockSkewBuckets + bucket].fetch_add(
+      1, std::memory_order_relaxed);
 }
 void Statistics::set_replay_cache_entries(uint64_t entries) noexcept {
   set_replay_cache_entries(0, entries);
@@ -1124,6 +1142,14 @@ StatisticsSnapshot Statistics::snapshot() const {
     out.budget_refusals[kBudgetRefusalLabels[i]] =
         impl_->budget_refusals[i].load(std::memory_order_relaxed);
   }
+  for (size_t side = 0; side < kClockSkewSideLabels.size(); ++side) {
+    auto& buckets = out.hello_clock_skew_total[kClockSkewSideLabels[side]];
+    for (size_t bucket = 0; bucket < kClockSkewBuckets; ++bucket) {
+      buckets[kClockSkewBucketLabels[bucket]] =
+          impl_->hello_clock_skew[side * kClockSkewBuckets + bucket].load(
+              std::memory_order_relaxed);
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(impl_->users_mutex);
     for (const auto& [name, metrics] : impl_->users) {
@@ -1422,6 +1448,14 @@ std::string Statistics::prometheus_text() const {
   for (const auto& [result, value] : snapshot.handshakes_by_result) {
     append_metric(out, "mtdd_handshakes_total",
                   "result=\"" + escape_label(result) + "\"", value);
+  }
+  for (const auto& [side, buckets] : snapshot.hello_clock_skew_total) {
+    for (const auto& [bucket, value] : buckets) {
+      append_metric(out, "mtdd_handshake_clock_skew_total",
+                    "client_clock=\"" + escape_label(side) + "\",skew=\"" +
+                        escape_label(bucket) + "\"",
+                    value);
+    }
   }
   out << "# HELP mtdd_user_quota_used_bytes Payload bytes (c2s+s2c) counted "
          "against the user's data quota since the last quota reset.\n";

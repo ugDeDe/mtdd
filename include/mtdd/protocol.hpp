@@ -254,14 +254,18 @@ enum class HelloStatus { Ok, NeedMoreData, NotTls, Invalid, Unauthenticated, Clo
 // the 16-byte FakeTLS user secret. The timestamp is masked into digest[28..32].
 // A ClientHello that offers no TLS 1.3 cipher (1301/1302/1303) is Invalid: the
 // ServerHello never invents a cipher the client did not offer.
+// ClockSkew: the HMAC matched but the timestamp is outside +-skew_seconds;
+// `out` then holds only `timestamp` (the client's clock), every other field
+// stays wiped. Any other non-Ok status leaves `out` wiped.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const std::uint8_t, 16> secret,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out);
 
 // Same contract, tried against every key with the canonical HMAC input built
-// once. On Ok, @p matched is the index of the first authenticating key; any
-// other status leaves it unspecified. Unauthenticated means no key matched.
+// once. On Ok and ClockSkew, @p matched is the index of the first
+// authenticating key; any other status leaves it unspecified. Unauthenticated
+// means no key matched.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const crypto::HmacSha256Key* const> keys,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,

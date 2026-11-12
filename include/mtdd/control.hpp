@@ -335,6 +335,13 @@ enum class BudgetRefusal : uint8_t {
 inline constexpr std::size_t kBudgetRefusalKinds = 3;
 
 enum class HandshakeResult { success, failure, timeout, replay };
+
+// ClientHellos whose HMAC matched a user's secret but whose timestamp was
+// outside the accepted window. Fixed labels: the client clock relative to the
+// server ("behind", "ahead") x |skew| ("le_300s", "le_600s", "le_1200s",
+// "gt_1200s"). Such a hello is still rejected and also counted as a handshake
+// failure; this only shows how far off the clocks were.
+inline constexpr std::size_t kClockSkewBuckets = 4;
 // Why an authenticated relay session ended. First recorded reason wins.
 enum class RelayCloseReason : uint8_t {
   other,
@@ -567,6 +574,8 @@ struct StatisticsSnapshot {
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
   std::map<std::string, uint64_t> budget_refusals;  // by BudgetRefusal label
+  // [client_clock][skew bucket], every label present (see kClockSkewBuckets).
+  std::map<std::string, std::map<std::string, uint64_t>> hello_clock_skew_total;
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
   std::array<uint64_t, kSuspectSignals> suspect_events_total{};
   uint64_t suspect_shadow_bans_total{0};
@@ -729,6 +738,9 @@ class Statistics {
   void connection_closed() noexcept;
   void connection_rejected(RejectReason reason) noexcept;
   void handshake(HandshakeResult result) noexcept;
+  // A valid-secret ClientHello outside the timestamp window. `skew_seconds` is
+  // server clock - client timestamp: positive when the client clock is behind.
+  void hello_clock_skew(int64_t skew_seconds) noexcept;
 
   // Returns nullptr for names outside the store's [A-Za-z0-9_.-]{1,64}
   // contract or once max_tracked_users is reached. Callers keep the shared

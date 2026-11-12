@@ -127,6 +127,11 @@ inline constexpr std::size_t kMaxWorkers = 256;
 // saturation).
 inline constexpr std::chrono::seconds kReplayRetention{240};
 inline constexpr std::size_t kReplayCapacity = 524288;
+// Test-only: replay-cache capacity for SharedState objects built afterwards.
+// Production never installs one, so kReplayCapacity is used unchanged; tests
+// must not send half a million hellos to reach saturation.
+void set_replay_capacity_for_test(std::optional<std::size_t> value);
+std::size_t replay_capacity();
 
 // Snapshot/metadata checks happen on this cadence, not per packet.
 inline constexpr std::chrono::milliseconds kPollInterval{150};
@@ -398,6 +403,28 @@ private:
         order_;
 };
 
+// Public ClientHello digests (record bytes 11..43) of valid-secret hellos
+// rejected for clock skew. A mis-clocked client sends a fresh random on every
+// attempt; a repeat is a stale replay. At capacity the oldest entry is evicted,
+// so a full set only fails open toward counting, never refuses a connection.
+inline constexpr std::chrono::minutes kSkewSeenRetention{30};
+inline constexpr std::size_t kSkewSeenCapacity = 65536;
+
+class SkewSeenCache {
+public:
+    // True on the first sighting within the retention, false on a repeat.
+    bool insert(const std::array<std::uint8_t, 32>& digest,
+                std::chrono::steady_clock::time_point now);
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point,
+                       ReplayHash>
+        entries_;
+    std::deque<std::pair<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point>>
+        order_;
+};
+
 // Coarse client platform (see platform.cpp for the reference fingerprints).
 enum class Platform : std::uint8_t { undefined, apple, android, linux_desktop, windows };
 enum class SynLayout : std::uint8_t { other, linux_stack, apple_stack, windows_stack };
@@ -608,7 +635,8 @@ private:
 struct SharedState {
     SharedState(std::size_t worker_count, std::size_t budget_per_worker)
         : workers(worker_count == 0 ? 1 : worker_count),
-          worker_budget(budget_per_worker) {}
+          worker_budget(budget_per_worker),
+          replay(replay_capacity()) {}
 
     std::atomic<bool> stop{false};
     // Live-reloadable ME pool tunables (Runtime::set_tunables). Reactors pick
@@ -639,6 +667,7 @@ struct SharedState {
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
+    SkewSeenCache skew_seen;
 
     // Global admission counters. Reservations are CAS loops, so N reactors can
     // enforce one process-wide limit without a per-packet mutex.
@@ -1178,9 +1207,13 @@ struct Runtime::Impl {
     /// The configured domain (global first, then personal) that covers `sni`
     /// (equal or a subdomain); empty when the name is not ours.
     std::string domain_for_sni(std::string_view sni);
+    /// False with `clock_skew` set (server clock - client timestamp, seconds)
+    /// and `user` = the matched user when the secret matched but the
+    /// timestamp is outside the window; false with both untouched otherwise.
     bool authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                             Time now, protocol::ClientHelloInfo& info,
-                            const control::UserRecord*& user);
+                            const control::UserRecord*& user,
+                            std::optional<std::int64_t>& clock_skew);
     void begin_client_tls(Client& client, const control::UserRecord& user,
                           protocol::ClientHelloInfo&& info, std::span<const std::uint8_t> record,
                           Time now);

@@ -498,9 +498,47 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (client.watched) watch_hello(client, record);
     protocol::ClientHelloInfo info;
     const control::UserRecord* user = nullptr;
-    if (!authenticate_hello(client, record, now, info, user)) {
-        if (client.watched) watch_log(client, "auth", "result=bad_secret");
-        if (config_.suspects) {
+    // A refused replay gets what any unauthenticated visitor gets (the real
+    // site), with the same accounting as a close. The replay result is recorded
+    // first: start_fallback() records a pending handshake as failure.
+    const auto refuse_replay = [&](control::RejectReason reason) {
+        if (!masking_enabled()) {
+            reject_close(client, reason, control::HandshakeResult::replay);
+            return;
+        }
+        record_handshake(client, control::HandshakeResult::replay);
+        stats_.connection_rejected(reason);
+        if (client.watched) {
+            watch_log(client, "reject", std::string("reason=") + control::to_string(reason));
+        }
+        start_fallback(client, original, now, record);
+    };
+    std::optional<std::int64_t> clock_skew;
+    if (!authenticate_hello(client, record, now, info, user, clock_skew)) {
+        std::array<std::uint8_t, 32> digest{};
+        if (clock_skew) std::copy_n(record.begin() + 11, digest.size(), digest.begin());
+        if (clock_skew && !shared_->skew_seen.insert(digest, now)) {
+            // The same signed random again, outside the window: a stale replay
+            // (older than the replay cache), refused like an in-window one.
+            if (client.watched) watch_log(client, "auth", "result=replay");
+            suspect(client, control::SuspectSignal::junk);
+            shared_->replay_rejected_per_worker[worker_index_].fetch_add(
+                1, std::memory_order_relaxed);
+            refuse_replay(control::RejectReason::auth_failed);
+            return;
+        }
+        if (clock_skew) {
+            // The secret matched, only the client clock is off: a mis-clocked
+            // user, not a guess. Counted by skew, never scored as suspect.
+            stats_.hello_clock_skew(*clock_skew);
+            if (client.watched) {
+                watch_log(client, "auth", "result=clock_skew skew=" + std::to_string(*clock_skew) +
+                                              "s user=" + user->name);
+            }
+        } else if (client.watched) {
+            watch_log(client, "auth", "result=bad_secret");
+        }
+        if (config_.suspects && !clock_skew) {
             // E: someone who knows our domain but not a valid secret.
             const auto sni = protocol::client_hello_sni(record);
             const bool ours = sni && !domain_for_sni(*sni).empty();
@@ -545,8 +583,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
-        reject_close(client, control::RejectReason::auth_failed,
-                     control::HandshakeResult::replay);
+        refuse_replay(control::RejectReason::auth_failed);
         return;
     }
     if (outcome == detail::ReplayCache::Outcome::saturated) {
@@ -554,8 +591,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         // rejected at capacity and reported as replay (documented limitation).
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
-        reject_close(client, control::RejectReason::overload,
-                     control::HandshakeResult::replay);
+        refuse_replay(control::RejectReason::overload);
         return;
     }
 
@@ -616,7 +652,8 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
 
 bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                                        Time now, protocol::ClientHelloInfo& info,
-                                       const control::UserRecord*& user) {
+                                       const control::UserRecord*& user,
+                                       std::optional<std::int64_t>& clock_skew) {
     (void)client;
     (void)now;
     const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
@@ -643,8 +680,14 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
     }
     protocol::ClientHelloInfo found;
     std::size_t matched = 0;
-    const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, unix_now(),
+    const std::int64_t now_unix = unix_now();
+    const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, now_unix,
                                                         120, found, matched);
+    if (status == protocol::HelloStatus::ClockSkew && matched < hello_key_users_.size()) {
+        clock_skew = now_unix - static_cast<std::int64_t>(found.timestamp);
+        user = hello_key_users_[matched];
+        return false;
+    }
     if (status != protocol::HelloStatus::Ok || matched >= hello_key_users_.size()) return false;
     // A user with a personal tls_domain authenticates only on that SNI; the
     // others on the global one (when configured).
