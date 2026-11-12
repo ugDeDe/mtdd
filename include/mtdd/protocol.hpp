@@ -267,6 +267,39 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out, std::size_t& matched);
 
+// A ClientHello handshake message may arrive split over several consecutive
+// TLS handshake records (DPI-circumvention tools such as ByeDPI --tlsrec or
+// zapret); the first may carry a single body byte. The client's HMAC covers
+// the original single record, so a split hello is authenticated as its
+// reassembly: [0x16, version of the first record, u16 total body length] +
+// the concatenated bodies.
+inline constexpr std::size_t kFakeTlsMaxHelloRecords = 16;
+
+struct ClientHelloScan {
+  // NeedMoreData: a valid prefix of a ClientHello; NotTls: the first record
+  // header is not a TLS handshake record; Invalid: anything else that cannot
+  // become a ClientHello within the limits; Ok: the input is exactly one
+  // complete ClientHello (1..kFakeTlsMaxHelloRecords records, total body
+  // 100..kFakeTlsMaxClientHello bytes, nothing after it).
+  HelloStatus status{HelloStatus::NeedMoreData};
+  // NeedMoreData only: bytes that may still be read without passing the end
+  // of the ClientHello (the rest of the current record header or body), >= 1.
+  std::size_t want{0};
+  // Complete record headers seen.
+  std::size_t records{0};
+};
+
+// Classifies a received prefix as early as its bytes allow. The first record
+// is classified only from its complete 5-byte header, as before. Pure: the
+// result depends only on `wire`, so feeding byte by byte or at once agrees.
+[[nodiscard]] ClientHelloScan scan_client_hello(std::span<const std::uint8_t> wire);
+
+// The single canonical record for a scan_client_hello() Ok input (identical to
+// the input when it is one record). For any other input, the reassembly of the
+// leading well-formed handshake records (possibly empty), for SNI inspection
+// only; it is never a substitute for scan_client_hello().
+[[nodiscard]] Bytes reassemble_client_hello(std::span<const std::uint8_t> wire);
+
 // Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
 // x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
 std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random);

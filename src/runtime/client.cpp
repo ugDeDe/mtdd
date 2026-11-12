@@ -379,25 +379,13 @@ void Runtime::Impl::read_client(Client& client, Time now) {
     while (total < detail::kReadBatch) {
         std::size_t limit = detail::kReadBatch - total;
         if (client.phase == Client::Phase::tls_hello) {
-            if (client.hello.size() < 5) {
-                limit = std::min(limit, 5 - client.hello.size());
-            } else {
-                const std::size_t record_length =
-                    (static_cast<std::size_t>(client.hello[3]) << 8) | client.hello[4];
-                const bool tls = client.hello[0] == 0x16 && client.hello[1] == 0x03 &&
-                                 (client.hello[2] == 0x01 || client.hello[2] == 0x03);
-                if (!tls || record_length < 100 ||
-                    record_length > protocol::kFakeTlsMaxClientHello) {
-                    limit = 0; // classify from the 5-byte header only
-                } else {
-                    const std::size_t target = 5 + record_length;
-                    if (target > client.hello.size()) {
-                        limit = std::min(limit, target - client.hello.size());
-                    } else {
-                        limit = 0;
-                    }
-                }
-            }
+            // Read only up to the end of the current record header or body:
+            // no byte after the ClientHello (one or more records) lands in
+            // client.hello. A classified hello reads nothing more here.
+            const auto scan = protocol::scan_client_hello(client.hello);
+            limit = scan.status == protocol::HelloStatus::NeedMoreData
+                        ? std::min(limit, scan.want)
+                        : 0;
             if (limit == 0) break;
         }
         if (limit > read_buffer_.size()) limit = read_buffer_.size();
@@ -437,32 +425,33 @@ void Runtime::Impl::consume_client_bytes(Client& client,
                                          std::span<const std::uint8_t> wire, Time now) {
     if (client.phase == Client::Phase::tls_hello) {
         client.hello.insert(client.hello.end(), wire.begin(), wire.end());
-        if (client.hello.size() >= 5) {
-            const std::size_t record_length =
-                (static_cast<std::size_t>(client.hello[3]) << 8) | client.hello[4];
-            const bool tls = client.hello[0] == 0x16 && client.hello[1] == 0x03 &&
-                             (client.hello[2] == 0x01 || client.hello[2] == 0x03);
-            if (!tls || record_length < 100 ||
-                record_length > protocol::kFakeTlsMaxClientHello) {
-                if (client.watched) watch_hello(client, client.hello);
-                if (tls) {
-                    suspect(client, control::SuspectSignal::junk);  // bad record length
-                } else {
-                    suspect_first_bytes(client);
-                }
-                if (masking_enabled()) {
-                    start_fallback(client, client.hello, now);
-                    return;
-                }
-                reject_close(client, control::RejectReason::auth_failed,
-                             control::HandshakeResult::failure);
+        const auto scan = protocol::scan_client_hello(client.hello);
+        if (scan.status == protocol::HelloStatus::NotTls ||
+            scan.status == protocol::HelloStatus::Invalid) {
+            // Not a ClientHello, split or not. Masking gets the bytes exactly
+            // as they arrived; the SNI target comes from the reassembly.
+            const bool tls = scan.status == protocol::HelloStatus::Invalid;
+            const auto reassembled = protocol::reassemble_client_hello(client.hello);
+            if (client.watched) watch_hello(client, tls ? reassembled : client.hello);
+            if (tls) {
+                suspect(client, control::SuspectSignal::junk);  // malformed record(s)
+            } else {
+                suspect_first_bytes(client);
+            }
+            if (masking_enabled()) {
+                const auto original = std::move(client.hello);
+                client.hello.clear();
+                start_fallback(client, original, now, reassembled);
                 return;
             }
-            if (5 + record_length == client.hello.size()) {
-                const std::uint64_t token = client.token;
-                process_client_hello(client, now);
-                if (clients_.find(token) == clients_.end()) return;
-            }
+            reject_close(client, control::RejectReason::auth_failed,
+                         control::HandshakeResult::failure);
+            return;
+        }
+        if (scan.status == protocol::HelloStatus::Ok) {
+            const std::uint64_t token = client.token;
+            process_client_hello(client, now);
+            if (clients_.find(token) == clients_.end()) return;
         }
         reaccount(client);
         return;
@@ -471,14 +460,23 @@ void Runtime::Impl::consume_client_bytes(Client& client,
 }
 
 void Runtime::Impl::process_client_hello(Client& client, Time now) {
-    auto record = std::move(client.hello);
+    const auto original = std::move(client.hello);
     client.hello.clear();
     const std::uint64_t token = client.token;
+    // A ClientHello split over several records is authenticated, replay-keyed
+    // and served as the single record the client signed. Masking still gets
+    // `original` exactly as it arrived.
+    std::vector<std::uint8_t> reassembled;
+    std::span<const std::uint8_t> record = original;
+    if (protocol::scan_client_hello(original).records > 1) {
+        reassembled = protocol::reassemble_client_hello(original);
+        record = reassembled;
+    }
 
     if (record.size() < 5 || record[0] != 0x16 || record[1] != 0x03 ||
         (record[2] != 0x01 && record[2] != 0x03)) {
         if (masking_enabled()) {
-            start_fallback(client, record, now);
+            start_fallback(client, original, now, record);
             return;
         }
         reject_close(client, control::RejectReason::auth_failed,
@@ -489,7 +487,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         (static_cast<std::size_t>(record[3]) << 8) | record[4];
     if (record_length < 100 || record_length > protocol::kFakeTlsMaxClientHello) {
         if (masking_enabled()) {
-            start_fallback(client, record, now);
+            start_fallback(client, original, now, record);
             return;
         }
         reject_close(client, control::RejectReason::auth_failed,
@@ -513,7 +511,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
                     sni ? std::string_view(*sni) : std::string_view{});
         }
         if (masking_enabled()) {
-            start_fallback(client, record, now);
+            start_fallback(client, original, now, record);
             return;
         }
         reject_close(client, control::RejectReason::auth_failed,
@@ -524,7 +522,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // (the real site), so its list marks this proxy dead. No RST, no refusal.
     if (suspect_shadow_ban(client, now)) {
         if (masking_enabled()) {
-            start_fallback(client, record, now);
+            start_fallback(client, original, now, record);
             return;
         }
         reject_close(client, control::RejectReason::auth_failed,

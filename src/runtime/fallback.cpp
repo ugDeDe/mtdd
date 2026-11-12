@@ -134,12 +134,15 @@ std::string Runtime::Impl::ensure_fallback_address(Time now, std::string_view ho
 }
 
 bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t> prefetched,
-                                   Time now) {
+                                   Time now, std::span<const std::uint8_t> client_hello) {
     if (!masking_enabled()) return false;
     if (client.phase == Client::Phase::fallback) return true;
 
+    // Room for the largest ClientHello as received: the maximum body plus the
+    // header of every fragment record.
     const std::size_t c2b_capacity =
-        std::max(config_.connection_queue_bytes, protocol::kFakeTlsMaxClientHello + 64U);
+        std::max(config_.connection_queue_bytes,
+                 protocol::kFakeTlsMaxClientHello + 5U * protocol::kFakeTlsMaxHelloRecords + 64U);
     if (!client.c2b) {
         client.c2b.emplace(c2b_capacity);
     }
@@ -172,7 +175,8 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
         targets.emplace_back(ensure_fallback_address(now, config_.fallback_host),
                              config_.fallback_port);
     } else if (config_.masking && !config_.tls_domain.empty()) {
-        const auto sni = protocol::client_hello_sni(prefetched);
+        const auto sni =
+            protocol::client_hello_sni(client_hello.empty() ? prefetched : client_hello);
         const std::string ours = sni ? domain_for_sni(*sni) : std::string{};
         if (!ours.empty()) {
             targets.emplace_back(*sni, 443U);

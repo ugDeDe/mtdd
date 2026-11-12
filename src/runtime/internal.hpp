@@ -1268,7 +1268,10 @@ struct Runtime::Impl {
     bool fallback_enabled() const noexcept;
     bool masking_enabled() const noexcept;  // automatic SNI masking for probes
     std::string ensure_fallback_address(Time now, std::string_view host);
-    bool start_fallback(Client& client, std::span<const std::uint8_t> prefetched, Time now);
+    // `prefetched` is queued to the backend verbatim; `client_hello` (the
+    // reassembled ClientHello, when it differs) selects the SNI target.
+    bool start_fallback(Client& client, std::span<const std::uint8_t> prefetched, Time now,
+                        std::span<const std::uint8_t> client_hello = {});
     void handle_fallback_client(Client& client, std::uint32_t events, Time now);
     void handle_fallback_backend(Client& client, std::uint32_t events, Time now);
     void read_fallback_client(Client& client, Time now);
