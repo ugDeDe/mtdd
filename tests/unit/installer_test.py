@@ -220,7 +220,11 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --public-host proxy.example.org --public-port 443
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL" --domain ignored.example --port 14444
-python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; d["me_connections_per_dc"]=20; open(p,"w").write(json.dumps(d))'
+python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; d["me_connections_per_dc"]=20; ram=next(int(l.split()[1])*1024 for l in open("/proc/meminfo") if l.startswith("MemTotal:")); d["global_buffer_bytes"]=max(64<<20, min(ram//4, 1<<30)); open(p,"w").write(json.dumps(d))'
+bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
+  --base-url "$MTDD_TEST_URL"
+cp /etc/mtdd/config.json /etc/mtdd/config.after-legacy.json
+python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); d["global_buffer_bytes"]=3<<30; open(p,"w").write(json.dumps(d))'
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL"
 '''
@@ -245,8 +249,11 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
         self.assertEqual((sandbox / "etc/mtdd/credentials.env").stat().st_mode & 0o777, 0o600)
         self.assertTrue((sandbox / "etc/systemd/system/mtdd.service").exists())
         # Capacity defaults: filled when absent, never overriding an operator.
-        self.assertGreaterEqual(config["global_buffer_bytes"], 64 << 20)
-        self.assertLessEqual(config["global_buffer_bytes"], 1 << 30)
+        # The budget is sized by the binary: a value an older installer wrote
+        # (a quarter of RAM capped at 1 GiB) is dropped, an explicit one kept.
+        legacy = json.loads((sandbox / "etc/mtdd/config.after-legacy.json").read_text())
+        self.assertNotIn("global_buffer_bytes", legacy)
+        self.assertEqual(config["global_buffer_bytes"], 3 << 30)
         self.assertEqual(config["me_connections_per_dc"], 20,
                          "an operator's explicit value must survive the update")
         unit = (sandbox / "etc/systemd/system/mtdd.service").read_text()

@@ -59,7 +59,11 @@ struct Config {
     std::uint32_t max_handshakes{0};
     std::size_t max_frame_bytes{2 * 1024 * 1024};
     std::size_t connection_queue_bytes{256 * 1024};
+    // Relay-buffer budget shared by all reactors. When the config omits it,
+    // Config::parse sizes it from memory (default_global_buffer_bytes) and
+    // sets global_buffer_auto.
     std::size_t global_buffer_bytes{256 * 1024 * 1024};
+    bool global_buffer_auto{false};
     std::chrono::seconds handshake_timeout{15};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
@@ -112,4 +116,18 @@ struct Config {
     // guard. Booleans and counts only.
     nlohmann::json security_posture() const;
 };
+
+// Upper bound of global_buffer_bytes, explicit or derived.
+inline constexpr std::uint64_t kMaxGlobalBufferBytes = 64ULL << 30;
+
+// Memory available to this process: the smaller of MemTotal and every cgroup
+// memory limit on the process's cgroup path (v2 memory.max, v1
+// memory.limit_in_bytes). `root` prefixes /proc and /sys for tests. 0 when
+// MemTotal cannot be read.
+std::uint64_t detect_memory_limit_bytes(const std::filesystem::path& root = "/");
+
+// Budget used when global_buffer_bytes is not configured: a quarter of
+// `memory_bytes`, clamped to 64 MiB..kMaxGlobalBufferBytes; 256 MiB when the
+// memory size is unknown (0).
+std::uint64_t default_global_buffer_bytes(std::uint64_t memory_bytes);
 } // namespace mtdd

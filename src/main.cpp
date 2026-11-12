@@ -49,6 +49,39 @@ std::string token_from_env(const std::string& name) {
     return token;
 }
 
+// The management API is optional: an unset (or empty) variable runs the proxy
+// without it, serving the users from users_path (edits then need a restart). A
+// value that is present but malformed is a typo, not a choice, and still fails.
+std::optional<std::string> api_token(const std::string& name) {
+    const auto* value = std::getenv(name.c_str());
+    if (value == nullptr || *value == '\0') return std::nullopt;
+    return token_from_env(name);
+}
+
+// Startup summary of the relay-buffer budget, plus a warning when the budget
+// per allowed connection is too small to move media. Under that load the
+// symptoms (stuck downloads, handshake timeouts, idle media DCs) look like a
+// network problem, so say it once, at startup, in plain words.
+void report_buffer_budget(const mtdd::Config& config) {
+    constexpr std::uint64_t kMiB = 1024U * 1024U;
+    // Below this a connection cannot hold one full TLS record each way plus
+    // decoder state; downloads crawl long before the queue limit matters.
+    constexpr std::uint64_t kMinimumPerConnection = 64U * 1024U;
+    std::cerr << "mtdd: global_buffer_bytes=" << config.global_buffer_bytes / kMiB << " MiB ("
+              << (config.global_buffer_auto ? "auto: a quarter of available memory" : "configured")
+              << "), about " << config.global_buffer_bytes / kMinimumPerConnection
+              << " busy connections at 64 KiB each\n";
+    if (config.max_connections != 0 &&
+        config.global_buffer_bytes / config.max_connections < kMinimumPerConnection) {
+        std::cerr << "mtdd: warning: global_buffer_bytes gives "
+                  << config.global_buffer_bytes / config.max_connections / 1024U
+                  << " KiB per connection at max_connections=" << config.max_connections
+                  << "; at least 64 KiB is recommended (raise global_buffer_bytes to "
+                  << std::uint64_t{config.max_connections} * kMinimumPerConnection / kMiB
+                  << " MiB or more)\n";
+    }
+}
+
 // A configured-but-missing optional token is an error, not "disabled": silently
 // dropping auth from the metrics listener would be worse than not starting.
 std::string optional_token(const std::string& name) { return name.empty() ? std::string{} : token_from_env(name); }
@@ -66,12 +99,13 @@ void block_shutdown_signals() {
 }
 
 int serve(const mtdd::Config& config, const std::filesystem::path& config_path) {
-    const auto token = token_from_env(config.api_token_env);
-    const auto read_token = optional_token(config.api_read_token_env);
+    const auto token = api_token(config.api_token_env);
+    const auto read_token = token ? optional_token(config.api_read_token_env) : std::string{};
     const auto metrics_token = optional_token(config.metrics_token_env);
     if ((!read_token.empty() && (read_token == token || read_token == metrics_token)) ||
         (!metrics_token.empty() && metrics_token == token))
         throw std::invalid_argument("API, read and metrics tokens must all differ");
+    report_buffer_budget(config);
     block_shutdown_signals(); // All background threads inherit this mask.
     mtdd::RevisionBarrier applied;
     mtdd::control::StoreOptions store_options;
@@ -105,7 +139,7 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
     mtdd::control::HttpOptions http;
     http.bind_address = config.control_host;
     http.port = config.control_port;
-    http.bearer_token = token;
+    http.bearer_token = token.value_or(std::string{});
     http.read_token = read_token;
     http.allow_networks = config.control_allow;
     http.public_host = config.public_host;
@@ -126,9 +160,18 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
             return false;
         }
     };
-    mtdd::control::ControlServer management{users, stats, std::move(http)};
-    const auto listening = management.start();
-    if (!listening) throw std::runtime_error("cannot start management listener");
+    std::optional<mtdd::control::ControlServer> management;
+    std::string management_endpoint{"off"};
+    if (token) {
+        management.emplace(users, stats, std::move(http));
+        const auto listening = management->start();
+        if (!listening) throw std::runtime_error("cannot start management listener");
+        management_endpoint = config.control_host + ':' + std::to_string(listening.value());
+    } else {
+        std::cerr << "mtdd: management API disabled: " << config.api_token_env
+                  << " is not set; users are read from " << config.users_path.string()
+                  << " at startup\n";
+    }
     std::optional<mtdd::control::ControlServer> exporter;
     std::string metrics_endpoint{"off"};
     if (config.metrics_port != 0) {
@@ -141,17 +184,17 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
         exporter.emplace(users, stats, std::move(scrape));
         const auto scraping = exporter->start();
         if (!scraping) {
-            management.stop();
+            if (management) management->stop();
             throw std::runtime_error("cannot start metrics listener: " + scraping.error().message);
         }
         metrics_endpoint = config.metrics_host + ':' + std::to_string(scraping.value());
     }
     std::cerr << "mtdd " << MTDD_VERSION << ": proxy=" << config.proxy_host << ':' << runtime.port()
-              << " management=" << config.control_host << ':' << listening.value()
+              << " management=" << management_endpoint
               << " metrics=" << metrics_endpoint << '\n';
     const auto stop_listeners = [&] {
         if (exporter) exporter->stop();
-        management.stop();
+        if (management) management->stop();
     };
     try {
         runtime.run();

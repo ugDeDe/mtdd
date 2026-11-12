@@ -496,6 +496,7 @@ void Runtime::Impl::run() {
                     lifecycle.allocations.load(std::memory_order_relaxed),
                     lifecycle.reuses.load(std::memory_order_relaxed));
                 next_gauge_ = now + std::chrono::seconds(1);
+                log_budget_pressure(now);
                 // Expiry and quota are time/traffic driven, not snapshot driven.
                 sweep_user_policy(now);
             }
@@ -665,8 +666,13 @@ void Runtime::Impl::update_listener_interest() {
     // Keep EPOLLIN off while the buffer budget cannot admit a client; otherwise
     // the reactor accepts sockets only to close them. Housekeeping re-evaluates
     // this every tick, so acceptance resumes once the budget drains.
-    const bool accept = !stopping_ && listener_.valid() &&
-        budget_allows(detail::kBudgetHeadroom + 8192) &&
+    const bool budget_ok = budget_allows(detail::kBudgetHeadroom + 8192);
+    // Count each transition into the budget pause, not every re-evaluation.
+    if (!budget_ok && !accept_budget_paused_ && !stopping_ && listener_.valid()) {
+        note_budget_refusal(control::BudgetRefusal::accept);
+    }
+    accept_budget_paused_ = !budget_ok;
+    const bool accept = !stopping_ && listener_.valid() && budget_ok &&
         (config_.max_connections == 0 ||
          (clients_.size() < static_cast<std::size_t>(config_.max_connections) &&
           shared_->connections.load(std::memory_order_relaxed) <

@@ -2,7 +2,10 @@
 #include "mtdd/metadata.hpp"
 
 #include <gtest/gtest.h>
+#include <filesystem>
 #include <fstream>
+#include <stdexcept>
+#include <string>
 #include <nlohmann/json.hpp>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -452,4 +455,120 @@ TEST(Config, PublicViewOmitsAdTagAndReportsPosture) {
     EXPECT_EQ(posture["metrics"]["token"], false);
     config.metrics_port = 0;
     EXPECT_TRUE(config.security_posture()["metrics"]["host"].is_null());
+}
+
+namespace {
+
+// Builds a fake /proc + /sys tree under a fresh temporary directory.
+class MemoryRoot {
+public:
+    MemoryRoot() {
+        std::string pattern =
+            (std::filesystem::temp_directory_path() / "mtdd-memory-XXXXXX").string();
+        const char* made = ::mkdtemp(pattern.data());
+        if (made == nullptr) throw std::runtime_error("mkdtemp failed");
+        root_ = made;
+    }
+    ~MemoryRoot() {
+        std::error_code ignored;
+        std::filesystem::remove_all(root_, ignored);
+    }
+    MemoryRoot(const MemoryRoot&) = delete;
+    MemoryRoot& operator=(const MemoryRoot&) = delete;
+
+    void write(const std::string& relative, const std::string& text) const {
+        const auto path = root_ / relative;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path) << text;
+    }
+    const std::filesystem::path& path() const { return root_; }
+
+private:
+    std::filesystem::path root_;
+};
+
+constexpr std::uint64_t kGiB = 1ULL << 30;
+
+} // namespace
+
+TEST(Config, DefaultBufferBudgetIsAQuarterOfMemoryWithinBounds) {
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(0), 256ULL << 20);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(128ULL << 20), 64ULL << 20);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(16 * kGiB), 4 * kGiB);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(1024 * kGiB), mtdd::kMaxGlobalBufferBytes);
+}
+
+TEST(Config, MemoryLimitIsMemTotalWithoutCgroupLimits) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemFree:  1000 kB\nMemTotal:  8388608 kB\n");
+    root.write("proc/self/cgroup", "0::/system.slice/mtdd.service\n");
+    root.write("sys/fs/cgroup/system.slice/mtdd.service/memory.max", "max\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 8 * kGiB);
+}
+
+TEST(Config, MemoryLimitHonoursTheTightestCgroupOnThePath) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    root.write("proc/self/cgroup", "0::/system.slice/mtdd.service\n");
+    // The unit's own MemoryMax= and a looser ancestor limit.
+    root.write("sys/fs/cgroup/system.slice/mtdd.service/memory.max", "2147483648\n");
+    root.write("sys/fs/cgroup/system.slice/memory.max", "4294967296\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 2 * kGiB);
+    // An ancestor tighter than the leaf wins as well (container limit).
+    root.write("sys/fs/cgroup/system.slice/memory.max", "1073741824\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 1 * kGiB);
+}
+
+TEST(Config, MemoryLimitReadsCgroupV1MemoryController) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    root.write("proc/self/cgroup", "4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc\n");
+    root.write("sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes", "3221225472\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 3 * kGiB);
+}
+
+TEST(Config, MemoryLimitStaysInsideTheMountedHierarchy) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    // A cgroup namespace can report a path above its root; nothing outside
+    // sys/fs/cgroup may be read.
+    root.write("proc/self/cgroup", "0::/../../outside\n");
+    root.write("sys/fs/outside/memory.max", "1048576\n");
+    root.write("sys/fs/cgroup/memory.max", "max\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 16 * kGiB);
+}
+
+TEST(Config, MemoryLimitIsUnknownWithoutMeminfo) {
+    MemoryRoot root;
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 0U);
+}
+
+TEST(Config, OmittedBufferBudgetIsDerivedAndMarkedAuto) {
+    const auto derived = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_TRUE(derived.global_buffer_auto);
+    EXPECT_EQ(derived.global_buffer_bytes,
+              mtdd::default_global_buffer_bytes(mtdd::detect_memory_limit_bytes()));
+    auto value = minimal_config();
+    value["global_buffer_bytes"] = 64U << 20;
+    const auto explicit_value = mtdd::Config::parse(value, "/work");
+    EXPECT_FALSE(explicit_value.global_buffer_auto);
+    EXPECT_EQ(explicit_value.global_buffer_bytes, 64U << 20);
+}
+
+TEST(Config, AutoBufferBudgetCoversExplicitWorkers) {
+    // 256 reactors need far more than a quarter of a small host: the derived
+    // budget grows to the per-reactor minimum instead of failing the config.
+    auto value = minimal_config();
+    value["workers"] = 256;
+    const auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_GE(config.global_buffer_bytes / 256,
+              2 * config.max_frame_bytes + 2 * config.connection_queue_bytes + 65536);
+}
+
+TEST(Config, BufferBudgetAcceptsMoreThanOneGibibyte) {
+    auto value = minimal_config();
+    value["global_buffer_bytes"] = 8 * kGiB;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").global_buffer_bytes, 8 * kGiB);
+    value["global_buffer_bytes"] = mtdd::kMaxGlobalBufferBytes + 1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }

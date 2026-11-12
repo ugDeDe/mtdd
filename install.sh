@@ -2713,15 +2713,16 @@ if os.environ['MTDD_PUBLIC_PORT']:
     config['public_port'] = int(os.environ['MTDD_PUBLIC_PORT'])
 # Capacity defaults for thousands of concurrent clients. Only missing keys are
 # filled, so an operator's explicit values survive every update. The relay
-# buffer budget scales with RAM (a quarter, 64 MiB..1 GiB): the old 64 MiB
-# default is split over the reactors and runs out at a few thousand clients,
-# which pauses the shared ME reads and stalls everyone.
+# buffer budget is left to the binary, which sizes it from the memory the
+# service may use (a quarter of RAM or of its cgroup limit). Earlier installers
+# wrote a quarter of RAM capped at 1 GiB; that exact value is the installer's,
+# not the operator's, so it is dropped to let the binary size it again.
 try:
     ram = next(int(l.split()[1]) * 1024 for l in open('/proc/meminfo') if l.startswith('MemTotal:'))
 except (OSError, StopIteration, ValueError):
     ram = 0
-if ram:
-    config.setdefault('global_buffer_bytes', max(64 << 20, min(ram // 4, 1 << 30)))
+if ram and config.get('global_buffer_bytes') == max(64 << 20, min(ram // 4, 1 << 30)):
+    del config['global_buffer_bytes']
 config.setdefault('me_connections_per_dc', 16)
 scoped = {'api_read_token_env': 'MTDD_API_READ_TOKEN', 'metrics_token_env': 'MTDD_METRICS_TOKEN',
           'usage_state_path': '/var/lib/mtdd/usage.json'}

@@ -215,7 +215,7 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
                                                  control::RejectReason& failure,
                                                  std::optional<io::Endpoint> accepted_peer) {
     if (!budget_allows(detail::kBudgetHeadroom + 8192)) {
-        failure = control::RejectReason::overload;
+        failure = control::RejectReason::buffer_budget;
         return nullptr;
     }
     const auto peer = accepted_peer ? std::move(accepted_peer) : io::peer_endpoint(fd.get());
@@ -367,8 +367,10 @@ void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
     if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
+        if (client.phase != Client::Phase::relay) client.handshake_budget_stalled = true;
         paused_clients_.push_back(client.token);
         stats_.add_backpressure(control::Direction::client_to_server);
+        note_budget_refusal(control::BudgetRefusal::client_read);
         update_client_interest(client);
         return;
     }

@@ -316,7 +316,23 @@ enum class RejectReason {
   user_expired,
   user_quota_exceeded,
   user_ip_limit,
+  // The reactor's relay-buffer budget could not admit a new client.
+  buffer_budget,
+  // Handshake deadline expired while the client's reads were paused by the
+  // buffer budget: the proxy, not the client, stalled the handshake.
+  handshake_budget_stall,
+  // Authenticated, but no ready ME connection to the target DC in time.
+  me_unavailable,
 };
+
+// Points where the relay-buffer budget (`global_buffer_bytes`) refused work.
+// Each counts one refusal event, not one byte; the kinds tell which path stalled.
+enum class BudgetRefusal : uint8_t {
+  client_read,  // a client read was paused (also counted as c2s backpressure)
+  accept,       // the listener stopped accepting new connections
+  me_dial,      // a new ME connection to Telegram was not opened
+};
+inline constexpr std::size_t kBudgetRefusalKinds = 3;
 
 enum class HandshakeResult { success, failure, timeout, replay };
 // Why an authenticated relay session ended. First recorded reason wins.
@@ -399,6 +415,7 @@ enum class ApiMethod { get, post, patch, delete_, other };
 
 const char* to_string(RejectReason reason) noexcept;
 const char* to_string(HandshakeResult result) noexcept;
+const char* to_string(BudgetRefusal kind) noexcept;
 const char* to_string(Direction direction) noexcept;
 const char* to_string(BufferState state) noexcept;
 const char* to_string(MeResult result) noexcept;
@@ -549,6 +566,7 @@ struct StatisticsSnapshot {
   uint64_t client_reuses_total{0};         // Client objects taken from freelist
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
+  std::map<std::string, uint64_t> budget_refusals;  // by BudgetRefusal label
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
   std::array<uint64_t, kSuspectSignals> suspect_events_total{};
   uint64_t suspect_shadow_bans_total{0};
@@ -744,6 +762,7 @@ class Statistics {
   void set_client_pool(std::size_t worker, uint64_t pooled, uint64_t allocations,
                        uint64_t reuses) noexcept;
   void add_backpressure(Direction direction) noexcept;
+  void budget_refusal(BudgetRefusal kind) noexcept;
   void relay_closed(RelayCloseReason reason) noexcept;
   // Media shaping held a client (one count per throttle episode).
   void media_throttled() noexcept;

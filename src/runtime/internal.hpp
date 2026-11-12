@@ -130,6 +130,8 @@ inline constexpr std::size_t kReplayCapacity = 524288;
 
 // Snapshot/metadata checks happen on this cadence, not per packet.
 inline constexpr std::chrono::milliseconds kPollInterval{150};
+// Minimum spacing of the per-reactor "buffer budget exhausted" log line.
+inline constexpr std::chrono::seconds kBudgetLogInterval{60};
 
 // Minimum interval between full FIN/read-EOF sweeps. The sweep is also forced
 // by the 150 ms housekeeping tick and by an earlier exact EOF deadline, so an
@@ -803,6 +805,10 @@ struct Runtime::Impl {
         bool handshake_pending{false};
         bool draining{false};
         bool budget_paused{false};
+        // Set when the budget paused this client's reads before its handshake
+        // finished; a handshake timeout is then the proxy's stall, not the
+        // client's silence.
+        bool handshake_budget_stalled{false};
         bool in_me_queue{false};
         bool conn_registered{false};
         bool deferred{false};
@@ -1119,6 +1125,12 @@ struct Runtime::Impl {
     // Budget
     // ------------------------------------------------------------------
     bool budget_allows(std::size_t extra) const;
+    // Counts one budget refusal locally (for the periodic log line) and in the
+    // process-wide statistics.
+    void note_budget_refusal(control::BudgetRefusal kind);
+    // At most once per kBudgetLogInterval: one stderr line naming the stalled
+    // paths when this reactor's budget refused work since the previous line.
+    void log_budget_pressure(Time now);
     void reaccount(Client& client);
     void reaccount(MeConn& me);
     void reaccount_shared();
@@ -1463,6 +1475,14 @@ struct Runtime::Impl {
 
     Time next_poll_{};
     Time next_gauge_{};
+    // Budget refusals of this reactor, and the values already reported by
+    // log_budget_pressure(). Indexed by control::BudgetRefusal.
+    std::array<std::uint64_t, control::kBudgetRefusalKinds> budget_refusals_{};
+    std::array<std::uint64_t, control::kBudgetRefusalKinds> budget_refusals_logged_{};
+    std::uint64_t budget_handshake_stalls_{0};
+    std::uint64_t budget_handshake_stalls_logged_{0};
+    Time next_budget_log_{};
+    bool accept_budget_paused_{false};
     // Housekeeping lateness vs. the scheduled next_poll_ deadline. Sampled on
     // the existing 150 ms tick; published with the 1 Hz worker diagnostics.
     std::uint64_t housekeeping_lateness_ms_{0};

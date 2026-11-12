@@ -5,7 +5,9 @@
 #include <cctype>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <set>
+#include <string>
 #include <stdexcept>
 
 namespace mtdd {
@@ -127,7 +129,92 @@ std::filesystem::path resolve(const std::filesystem::path& base, const std::stri
     const std::filesystem::path result{path};
     return (result.is_absolute() ? result : base / result).lexically_normal();
 }
+
+// First unsigned integer in a small sysfs/procfs file; nullopt for "max",
+// missing or malformed content.
+std::optional<std::uint64_t> read_number(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    std::string token;
+    if (!(file >> token) || token.empty() ||
+        !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return std::nullopt;
+    try {
+        return std::stoull(token);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+// Smallest `file` limit on the cgroup at `relative` (below `top`) and on
+// each of its ancestors up to `top`. systemd's MemoryMax= sits on the unit's
+// own cgroup, a container limit on an ancestor.
+std::optional<std::uint64_t> cgroup_limit(const std::filesystem::path& top,
+                                          const std::string& relative,
+                                          const char* file) {
+    const auto stop = top.lexically_normal();
+    std::filesystem::path current = stop;
+    for (const auto& part : std::filesystem::path(relative).lexically_normal()) {
+        const auto name = part.string();
+        if (name == "/" || name.empty() || name == ".") continue;
+        // Inside a cgroup namespace the path can point outside the mounted
+        // hierarchy ("/../x"): only the visible root is then trustworthy.
+        if (name == "..") {
+            current = stop;
+            break;
+        }
+        current /= part;
+    }
+    std::optional<std::uint64_t> result;
+    for (int depth = 0; depth < 64; ++depth) {
+        if (const auto value = read_number(current / file); value && *value != 0)
+            result = result ? std::min(*result, *value) : *value;
+        if (current == stop) break;
+        current = current.parent_path();
+    }
+    return result;
+}
 } // namespace
+
+std::uint64_t detect_memory_limit_bytes(const std::filesystem::path& root) {
+    std::uint64_t total = 0;
+    {
+        std::ifstream meminfo(root / "proc/meminfo");
+        std::string key;
+        std::uint64_t kib = 0;
+        std::string unit;
+        while (meminfo >> key >> kib) {
+            std::getline(meminfo, unit);
+            if (key == "MemTotal:") {
+                total = kib * 1024U;
+                break;
+            }
+        }
+    }
+    if (total == 0) return 0;
+    std::ifstream groups(root / "proc/self/cgroup");
+    std::string line;
+    while (std::getline(groups, line)) {
+        // "hierarchy:controllers:path"; v2 is "0::path".
+        const auto first = line.find(':');
+        const auto second = first == std::string::npos ? first : line.find(':', first + 1);
+        if (second == std::string::npos) continue;
+        const std::string controllers = line.substr(first + 1, second - first - 1);
+        const std::string path = line.substr(second + 1);
+        std::optional<std::uint64_t> limit;
+        if (controllers.empty()) {
+            limit = cgroup_limit(root / "sys/fs/cgroup", path, "memory.max");
+        } else if (("," + controllers + ",").find(",memory,") != std::string::npos) {
+            limit = cgroup_limit(root / "sys/fs/cgroup/memory", path, "memory.limit_in_bytes");
+        }
+        if (limit) total = std::min(total, *limit);
+    }
+    return total;
+}
+
+std::uint64_t default_global_buffer_bytes(std::uint64_t memory_bytes) {
+    if (memory_bytes == 0) return 256ULL << 20;
+    return std::clamp<std::uint64_t>(memory_bytes / 4, 64ULL << 20, kMaxGlobalBufferBytes);
+}
 
 Config Config::parse(const nlohmann::json& value, const std::filesystem::path& base) {
     if (!value.is_object()) throw std::invalid_argument("configuration must be a JSON object");
@@ -256,8 +343,21 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     }
     config.max_frame_bytes = static_cast<std::size_t>(number(value, "max_frame_bytes", config.max_frame_bytes, 4096, 16 * 1024 * 1024));
     config.connection_queue_bytes = static_cast<std::size_t>(number(value, "connection_queue_bytes", config.connection_queue_bytes, 4096, 16 * 1024 * 1024));
-    config.global_buffer_bytes = static_cast<std::size_t>(number(value, "global_buffer_bytes", config.global_buffer_bytes, config.connection_queue_bytes, 1024ULL * 1024 * 1024));
     const auto minimum_buffer_budget = 2 * config.max_frame_bytes + 2 * config.connection_queue_bytes + 65536;
+    if (value.contains("global_buffer_bytes")) {
+        config.global_buffer_bytes = static_cast<std::size_t>(number(
+            value, "global_buffer_bytes", 0, config.connection_queue_bytes, kMaxGlobalBufferBytes));
+        config.global_buffer_auto = false;
+    } else {
+        // A quarter of the memory this process may use. An explicit worker
+        // count still gets its per-reactor minimum: auto-sizing must never turn
+        // a valid config into a startup failure on a small host.
+        auto derived = default_global_buffer_bytes(detect_memory_limit_bytes());
+        derived = std::max<std::uint64_t>(
+            derived, std::uint64_t{std::max(config.workers, 1U)} * minimum_buffer_budget);
+        config.global_buffer_bytes = static_cast<std::size_t>(derived);
+        config.global_buffer_auto = true;
+    }
     if (config.global_buffer_bytes < minimum_buffer_budget)
         throw std::invalid_argument("global_buffer_bytes must cover two maximum frames, two queues and 64 KiB overhead");
     if (config.workers != 0 &&

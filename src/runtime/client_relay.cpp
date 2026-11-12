@@ -336,7 +336,11 @@ void Runtime::Impl::on_client_deadline(Client& client, Time now) {
     }
     if (client.deadline_kind == Client::DeadlineKind::handshake) {
         if (client.phase != Client::Phase::relay) {
-            reject_close(client, control::RejectReason::handshake_timeout,
+            if (client.handshake_budget_stalled) ++budget_handshake_stalls_;
+            reject_close(client,
+                         client.handshake_budget_stalled
+                             ? control::RejectReason::handshake_budget_stall
+                             : control::RejectReason::handshake_timeout,
                          control::HandshakeResult::timeout);
         } else {
             reject_close(client, control::RejectReason::other, std::nullopt);
@@ -348,7 +352,7 @@ void Runtime::Impl::on_client_deadline(Client& client, Time now) {
             client.deadline_kind = Client::DeadlineKind::idle;
             deadlines_.set(token, client.last_activity + config_.idle_timeout);
         } else {
-            reject_close(client, control::RejectReason::other, std::nullopt);
+            reject_close(client, control::RejectReason::me_unavailable, std::nullopt);
         }
         return;
     }

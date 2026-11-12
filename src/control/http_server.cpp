@@ -457,6 +457,25 @@ struct ControlServer::Impl {
     send_json(request, status, json{{"data", {{"config", config_view}}}});
   }
 
+  // Relay-buffer budget at a glance: the summed gauge plus the fullest reactor,
+  // because one worker at its local partition limit stalls its own clients
+  // even while the total looks healthy.
+  static json budget_json(const StatisticsSnapshot& snapshot) {
+    uint64_t limit = 0;
+    uint64_t fullest = 0;
+    for (const auto& worker : snapshot.workers) {
+      limit += worker.budget_limit_bytes;
+      if (worker.budget_limit_bytes != 0) {
+        fullest = std::max<uint64_t>(
+            fullest, worker.budget_used_bytes * 100 / worker.budget_limit_bytes);
+      }
+    }
+    return json{{"used_bytes", snapshot.buffer_budget_used},
+                {"limit_bytes", limit},
+                {"fullest_worker_percent", fullest},
+                {"refusals_total", snapshot.budget_refusals}};
+  }
+
   static json me_json(const StatisticsSnapshot& snapshot) {
     uint64_t me_requests = 0;
     uint64_t me_reconnects = 0;
@@ -570,6 +589,7 @@ struct ControlServer::Impl {
         {"relative_standard_error", 0.0325}};
     data["me"] = {{"connected_dcs", me_connected},
                   {"dcs_total", snapshot.me_dcs.size()}};
+    data["buffer_budget"] = budget_json(snapshot);
     status = 200;
     send_json(request, status, json{{"data", std::move(data)}}, users->revision);
   }
@@ -982,7 +1002,9 @@ struct ControlServer::Impl {
         {"observation_failures", snapshot.ip_history_observation_failures}};
     data["connections_accepted_total"] = snapshot.connections_accepted_total;
     data["connections_rejected_total"] = snapshot.connections_rejected_total;
+    data["connections_rejected_by_reason"] = snapshot.rejected_by_reason;
     data["handshakes_total"] = handshakes_total;
+    data["handshakes_by_result"] = snapshot.handshakes_by_result;
     data["api_requests_total"] = snapshot.api_requests_total;
     data["buffer_bytes"] = {{"queued", snapshot.buffer_bytes[0]},
                             {"pending_write", snapshot.buffer_bytes[1]},
@@ -990,6 +1012,7 @@ struct ControlServer::Impl {
     data["backpressure_events_total"] = {
         {"c2s", snapshot.backpressure_c2s_total},
         {"s2c", snapshot.backpressure_s2c_total}};
+    data["buffer_budget"] = budget_json(snapshot);
     data["replay_cache_entries"] = snapshot.replay_cache_entries;
     data["build"] = {{"version", snapshot.build_version}};
     data["me"] = me_json(snapshot);

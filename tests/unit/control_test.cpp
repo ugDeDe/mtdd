@@ -373,6 +373,39 @@ TEST(UserStorePersistenceTest, FileSchemaIsStableJson) {
   EXPECT_EQ(j["users"][0]["generation"], 1);
 }
 
+TEST(UserStorePersistenceTest, OmittedGenerationTakesTheFileRevision) {
+  TempDir dir;
+  const std::string path = dir.file("users.json");
+  write_text_file(path,
+                  R"({"version":1,"revision":5,"users":[)"
+                  R"({"name":"alice","secret":")" + std::string(kHexA) +
+                      R"(","enabled":true,"max_connections":null}]})");
+  auto store = open_store_or_throw(path);
+  ASSERT_NE(store.snapshot()->find("alice"), nullptr);
+  EXPECT_EQ(store.snapshot()->find("alice")->generation, 5u);
+  EXPECT_EQ(store.snapshot()->revision, 5u);
+
+  // The next mutation still mints a strictly larger generation.
+  RotateSecretRequest rotate;
+  rotate.name = "alice";
+  auto rotated = store.rotate_secret(rotate);
+  ASSERT_TRUE(rotated.ok()) << rotated.error().message;
+  EXPECT_EQ(rotated.value().user.generation, 6u);
+}
+
+TEST(UserStorePersistenceTest, OmittedGenerationAtRevisionZeroStartsAtOne) {
+  TempDir dir;
+  const std::string path = dir.file("users.json");
+  write_text_file(path,
+                  R"({"version":1,"revision":0,"users":[)"
+                  R"({"name":"alice","secret":")" + std::string(kHexA) +
+                      R"(","enabled":true,"max_connections":null}]})");
+  auto store = open_store_or_throw(path);
+  ASSERT_NE(store.snapshot()->find("alice"), nullptr);
+  EXPECT_EQ(store.snapshot()->find("alice")->generation, 1u);
+  EXPECT_EQ(store.snapshot()->revision, 1u);
+}
+
 TEST(UserStorePersistenceTest, FilesAndCreatedDirectoriesAreRestrictive) {
   TempDir dir;
   const std::string state_dir = dir.file("private/state");

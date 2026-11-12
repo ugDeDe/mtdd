@@ -12,10 +12,9 @@
   "workers": 0,
   "max_frame_bytes": 2097152,
   "connection_queue_bytes": 262144,
-  "global_buffer_bytes": 67108864,
   "handshake_timeout_seconds": 15,
   "idle_timeout_seconds": 1800,
-  "me_connections_per_dc": 12,
+  "me_connections_per_dc": 16,
   "me_clients_per_writer": 400,
   "metadata_refresh_seconds": 3600
 }

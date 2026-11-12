@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <stdexcept>
 #include <system_error>
 #include <string>
@@ -149,6 +150,43 @@ bool Runtime::Impl::budget_allows(std::size_t extra) const {
     const std::size_t limit = config_.global_buffer_bytes;
     if (budget_used_ >= limit) return false;
     return extra <= limit - budget_used_;
+}
+
+void Runtime::Impl::note_budget_refusal(control::BudgetRefusal kind) {
+    const auto index = static_cast<std::size_t>(kind);
+    if (index < budget_refusals_.size()) ++budget_refusals_[index];
+    stats_.budget_refusal(kind);
+}
+
+void Runtime::Impl::log_budget_pressure(Time now) {
+    if (now < next_budget_log_) return;
+    std::array<std::uint64_t, control::kBudgetRefusalKinds> delta{};
+    bool any = false;
+    for (std::size_t index = 0; index < delta.size(); ++index) {
+        delta[index] = budget_refusals_[index] - budget_refusals_logged_[index];
+        any = any || delta[index] != 0;
+    }
+    const std::uint64_t stalls = budget_handshake_stalls_ - budget_handshake_stalls_logged_;
+    if (!any && stalls == 0) return;
+    budget_refusals_logged_ = budget_refusals_;
+    budget_handshake_stalls_logged_ = budget_handshake_stalls_;
+    next_budget_log_ = now + detail::kBudgetLogInterval;
+    constexpr std::size_t kMiB = 1024U * 1024U;
+    std::string line = "mtdd: worker " + std::to_string(worker_index_) +
+                       " relay buffer budget exhausted (" +
+                       std::to_string(budget_used_ / kMiB) + " of " +
+                       std::to_string(config_.global_buffer_bytes / kMiB) +
+                       " MiB in use):";
+    const auto client_reads = delta[static_cast<std::size_t>(control::BudgetRefusal::client_read)];
+    const auto accepts = delta[static_cast<std::size_t>(control::BudgetRefusal::accept)];
+    const auto dials = delta[static_cast<std::size_t>(control::BudgetRefusal::me_dial)];
+    if (client_reads != 0) line += " client_reads_paused=" + std::to_string(client_reads);
+    if (accepts != 0) line += " accept_paused=" + std::to_string(accepts);
+    if (dials != 0) line += " me_connections_not_opened=" + std::to_string(dials);
+    if (stalls != 0) line += " handshakes_timed_out_stalled=" + std::to_string(stalls);
+    line += "; raise global_buffer_bytes (now split over workers)\n";
+    // One write per line keeps reactors' lines whole in the journal.
+    std::cerr << line;
 }
 
 std::size_t Runtime::Impl::shared_bytes() const noexcept {
