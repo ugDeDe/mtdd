@@ -76,6 +76,64 @@ class InstallerTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.root / "installed").read_bytes(), b"previous")
 
+    def publish(self, directory, binary):
+        release = self.root / directory
+        release.mkdir()
+        (release / "mtdd-linux-x86_64").write_bytes(binary)
+        (release / "SHA256SUMS").write_text(
+            f"{hashlib.sha256(binary).hexdigest()}  mtdd-linux-x86_64\n")
+
+    def test_main_installs_the_latest_release(self):
+        binary = b"#!/bin/sh\necho latest\n"
+        self.publish("latest", binary)
+        result = self.run_installer("--branch", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "installed").read_bytes(), binary)
+
+    def sh(self, body):
+        env = os.environ.copy()
+        env["MTDD_INSTALLER_SOURCE_ONLY"] = "1"
+        return subprocess.run(["bash", "-c", f'set -Eeuo pipefail; source "{INSTALLER}"; {body}'],
+                              text=True, capture_output=True, env=env, timeout=20)
+
+    def test_default_main_url_is_github_latest(self):
+        r = self.sh('repo=a/b channel=main release_version=; base_url=; init_base_url; release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/latest/download")
+        r = self.sh('repo=a/b channel=dev release_version=; base_url=; init_base_url; release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/download/channel-dev")
+        r = self.sh('repo=a/b channel=main release_version=v1.2.3; base_url=; init_base_url; '
+                    'release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/download/v1.2.3")
+
+    def test_version_pins_an_immutable_main_release(self):
+        for requested, directory in (("1.2.3", "v1.2.3"), ("v1.2.4", "v1.2.4")):
+            with self.subTest(requested=requested):
+                binary = f"#!/bin/sh\necho {directory}\n".encode()
+                self.publish(directory, binary)
+                result = self.run_installer("--branch", "main", "--version", requested)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.root / "installed").read_bytes(), binary)
+                self.assertIn(directory, result.stdout)
+
+    def test_missing_version_fails_without_touching_the_binary(self):
+        (self.root / "installed").write_bytes(b"previous")
+        result = self.run_installer("--branch", "main", "--version", "9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.root / "installed").read_bytes(), b"previous")
+
+    def test_malformed_version_or_dev_version_is_rejected(self):
+        for args in (("--branch", "main", "--version", "1.2"),
+                     ("--branch", "main", "--version", "latest"),
+                     ("--branch", "main", "--version", "dev-1a2b3c4"),
+                     ("--branch", "main", "--version", "../channel-dev"),
+                     ("--branch", "main", "--version", "1.2.3; id"),
+                     ("--branch", "dev", "--version", "1.2.3")):
+            with self.subTest(args=args):
+                result = self.run_installer(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--version", result.stderr)
+                self.assertFalse((self.root / "installed").exists())
+
     def test_invalid_branch_is_rejected(self):
         result = self.run_installer("--branch", "other")
         self.assertNotEqual(result.returncode, 0)
@@ -85,7 +143,7 @@ class InstallerTest(unittest.TestCase):
         result = subprocess.run(["bash", str(INSTALLER), "--help"],
                                 text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        for option in ("--branch", "--domain", "--ad-tag", "--public-host",
+        for option in ("--branch", "--version", "--domain", "--ad-tag", "--public-host",
                        "--public-port", "--binary-only"):
             self.assertIn(option, result.stdout)
 

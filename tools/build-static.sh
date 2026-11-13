@@ -17,6 +17,7 @@
 #   tools/build-static.sh --skip-verify   # build only (not for release evidence)
 #   tools/build-static.sh --jobs 4
 #   tools/build-static.sh --jobs4       # same, compact form
+#   MTDD_BUILD_VERSION=1.2.3 tools/build-static.sh   # version embedded in the binary
 #
 # Requirements on the host: bash, coreutils, curl, tar, xz, sha256sum,
 # cmake >= 3.20, ninja, pkg-config, python3, file, readelf (binutils).
@@ -401,6 +402,7 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -G Ninja \
     -DPKG_CONFIG_EXECUTABLE=/usr/bin/pkg-config \
     -DPKG_CONFIG_ARGN=--static \
     -DBUILD_TESTING=OFF \
+    ${MTDD_BUILD_VERSION:+-DMTDD_BUILD_VERSION="$MTDD_BUILD_VERSION"} \
     >"$LOGS/cmake-configure.log" 2>&1
 cmake --build "$BUILD_DIR" -j "$JOBS" >"$LOGS/cmake-build.log" 2>&1
 

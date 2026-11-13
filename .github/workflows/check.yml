@@ -33,3 +33,4 @@ jobs:
           python3 -m unittest discover -s tests/unit -p 'workspace_paths_test.py'
           python3 -m unittest discover -s tests/unit -p 'monitor_load_test.py'
           python3 -m unittest discover -s tests/unit -p 'coverage_report_test.py'
+          python3 -m unittest discover -s tests/unit -p 'release_version_test.py'

@@ -23,6 +23,7 @@ readonly MTDD_NETTUNE_SERVICE=mtdd-nettune.service
 repo=${MTDD_REPOSITORY:-ugDeDe/mtdd}
 channel=main
 channel_set=0
+release_version=  # --version X.Y.Z: этот релиз main вместо последнего
 domain=
 ad_tag=
 proxy_port=443
@@ -207,7 +208,8 @@ mtdd — установка и управление MTProto-прокси
   metrics all|ФИЛЬТР              Сырые метрики Prometheus (по умолчанию mtdd_)
   host АДРЕС [ПОРТ]               Сменить публичный адрес ссылок и перезапустить
   check-config                    Проверить конфигурацию бинарником
-  update [--branch main|dev]      Обновить бинарник (то же, что повторная установка)
+  update [--branch main|dev] [--version X.Y.Z]
+                                  Обновить бинарник (то же, что повторная установка)
   uninstall [--yes]               Удалить прокси с сервера
   menu                            Меню управления
 
@@ -223,6 +225,7 @@ mtdd — установка и управление MTProto-прокси
 Сборка и режим работы:
 
   --branch main|dev       Канал бинарника (по умолчанию main)
+  --version X.Y.Z         Конкретный релиз main вместо последнего (откат, фиксация)
   --binary-only           Скачать бинарник без установки службы
   --output PATH           Путь для --binary-only
   --repo OWNER/REPO       Репозиторий релизов (по умолчанию ugDeDe/mtdd)
@@ -240,10 +243,11 @@ SUBCOMMANDS=" status service start stop restart logs users links suspects rotate
 positional=()
 while (($#)); do
     case $1 in
-        --repo|--branch|--domain|--ad-tag|--port|--public-host|--public-port|--user|--output|--base-url)
+        --repo|--branch|--version|--domain|--ad-tag|--port|--public-host|--public-port|--user|--output|--base-url)
             (($# >= 2)) || die "Не указано значение для $1"
             case $1 in
-                --repo) repo=$2 ;; --branch) channel=$2; channel_set=1 ;; --domain) domain=$2 ;;
+                --repo) repo=$2 ;; --branch) channel=$2; channel_set=1 ;; --version) release_version=$2 ;;
+                --domain) domain=$2 ;;
                 --ad-tag) ad_tag=$2 ;; --port) proxy_port=$2; port_set=1 ;; --user) user_name=$2; user_set=1 ;;
                 --public-host) public_host=$2 ;; --public-port) public_port=$2 ;;
                 --output) output=$2 ;; --base-url) base_url=$2 ;;
@@ -2554,12 +2558,40 @@ install_launcher_copy() {
     ensure_sudo_visibility
 }
 
+# Откуда качать бинарник и SHA256SUMS:
+#   main             — последний релиз vX.Y.Z (GitHub: releases/latest);
+#   main --version   — неизменяемый релиз vX.Y.Z;
+#   dev              — релиз channel-dev, CI перезаливает его при каждой сборке.
+# Зеркало (--base-url) повторяет каталоги релизов: vX.Y.Z/, channel-dev/ и
+# latest/ — копию последнего релиза main.
+release_url() {
+    local version=$release_version
+    if [[ -n $version ]]; then
+        [[ $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            die 'Для --version укажите версию вида 1.2.3'
+        [[ $channel == main ]] || die '--version выбирает релиз main; канал dev не версионируется'
+        printf '%s/v%s' "$base_url" "${version#v}"
+    elif [[ $channel == dev ]]; then
+        printf '%s/channel-dev' "$base_url"
+    elif [[ $base_url == "https://github.com/$repo/releases/download" ]]; then
+        printf 'https://github.com/%s/releases/latest/download' "$repo"
+    else
+        printf '%s/latest' "$base_url"
+    fi
+}
+
 download_and_stage() {
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
     asset=mtdd-linux-x86_64
-    url="$base_url/channel-$channel"
-    step "Скачиваю бинарник и контрольную сумму канала $channel…"
+    url=$(release_url)
+    if [[ -n $release_version ]]; then
+        step "Скачиваю бинарник и контрольную сумму релиза v${release_version#v}…"
+    elif [[ $channel == dev ]]; then
+        step 'Скачиваю бинарник и контрольную сумму канала dev…'
+    else
+        step 'Скачиваю бинарник и контрольную сумму последнего релиза main…'
+    fi
     spin --quiet 'Скачивание бинарника' \
         curl -fsSL --retry 3 --connect-timeout 20 "$url/$asset" -o "$work/$asset" \
         || die 'Не удалось скачать бинарник; проверьте доступность release-канала'
@@ -3027,6 +3059,7 @@ fi
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || die 'Поддерживается только Linux x86_64'
 [[ $channel == main || $channel == dev ]] || die 'Для --branch укажите main или dev'
 init_base_url
+if [[ -n $release_version ]]; then release_url >/dev/null; fi  # формат — до любых действий
 if ((binary_only)); then
     banner 'загрузка бинарника · MTProto / FakeTLS'
     step "Скачивание бинарника · канал: $channel"
