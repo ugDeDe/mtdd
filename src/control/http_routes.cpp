@@ -447,6 +447,15 @@ std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& o
     }
     out.tls_domain = body["tls_domain"].get<std::string>();
   }
+  if (body.contains("ad_tag")) {
+    if (body["ad_tag"].is_null()) {
+      out.ad_tag = std::string{};
+    } else if (!body["ad_tag"].is_string()) {
+      return HttpError{400, "invalid_field", "ad_tag must be a string or null"};
+    } else {
+      out.ad_tag = body["ad_tag"].get<std::string>();
+    }
+  }
   return std::nullopt;
 }
 
@@ -470,6 +479,12 @@ UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
       if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
   }
+  if (patch.ad_tag) {
+    policy.ad_tag = *patch.ad_tag;
+    for (char& c : policy.ad_tag) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
   return policy;
 }
 
@@ -488,6 +503,7 @@ json policy_json(const UserPolicy& policy) {
   out["note"] = policy.note;
   out["canary"] = policy.canary;
   out["tls_domain"] = policy.tls_domain.empty() ? json(nullptr) : json(policy.tls_domain);
+  out["ad_tag"] = policy.ad_tag.empty() ? json(nullptr) : json(policy.ad_tag);
   return out;
 }
 

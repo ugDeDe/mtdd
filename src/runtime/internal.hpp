@@ -1013,6 +1013,10 @@ struct Runtime::Impl {
         detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
         // Config::watch_ips: this connection is logged stage by stage.
         bool watched{false};
+        // The user's own ad tag (UserPolicy::ad_tag) for RPC_PROXY_REQ; the
+        // global one when unset. Reloaded with the user snapshot.
+        bool has_ad_tag{false};
+        protocol::AdTag ad_tag{};
         // Suspect detection (suspects.cpp): connection timeline and what the
         // first MTProto frames looked like.
         Time accepted_at{};
@@ -1251,6 +1255,8 @@ struct Runtime::Impl {
     void apply_user_snapshot(bool initial);
     // Per-user policy runtime (src/runtime/policy.cpp).
     void load_client_rates(Client& client, const control::UserRecord& user);
+    // Client::ad_tag from UserPolicy::ad_tag (live: called again on reload).
+    void load_client_ad_tag(Client& client, const control::UserRecord& user) noexcept;
     void charge_rate(Client& client, control::Direction direction, std::uint64_t bytes,
                      Time now);
     void process_rate_resumes(Time now);

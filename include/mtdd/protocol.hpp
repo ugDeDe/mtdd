@@ -581,10 +581,14 @@ class MiddleEndSession {
   // AES-CBC encrypted.
   Status encode_client_message(std::span<const std::uint8_t> payload, const Endpoint& peer,
                                ProtoTag tag, bool quick_ack, std::vector<std::uint8_t>& to_me);
-  // Same, with an explicit per-logical-client connection id (shared ME multiplexing).
+  // Same, with an explicit per-logical-client connection id (shared ME
+  // multiplexing). A non-null, non-zero @p ad_tag replaces the session's tag
+  // for this request only (per-user ad tag); null or all-zero uses the
+  // session's.
   Status encode_client_message(const ConnId& conn_id, std::span<const std::uint8_t> payload,
                                const Endpoint& peer, ProtoTag tag, bool quick_ack,
-                               std::vector<std::uint8_t>& to_me);
+                               std::vector<std::uint8_t>& to_me,
+                               const AdTag* ad_tag = nullptr);
   // RPC_CLOSE_CONN (0x1fcf425d) for one logical connection; transport stays up.
   // This is the outgoing notification. Inbound RPC_CLOSE_CONN and RPC_CLOSE_EXT
   // are both delivered via Sink::on_remote_close and also do not close the

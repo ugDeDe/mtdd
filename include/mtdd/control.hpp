@@ -149,11 +149,16 @@ struct UserPolicy {
   // equals it authenticates this user. Masking relays probes for any
   // configured domain (global or personal) to that domain's real site.
   std::string tls_domain;
+  // Personal ad tag (32 lowercase hex characters, not all zero; empty = the
+  // global ad_tag). Sent to Telegram in place of the global tag for this
+  // user's ME requests, so the sponsored channel shown to the user is the
+  // one registered for this tag. The Direct DC route carries no ad tag.
+  std::string ad_tag;
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           note.empty() && !canary && tls_domain.empty();
+           note.empty() && !canary && tls_domain.empty() && ad_tag.empty();
   }
   bool operator==(const UserPolicy&) const = default;
 };
@@ -172,11 +177,12 @@ struct UserPolicyPatch {
   std::optional<std::string> note;  // "" clears
   std::optional<bool> canary;
   std::optional<std::string> tls_domain;  // "" clears (back to the global domain)
+  std::optional<std::string> ad_tag;      // "" clears (back to the global ad tag)
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           !note && !canary && !tls_domain;
+           !note && !canary && !tls_domain && !ad_tag;
   }
 };
 

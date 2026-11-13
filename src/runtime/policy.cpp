@@ -62,6 +62,29 @@ void Runtime::Impl::load_client_rates(Client& client, const control::UserRecord&
     client.policy_down = user.policy.rate_limit_down_bytes_per_sec.value_or(0);
     client.max_devices = user.policy.max_devices.value_or(0);
     recompute_rate_share(client);
+    load_client_ad_tag(client, user);
+}
+
+void Runtime::Impl::load_client_ad_tag(Client& client, const control::UserRecord& user) noexcept {
+    // The store admits only 32 lowercase hex digits, not all zero; anything
+    // else falls back to the global tag.
+    const std::string& hex = user.policy.ad_tag;
+    client.has_ad_tag = false;
+    if (hex.size() != client.ad_tag.bytes.size() * 2) return;
+    const auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    bool nonzero = false;
+    for (std::size_t i = 0; i < client.ad_tag.bytes.size(); ++i) {
+        const int high = digit(hex[i * 2]);
+        const int low = digit(hex[i * 2 + 1]);
+        if (high < 0 || low < 0) return;
+        client.ad_tag.bytes[i] = static_cast<std::uint8_t>((high << 4) | low);
+        nonzero = nonzero || client.ad_tag.bytes[i] != 0;
+    }
+    client.has_ad_tag = nonzero;
 }
 
 void Runtime::Impl::recompute_rate_share(Client& client) noexcept {

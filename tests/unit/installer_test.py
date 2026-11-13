@@ -896,6 +896,13 @@ class UserPolicyTest(PolicyShellCase):
             with self.subTest(raw=raw):
                 self.assertRejected("max_devices", raw)
 
+    def test_ad_tag_is_lowercased_hex(self):
+        self.assertBody("ad_tag", "00112233445566778899AABBCCDDEEFF", "00112233445566778899aabbccddeeff")
+        self.assertBody("ad_tag", "none", None)
+        for raw in ("0" * 32, "0011", "zz112233445566778899aabbccddeeff", "0" * 31 + "1" + "0"):
+            with self.subTest(raw=raw):
+                self.assertRejected("ad_tag", raw, "ad_tag")
+
     def test_expiry_date_becomes_end_of_day_utc(self):
         self.assertBody("expires_at", "2030-01-01", "2030-01-01T23:59:59Z")
         self.assertBody("expires_at", "2028-02-29", "2028-02-29T23:59:59Z")

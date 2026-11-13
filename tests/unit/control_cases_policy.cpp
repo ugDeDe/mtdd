@@ -364,3 +364,51 @@ TEST(UserPolicyStoreTest, PersonalTlsDomainPersistsInVersionTwo) {
   auto reopened = open_store_or_throw(path);
   EXPECT_EQ(reopened.snapshot()->users[0].policy.tls_domain, "front.example.org");
 }
+
+TEST(UserPolicyHttpTest, PersonalAdTagIsValidatedNormalisedAndClearable) {
+  Harness h;
+  const auto created = h.req("POST", "/v1/users",
+                             R"({"name":"alice","ad_tag":"00112233445566778899AABBCCDDEEFF"})");
+  ASSERT_EQ(created.status, 201) << created.body;
+  EXPECT_EQ(parse_json(created)["data"]["user"]["ad_tag"], "00112233445566778899aabbccddeeff");
+
+  for (const char* body : {R"({"ad_tag":5})", R"({"ad_tag":"0011"})",
+                           R"({"ad_tag":"00000000000000000000000000000000"})",
+                           R"({"ad_tag":"zz112233445566778899aabbccddeeff"})"}) {
+    const auto response = h.req("PATCH", "/v1/users/alice", body);
+    EXPECT_EQ(response.status, 400) << body << " -> " << response.body;
+  }
+  const auto changed = h.req("PATCH", "/v1/users/alice",
+                             R"({"ad_tag":"ffeeddccbbaa99887766554433221100"})");
+  ASSERT_EQ(changed.status, 200) << changed.body;
+  EXPECT_EQ(parse_json(changed)["data"]["user"]["ad_tag"], "ffeeddccbbaa99887766554433221100");
+
+  for (const char* clear : {R"({"ad_tag":""})", R"({"ad_tag":null})"}) {
+    ASSERT_EQ(h.req("PATCH", "/v1/users/alice",
+                    R"({"ad_tag":"ffeeddccbbaa99887766554433221100"})").status, 200);
+    const auto cleared = h.req("PATCH", "/v1/users/alice", clear);
+    ASSERT_EQ(cleared.status, 200) << clear << " -> " << cleared.body;
+    EXPECT_TRUE(parse_json(cleared)["data"]["user"]["ad_tag"].is_null()) << clear;
+  }
+}
+
+TEST(UserPolicyStoreTest, PersonalAdTagPersistsInVersionTwo) {
+  TempDir dir;
+  const auto path = dir.file("users.json");
+  {
+    auto store = open_store_or_throw(path);
+    CreateUserRequest request;
+    request.name = "alice";
+    request.policy.ad_tag = "00112233445566778899aabbccddeeff";
+    ASSERT_TRUE(store.create_user(request).ok());
+    CreateUserRequest bad;
+    bad.name = "bob";
+    bad.policy.ad_tag = "00112233445566778899AABBCCDDEEFF";  // the store wants lowercase
+    EXPECT_FALSE(store.create_user(bad).ok());
+  }
+  const auto file = nlohmann::json::parse(read_text_file(path));
+  EXPECT_EQ(file["version"], 2);
+  EXPECT_EQ(file["users"][0]["ad_tag"], "00112233445566778899aabbccddeeff");
+  auto reopened = open_store_or_throw(path);
+  EXPECT_EQ(reopened.snapshot()->users[0].policy.ad_tag, "00112233445566778899aabbccddeeff");
+}

@@ -672,6 +672,37 @@ TEST(MiddleEnd, LiveAdTagOverrideAppliesToNextRequest) {
   expect_bytes(std::span<const std::uint8_t>(again).subspan(8, rd32(again) - 12).subspan(65, 16), other);
 }
 
+// A per-request tag (per-user ad tag) goes into that request only; null or
+// all-zero falls back to the session's tag.
+TEST(MiddleEnd, PerRequestAdTagOverridesOnlyThatRequest) {
+  auto r = make_ready();
+  AdTag own;
+  own.bytes = {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8,
+               0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0};
+  const Bytes payload = from_hex("0102030405060708090a0b0c");
+  const auto tag_of = [&](Bytes& out) {
+    r.write_dec->decrypt(out);
+    const auto p = std::span<const std::uint8_t>(out).subspan(8, rd32(out) - 12);
+    return Bytes(p.begin() + 65, p.begin() + 81);
+  };
+  Bytes first;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, first, &own),
+            Status::Ok);
+  EXPECT_EQ(tag_of(first), Bytes(own.bytes.begin(), own.bytes.end()));
+  Bytes second;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, second, nullptr),
+            Status::Ok);
+  EXPECT_EQ(tag_of(second), Bytes(kAdTag.begin(), kAdTag.end()));
+  const AdTag zero;
+  Bytes third;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, third, &zero),
+            Status::Ok);
+  EXPECT_EQ(tag_of(third), Bytes(kAdTag.begin(), kAdTag.end()));
+}
+
 // RPC_PROXY_REQ carries two distinct 20-byte endpoints: the client's address
 // and this proxy's own listener address. The listener port must be the one
 // clients connect to; the ME socket's ephemeral source port belongs ONLY to the

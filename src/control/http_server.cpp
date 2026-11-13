@@ -1090,7 +1090,8 @@ struct ControlServer::Impl {
                                  {"name", "secret", "enabled", "max_connections",
                                   "expires_at", "data_quota_bytes",
                                   "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                  "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
+                                  "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
+                                  "ad_tag"})) {
       status = error->status;
       send_error(request, status, error->type, error->message);
       return;
@@ -1197,7 +1198,8 @@ struct ControlServer::Impl {
                                             {"enabled", "max_connections",
                                              "expires_at", "data_quota_bytes",
                                              "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                             "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
+                                             "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
+                                  "ad_tag"})) {
         status = error->status;
         send_error(request, status, error->type, error->message);
         return;

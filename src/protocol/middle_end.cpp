@@ -682,7 +682,8 @@ Status MiddleEndSession::encode_client_message(std::span<const std::uint8_t> pay
 Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
                                                std::span<const std::uint8_t> payload,
                                                const Endpoint& peer, ProtoTag tag, bool quick_ack,
-                                               std::vector<std::uint8_t>& to_me) {
+                                               std::vector<std::uint8_t>& to_me,
+                                               const AdTag* ad_tag) {
   auto& s = *impl_;
   if (s.state != State::Ready) return Status::ProtocolError;
   if (payload.empty() || payload.size() % 4 != 0) {
@@ -729,7 +730,11 @@ Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
   put32(to_me, 24);  // extra_size: TL_PROXY_TAG block
   put32(to_me, kTlProxyTag);
   to_me.push_back(16);  // TL string length
-  to_me.insert(to_me.end(), s.cfg.ad_tag.bytes.begin(), s.cfg.ad_tag.bytes.end());
+  const bool own_tag =
+      ad_tag != nullptr && std::any_of(ad_tag->bytes.begin(), ad_tag->bytes.end(),
+                                       [](std::uint8_t b) { return b != 0; });
+  const AdTag& request_tag = own_tag ? *ad_tag : s.cfg.ad_tag;
+  to_me.insert(to_me.end(), request_tag.bytes.begin(), request_tag.bytes.end());
   to_me.insert(to_me.end(), {0, 0, 0});  // 4-byte alignment
   append(to_me, payload);
   put32(to_me, rpc_crc(s.crc_mode, std::span<const std::uint8_t>(to_me).subspan(start)));

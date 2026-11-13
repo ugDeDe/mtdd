@@ -273,7 +273,8 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
             me_encode_buffer_.clear();
             const auto status = me.session->encode_client_message(
                 client.conn_id, message.data, client.peer, protocol::ProtoTag::Secure,
-                message.quick_ack, me_encode_buffer_);
+                message.quick_ack, me_encode_buffer_,
+                client.has_ad_tag ? &client.ad_tag : nullptr);
             if (status != protocol::Status::Ok) {
                 if (me.session->state() == protocol::MiddleEndSession::State::Failed) {
                     fail_me(me, now);

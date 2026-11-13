@@ -258,6 +258,9 @@ std::optional<std::string> UserStore::validate_policy(const UserPolicy& policy) 
   if (!policy.tls_domain.empty() && !valid_tls_domain(policy.tls_domain)) {
     return "tls_domain must be a lowercase DNS hostname";
   }
+  if (!policy.ad_tag.empty() && !valid_ad_tag(policy.ad_tag)) {
+    return "ad_tag must be 32 lowercase hexadecimal characters and not all zero";
+  }
   return std::nullopt;
 }
 
@@ -519,6 +522,7 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
   }
   if (patch.note) policy.note = *patch.note;
   if (patch.tls_domain) policy.tls_domain = lower_ascii(*patch.tls_domain);
+  if (patch.ad_tag) policy.ad_tag = lower_ascii(*patch.ad_tag);
   if (auto reason = validate_policy(policy)) {
     return Error{ErrorCode::invalid_field, *reason};
   }

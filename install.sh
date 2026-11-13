@@ -194,7 +194,7 @@ mtdd — установка и управление MTProto-прокси
   users rotate ИМЯ                Заменить секрет и показать новую ссылку
   users show ИМЯ                  Политики и статистика пользователя
   users devices ИМЯ               Устройства: платформа, DC, IP, подключено ли
-  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости/устройств, canary, заметка (none — снять)
+  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости/устройств, canary, заметка, ad_tag (none — снять)
   users reset-quota ИМЯ           Сбросить использованную квоту
   users audit [N]                 Последние N событий журнала аудита
   links [ИМЯ]                     Ссылки подключения (все или одного)
@@ -682,6 +682,13 @@ elif field == "max_devices":
         if not re.fullmatch(r"\d{1,7}", raw) or not 1 <= int(raw) <= 1000000:
             fail("Лимит устройств: целое число от 1 до 1000000 или none")
         value = int(raw)
+elif field == "ad_tag":
+    if raw.lower() in CLEAR:
+        value = None
+    else:
+        value = raw.lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", value) or set(value) == {"0"}:
+            fail("ad_tag: 32 шестнадцатеричных символа (не все нули) или none")
 elif field == "note":
     try:
         raw.encode("utf-8")
@@ -803,6 +810,7 @@ rows = [
     ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
     ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
     ("Заметка", user.get("note") or "—"),
+    ("Свой ad_tag", user.get("ad_tag") or "общий"),
     ("Соединений", str(stats.get("active_connections", 0))),
     ("Уникальных IP", str(stats.get("unique_ips_active", 0))),
     ("Устройств", "{} подключено · {} за 15 мин".format(stats.get("devices_connected", 0), stats.get("devices", 0))),
@@ -921,7 +929,7 @@ cmd_users() {
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users devices ИМЯ'; return 1; }
             cmd_users_devices "${cargs[1]}" ;;
         set)
-            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note|ad_tag ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
         reset-quota)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
