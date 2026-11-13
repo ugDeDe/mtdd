@@ -986,6 +986,10 @@ struct Runtime::Impl {
         detail::DirectFlushGate direct_flush;
         std::unique_ptr<protocol::crypto::AesCtr> direct_encrypt;
         std::unique_ptr<protocol::crypto::AesCtr> direct_decrypt;
+        // SOCKS5 upstream handshakes of the Direct DC and masking sockets;
+        // the socket counts as connecting until they are Done.
+        std::unique_ptr<protocol::Socks5Client> direct_socks;
+        std::unique_ptr<protocol::Socks5Client> backend_socks;
 
         bool ip_counted{false};
         detail::IpKey ip_key{};
@@ -1061,6 +1065,11 @@ struct Runtime::Impl {
         std::uint64_t token{0};
         io::UniqueFd fd;
         State state{State::idle};
+        // SOCKS5 upstream of this attempt; while it is not Done the state stays
+        // connecting. `target` is the ME endpoint itself (the socket peer is
+        // the proxy), used as the server address of the key derivation.
+        std::unique_ptr<protocol::Socks5Client> socks;
+        protocol::Endpoint target{};
         std::size_t candidate{0};
         std::size_t attempt{0};
         Time next_attempt{};
@@ -1498,6 +1507,26 @@ struct Runtime::Impl {
 
     static std::optional<protocol::Endpoint>
     to_protocol_endpoint(const io::Endpoint& endpoint);
+
+    // Outbound upstreams (Config::upstreams, src/runtime/upstream.cpp).
+    struct Dialed {
+        io::FdResult connected;
+        // Set for a SOCKS5 upstream: run socks_start()/socks_read() once the
+        // TCP connect to the proxy completed.
+        std::unique_ptr<protocol::Socks5Client> socks;
+        const UpstreamConfig* upstream{nullptr};  // nullptr: plain direct
+    };
+    // Weighted pick among the upstreams of `scope`; nullptr when none are
+    // configured.
+    const UpstreamConfig* pick_upstream(std::string_view scope);
+    // Starts a non-blocking connect to numeric host:port through an upstream
+    // of `scope`.
+    Dialed dial(std::string_view scope, const std::string& host, std::uint16_t port);
+    enum class SocksProgress : std::uint8_t { pending, done, failed };
+    // Sends the greeting on a connected socket; then wait for EPOLLIN.
+    SocksProgress socks_start(int fd, protocol::Socks5Client& socks);
+    // Reads exactly what the handshake needs and answers it.
+    SocksProgress socks_read(int fd, protocol::Socks5Client& socks);
 
     // ------------------------------------------------------------------
     // State

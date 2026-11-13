@@ -694,7 +694,8 @@ void Runtime::Impl::update_me_interest(MeConn& me) {
     }
     std::uint32_t desired = 0;
     if (me.state == MeConn::State::connecting) {
-        desired |= EPOLLRDHUP | EPOLLOUT;
+        // A SOCKS5 upstream answers the handshake once connected: read it.
+        desired |= EPOLLRDHUP | (me.socks && me.socks->started() ? EPOLLIN : EPOLLOUT);
     } else {
         // While the relay budget refused a read, neither unread data nor a
         // level-triggered FIN bit may keep the reactor spinning. The 150 ms

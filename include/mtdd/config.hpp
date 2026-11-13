@@ -9,6 +9,30 @@
 #include <vector>
 
 namespace mtdd {
+// One way out of the host for outbound connections (Telegram ME and Direct
+// DCs, masking, metadata downloads), as telemt's [[upstreams]]:
+//   direct  connect from here, optionally through `interface`
+//           (SO_BINDTODEVICE) or from `bind_address`;
+//   socks5  connect through a SOCKS5 proxy at host:port (numeric), with
+//           optional username/password; interface/bind_address then apply
+//           to the connection to the proxy.
+// A connection picks among the upstreams of its scope by weight: Telegram
+// connections and metadata use the upstreams without scopes, masking uses
+// Config::masking_scope.
+struct UpstreamConfig {
+    enum class Type { direct, socks5 };
+    std::string name;
+    Type type{Type::direct};
+    std::string interface;
+    std::string bind_address;
+    std::string host;  // socks5 server address
+    std::uint16_t port{0};
+    std::string username;
+    std::string password;
+    std::uint32_t weight{1};
+    std::vector<std::string> scopes;  // empty: the default scope
+};
+
 struct Config {
     std::string proxy_host{"127.0.0.1"};
     std::uint16_t proxy_port{14443};
@@ -44,6 +68,19 @@ struct Config {
     std::vector<std::string> metrics_allow{"127.0.0.0/8", "::1"};
     std::string tls_domain;
     std::array<std::uint8_t, 16> ad_tag{};
+    // Outbound upstreams; empty means one plain direct upstream.
+    std::vector<UpstreamConfig> upstreams;
+    // Scope of the masking connections (telemt's tls_fetch_scope); empty is
+    // the default scope. E.g. "local" with a direct upstream scoped "local"
+    // keeps a local mask site off a tunnel the Telegram traffic takes.
+    std::string masking_scope;
+    // The address Telegram's middle-end sees this host connect from, when it
+    // is not the socket's own: behind NAT or through a tunnel/upstream whose
+    // exit address is fixed (telemt's middle_proxy_nat_ip). It replaces the
+    // local IP in the ME key derivation and in RPC_PROXY_REQ; the port is
+    // kept, so the NAT must preserve source ports. Empty: the socket address
+    // (or, through SOCKS5, the address the proxy reports).
+    std::string me_nat_ip;
     std::filesystem::path users_path;
     std::filesystem::path unique_ip_stats_path; // optional private HLL checkpoints
     std::filesystem::path usage_state_path;     // optional private per-user quota counters

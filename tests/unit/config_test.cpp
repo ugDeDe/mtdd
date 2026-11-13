@@ -53,6 +53,69 @@ TEST(Config, ProxyProtocolIsOffByDefaultWithALoopbackAllowlist) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, UpstreamsParseLikeTelemtAndHideCredentials) {
+    auto value = minimal_config();
+    value["upstreams"] = nlohmann::json::parse(R"([
+        {"name": "donor", "type": "socks5", "address": "10.200.0.1:1080",
+         "username": "u", "password": "p", "weight": 10},
+        {"type": "socks5", "address": "[2001:db8::1]:41080", "interface": "mtpawg"},
+        {"type": "direct", "scopes": "local,fetch", "weight": 1},
+        {"type": "direct", "bind_address": "10.8.0.2", "enabled": false}
+    ])");
+    value["masking_scope"] = "local";
+    value["me_nat_ip"] = "203.0.113.9";
+    const auto config = mtdd::Config::parse(value, "/work");
+    ASSERT_EQ(config.upstreams.size(), 3U);  // the disabled one is dropped
+    const auto& donor = config.upstreams[0];
+    EXPECT_EQ(donor.type, mtdd::UpstreamConfig::Type::socks5);
+    EXPECT_EQ(donor.host, "10.200.0.1");
+    EXPECT_EQ(donor.port, 1080);
+    EXPECT_EQ(donor.username, "u");
+    EXPECT_EQ(donor.weight, 10U);
+    EXPECT_EQ(config.upstreams[1].host, "2001:db8::1");
+    EXPECT_EQ(config.upstreams[1].interface, "mtpawg");
+    EXPECT_EQ(config.upstreams[2].scopes, (std::vector<std::string>{"local", "fetch"}));
+    EXPECT_EQ(config.masking_scope, "local");
+    EXPECT_EQ(config.me_nat_ip, "203.0.113.9");
+
+    const auto view = config.public_view();
+    EXPECT_EQ(view["upstreams"][0]["address"], "10.200.0.1:1080");
+    EXPECT_EQ(view["upstreams"][0]["auth"], true);
+    EXPECT_EQ(view["upstreams"][1]["address"], "[2001:db8::1]:41080");
+    EXPECT_EQ(view.dump().find("\"p\""), std::string::npos);  // the password never shows
+
+    EXPECT_TRUE(mtdd::Config::parse(minimal_config(), "/work").upstreams.empty());
+}
+
+TEST(Config, InvalidUpstreamsAreRefused) {
+    const std::vector<std::string> bad = {
+        R"({"upstreams": {}})",
+        R"({"upstreams": [{"type": "http"}]})",
+        R"({"upstreams": [{"type": "socks5"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "proxy.example:1080"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "2001:db8::1:1080"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:0"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:1080", "username": "u"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:1080", "username": 5, "password": "p"}]})",
+        R"({"upstreams": [{"type": "direct", "address": "127.0.0.1:1080"}]})",
+        R"({"upstreams": [{"type": "direct", "interface": "bad iface"}]})",
+        R"({"upstreams": [{"type": "direct", "bind_address": "host.example"}]})",
+        R"({"upstreams": [{"type": "direct", "weight": 0}]})",
+        R"({"upstreams": [{"type": "direct", "scopes": ["bad scope"]}]})",
+        R"({"upstreams": [{"type": "direct", "scopes": ["local"]}]})",  // no default scope
+        R"({"upstreams": [{"type": "direct", "colour": "red"}]})",
+        R"({"masking_scope": "local"})",                                // no such scope
+        R"({"me_nat_ip": "0.0.0.0"})",
+        R"({"me_nat_ip": "nat.example"})",
+    };
+    for (const auto& patch : bad) {
+        SCOPED_TRACE(patch);
+        auto value = minimal_config();
+        value.update(nlohmann::json::parse(patch));
+        EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    }
+}
+
 TEST(Config, SuspectsAndFingerprintAreOffByDefault) {
     const auto config = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_FALSE(config.suspects);

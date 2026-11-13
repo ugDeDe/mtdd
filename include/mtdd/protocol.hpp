@@ -333,6 +333,52 @@ struct ProxyHeaderScan {
 // header, a TCP source address with port 0.
 [[nodiscard]] ProxyHeaderScan scan_proxy_header(std::span<const std::uint8_t> wire);
 
+// ---------------------------------------------------------------------------
+// SOCKS5 CONNECT client (RFC 1928; RFC 1929 username/password) for outbound
+// upstreams. A byte state machine: the caller owns the socket, sends what
+// start()/feed() produce and reads exactly want() bytes at a time, so no byte
+// of the tunnelled stream is ever consumed by the handshake.
+// ---------------------------------------------------------------------------
+
+class Socks5Client {
+ public:
+  enum class Status { NeedMore, Done, Failed };
+
+  // Empty username and password: no authentication (method 0); otherwise
+  // only username/password (method 2) is offered. Each is at most 255 bytes.
+  Socks5Client(Endpoint target, std::string username = {}, std::string password = {});
+
+  // The greeting; call once, right after the TCP connect completed.
+  [[nodiscard]] Bytes start();
+  [[nodiscard]] bool started() const noexcept { return started_; }
+  // Bytes the next feed() may consume (>= 1 while NeedMore, else 0).
+  [[nodiscard]] std::size_t want() const noexcept;
+  // Consumes at most want() bytes; anything to send next is appended to `out`.
+  Status feed(std::span<const std::uint8_t> in, Bytes& out);
+  [[nodiscard]] Status status() const noexcept { return status_; }
+  // Done: the address and port the proxy connected from (BND.ADDR/BND.PORT);
+  // nullopt when the proxy answered with a domain name.
+  [[nodiscard]] const std::optional<Endpoint>& bound() const noexcept { return bound_; }
+  [[nodiscard]] std::string_view error() const noexcept { return error_; }
+
+ private:
+  enum class Stage { Method, Auth, Head, Address, Finished };
+  Status fail(std::string message);
+  void advance(Bytes& out);
+
+  Endpoint target_;
+  std::string username_;
+  std::string password_;
+  Stage stage_{Stage::Method};
+  Status status_{Status::NeedMore};
+  bool started_{false};
+  std::size_t need_{2};
+  Bytes have_;
+  std::uint8_t address_type_{0};
+  std::optional<Endpoint> bound_;
+  std::string error_;
+};
+
 // Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
 // x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
 std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random);

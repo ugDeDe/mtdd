@@ -554,6 +554,40 @@ TEST(SocketTest, ListenerIsNonBlockingCloexecAndReusable) {
     EXPECT_FALSE(peer_endpoint(fd).has_value());
 }
 
+TEST(SocketTest, ConnectOptionsBindTheSourceAndRefuseBadOptions) {
+    auto listener = listen_tcp("127.0.0.1", 0, 8);
+    ASSERT_TRUE(listener.ok());
+    const auto bound = local_endpoint(listener.fd.get());
+    ASSERT_TRUE(bound.has_value());
+
+    mtdd::io::ConnectOptions source;
+    source.bind_address = "127.0.0.2";
+    auto client = connect_tcp("127.0.0.1", bound->port, source);
+    ASSERT_TRUE(client.ok()) << std::strerror(client.error);
+    const auto local = local_endpoint(client.fd.get());
+    ASSERT_TRUE(local.has_value());
+    EXPECT_EQ(local->address, "127.0.0.2");
+
+    mtdd::io::ConnectOptions loopback;
+    loopback.device = "lo";
+    auto through_lo = connect_tcp("127.0.0.1", bound->port, loopback);
+    // SO_BINDTODEVICE is unprivileged since Linux 5.7; older kernels say EPERM.
+    if (!through_lo.ok()) {
+        EXPECT_EQ(through_lo.error, EPERM);
+    }
+
+    mtdd::io::ConnectOptions missing;
+    missing.device = "mtdd-no-such0";
+    auto absent = connect_tcp("127.0.0.1", bound->port, missing);
+    EXPECT_FALSE(absent.ok());
+    mtdd::io::ConnectOptions too_long;
+    too_long.device = "an-interface-name-too-long";
+    EXPECT_EQ(connect_tcp("127.0.0.1", bound->port, too_long).error, EINVAL);
+    mtdd::io::ConnectOptions wrong_family;
+    wrong_family.bind_address = "::1";
+    EXPECT_EQ(connect_tcp("127.0.0.1", bound->port, wrong_family).error, EAFNOSUPPORT);
+}
+
 TEST(SocketTest, NonBlockingConnectAndEndpointTuples) {
     auto listener = listen_tcp("127.0.0.1", 0, 8);
     ASSERT_TRUE(listener.ok()) << std::strerror(listener.error);

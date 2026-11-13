@@ -366,6 +366,7 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
         return true;
     }
     auto connected = io::FdResult{};
+    std::unique_ptr<protocol::Socks5Client> socks;
     bool dialled = false;
     const auto override_target = fallback_enabled() ? std::nullopt : masking_override();
     for (const auto& [host, target_port] : targets) {
@@ -376,13 +377,19 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
             if (const auto hooks = masking_hooks(); hooks && hooks->port != 0) port = hooks->port;
         }
         if (address.empty()) continue;
-        auto attempt = io::connect_tcp(address, port);
+        auto dialed = dial(config_.masking_scope, address, port);
+        auto attempt = std::move(dialed.connected);
         if (client.watched) {
-            watch_log(client, "masking", "target=" + host + ":" + std::to_string(port) +
+            std::string via;
+            if (dialed.upstream != nullptr && !dialed.upstream->name.empty()) {
+                via = " via=" + dialed.upstream->name;
+            }
+            watch_log(client, "masking", "target=" + host + ":" + std::to_string(port) + via +
                                              (attempt.ok() ? "" : " connect_failed"));
         }
         if (attempt.ok()) {
             connected = std::move(attempt);
+            socks = std::move(dialed.socks);
             dialled = true;
             break;
         }
@@ -392,6 +399,7 @@ bool Runtime::Impl::start_fallback(Client& client, std::span<const std::uint8_t>
         return true;
     }
     client.backend = std::move(connected.fd);
+    client.backend_socks = std::move(socks);
     client.backend_connecting = true;
     client.deadline_kind = Client::DeadlineKind::fallback_connect;
     deadlines_.set(client.backend_token, now + config_.handshake_timeout);
@@ -421,13 +429,15 @@ void Runtime::Impl::update_fallback_backend_interest(Client& client) {
     if (client.backend_token == 0 || !client.backend.valid()) return;
     std::uint32_t desired = 0;
     if (client.backend_connecting) {
-        desired |= EPOLLOUT;
+        // Through SOCKS5 the proxy's handshake reply is read after the connect;
+        // nothing of c2b is written before the handshake is done.
+        desired |= client.backend_socks && client.backend_socks->started() ? EPOLLIN : EPOLLOUT;
     } else {
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
         if (!client.backend_eof && !client.backend_budget_paused && room) desired |= EPOLLIN;
         if (!client.backend_fin_pending && !client.backend_eof) desired |= EPOLLRDHUP;
+        if (client.c2b && !client.c2b->empty()) desired |= EPOLLOUT;
     }
-    if (client.c2b && !client.c2b->empty()) desired |= EPOLLOUT;
     set_interest(client.backend_token, client.backend.get(), client.backend_armed, desired);
 }
 
@@ -441,6 +451,17 @@ void Runtime::Impl::on_fallback_connected(Client& client, Time now) {
     if (::getsockopt(client.backend.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
         error != 0) {
         close_client(client.token);
+        return;
+    }
+    if (client.backend_socks &&
+        client.backend_socks->status() != protocol::Socks5Client::Status::Done) {
+        // Connected to the SOCKS5 proxy; entered again once its handshake is Done.
+        if (client.backend_socks->started()) return;
+        if (socks_start(client.backend.get(), *client.backend_socks) == SocksProgress::failed) {
+            close_client(client.token);
+            return;
+        }
+        update_fallback_backend_interest(client);
         return;
     }
     client.backend_connecting = false;
@@ -639,6 +660,16 @@ void Runtime::Impl::handle_fallback_backend(Client& client, std::uint32_t events
     if (client.backend_connecting) {
         if ((events & EPOLLHUP) != 0) {
             close_client(token);
+            return;
+        }
+        if (client.backend_socks && client.backend_socks->started()) {
+            if ((events & (EPOLLIN | EPOLLRDHUP)) == 0) return;
+            const auto progress = socks_read(client.backend.get(), *client.backend_socks);
+            if (progress == SocksProgress::failed) {
+                close_client(token);
+            } else if (progress == SocksProgress::done) {
+                on_fallback_connected(client, now);
+            }
             return;
         }
         if ((events & EPOLLOUT) != 0) on_fallback_connected(client, now);

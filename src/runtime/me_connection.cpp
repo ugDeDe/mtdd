@@ -43,6 +43,7 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
     if (me.out) me.out->clear();
     me.remote_close.clear();
 
+    me.socks.reset();
     std::vector<MeEndpoint> candidates;
     if (!me_candidates(me.dc, candidates)) {
         me.state = MeConn::State::backoff;
@@ -51,7 +52,12 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
     }
     me.meta = metadata_snapshot_;
     const MeEndpoint& endpoint = candidates[me.candidate % candidates.size()];
-    auto connected = io::connect_tcp(endpoint.host, endpoint.port);
+    if (const auto target = to_protocol_endpoint(io::Endpoint{endpoint.host, endpoint.port})) {
+        me.target = *target;
+    }
+    auto dialed = dial({}, endpoint.host, endpoint.port);
+    auto connected = std::move(dialed.connected);
+    me.socks = std::move(dialed.socks);
     if (!connected.ok()) {
         if (const auto found = me_pool_.find(me.dc); found != me_pool_.end()) {
             ++found->second.creation_failures_total;
@@ -101,16 +107,40 @@ void Runtime::Impl::on_me_connected(MeConn& me, Time now) {
         fail_me(me, now);
         return;
     }
-    const auto local = io::local_endpoint(me.fd.get());
-    const auto peer = io::peer_endpoint(me.fd.get());
-    if (!local || !peer || local->port == 0 || peer->port == 0) {
-        fail_me(me, now);
+    if (me.socks && me.socks->status() != protocol::Socks5Client::Status::Done) {
+        // Connected to the SOCKS5 proxy: the CONNECT handshake runs first
+        // (EPOLLIN, see handle_me); this function is entered again once Done.
+        if (me.socks->started()) return;
+        if (socks_start(me.fd.get(), *me.socks) == SocksProgress::failed) {
+            fail_me(me, now);
+            return;
+        }
+        update_me_interest(me);
         return;
     }
-    const auto protocol_local = to_protocol_endpoint(*local);
-    const auto protocol_server = to_protocol_endpoint(*peer);
-    if (!protocol_local || !protocol_server ||
-        protocol_local->ipv6 != protocol_server->ipv6) {
+    // The key derivation binds the address Telegram sees this connection come
+    // from and the ME address. Through SOCKS5 that is the proxy's outbound
+    // socket (BND.ADDR/PORT) and the target; otherwise this socket's ends.
+    std::optional<protocol::Endpoint> protocol_local;
+    std::optional<protocol::Endpoint> protocol_server;
+    if (me.socks) {
+        protocol_local = me.socks->bound();
+        protocol_server = me.target;
+    } else {
+        const auto local = io::local_endpoint(me.fd.get());
+        const auto peer = io::peer_endpoint(me.fd.get());
+        if (local) protocol_local = to_protocol_endpoint(*local);
+        if (peer) protocol_server = to_protocol_endpoint(*peer);
+    }
+    if (protocol_local && !config_.me_nat_ip.empty()) {
+        // Behind NAT or a fixed-exit tunnel: Telegram sees this address; the
+        // NAT keeps the source port.
+        if (auto nat = to_protocol_endpoint(io::Endpoint{config_.me_nat_ip, protocol_local->port})) {
+            protocol_local = *nat;
+        }
+    }
+    if (!protocol_local || !protocol_server || protocol_local->port == 0 ||
+        protocol_server->port == 0 || protocol_local->ipv6 != protocol_server->ipv6) {
         fail_me(me, now);
         return;
     }
@@ -271,6 +301,16 @@ void Runtime::Impl::handle_me(MeConn& me, std::uint32_t events, Time now) {
         return;
     }
     if (me.state == MeConn::State::connecting) {
+        if (me.socks && me.socks->started()) {
+            if ((events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) == 0) return;
+            const auto progress = socks_read(me.fd.get(), *me.socks);
+            if (progress == SocksProgress::failed) {
+                fail_me(me, now);
+            } else if (progress == SocksProgress::done) {
+                on_me_connected(me, now);
+            }
+            return;
+        }
         if ((events & (EPOLLOUT | EPOLLHUP)) != 0) on_me_connected(me, now);
         return;
     }

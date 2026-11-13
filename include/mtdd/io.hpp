@@ -203,6 +203,22 @@ struct FdResult {
 /// completed.
 [[nodiscard]] FdResult connect_tcp(std::string_view address, std::uint16_t port);
 
+/// Where an outbound connection leaves the host (a "direct" upstream).
+struct ConnectOptions {
+    /// SO_BINDTODEVICE: send through this interface regardless of the routing
+    /// table (e.g. a WireGuard/AmneziaWG tunnel). Unprivileged on Linux >= 5.7;
+    /// older kernels need CAP_NET_RAW. Empty: no binding.
+    std::string device;
+    /// Numeric source address (port 0), for policy routing by source. It must
+    /// be of the destination's family. Empty: chosen by the kernel.
+    std::string bind_address;
+};
+
+/// connect_tcp() with @p options applied before connect(). A failing option
+/// is an error (the caller never silently leaves through the default route).
+[[nodiscard]] FdResult connect_tcp(std::string_view address, std::uint16_t port,
+                                   const ConnectOptions& options);
+
 /// Returns true when @p address is a literal IPv4/IPv6 address (no DNS).
 [[nodiscard]] bool is_numeric_address(std::string_view address) noexcept;
 
