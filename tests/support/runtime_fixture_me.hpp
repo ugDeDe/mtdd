@@ -12,6 +12,8 @@ struct FakeMeObservation {
     std::size_t frames{0};
     // our_addr from the first RPC_PROXY_REQ (20-byte ME endpoint form).
     std::array<std::uint8_t, 20> our_addr{};
+    // The client address the proxy reported in the RPC_PROXY_REQ.
+    std::array<std::uint8_t, 20> client_addr{};
     // sender_pid from the encrypted RPC_HANDSHAKE request.
     std::array<std::uint8_t, 12> sender_pid{};
     bool saw_sender_pid{false};
@@ -265,6 +267,7 @@ private:
             if (rd32(payload, 0) != 0x36cef1eeU) return false;
             ConnId frame_conn{};
             std::copy_n(payload.begin() + 8, 8, frame_conn.begin());
+            std::copy_n(payload.begin() + 16, 20, observation.client_addr.begin());
             std::copy_n(payload.begin() + 36, 20, observation.our_addr.begin());
             std::copy_n(payload.begin() + 65, 16, observation.ad_tag.begin());
             observation.inner.assign(payload.begin() + 84, payload.end());

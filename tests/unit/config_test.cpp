@@ -30,6 +30,29 @@ TEST(Config, MinimalConfigHasUnlimitedConnectionDefaults) {
     EXPECT_EQ(config.ad_tag.back(), 0xff);
 }
 
+TEST(Config, ProxyProtocolIsOffByDefaultWithALoopbackAllowlist) {
+    const auto config = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_FALSE(config.proxy_protocol);
+    EXPECT_EQ(config.proxy_protocol_allow, (std::vector<std::string>{"127.0.0.0/8", "::1"}));
+    EXPECT_FALSE(config.public_view()["proxy_protocol"].get<bool>());
+
+    auto value = minimal_config();
+    value["proxy_protocol"] = true;
+    value["proxy_protocol_allow"] = {"10.0.0.0/8", "fd00::/8"};
+    const auto enabled = mtdd::Config::parse(value, "/work");
+    EXPECT_TRUE(enabled.proxy_protocol);
+    EXPECT_EQ(enabled.proxy_protocol_allow.size(), 2U);
+    EXPECT_EQ(enabled.security_posture()["proxy_protocol"]["allowlist_entries"], 2);
+
+    value["proxy_protocol_allow"] = nlohmann::json::array();
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["proxy_protocol_allow"] = {"not-an-address"};
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value.erase("proxy_protocol_allow");
+    value["proxy_protocol"] = "yes";
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, SuspectsAndFingerprintAreOffByDefault) {
     const auto config = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_FALSE(config.suspects);

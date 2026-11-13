@@ -228,6 +228,15 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         failure = control::RejectReason::other;
         return nullptr;
     }
+    // With PROXY protocol only the configured fronts may connect: anyone else
+    // could name an arbitrary client address in the header.
+    if (config_.proxy_protocol &&
+        std::none_of(proxy_allow_.begin(), proxy_allow_.end(), [&](const detail::WatchNet& net) {
+            return detail::watch_net_contains(net, *protocol_peer);
+        })) {
+        failure = control::RejectReason::invalid_request;
+        return nullptr;
+    }
     // Reserve one process-wide handshake slot. Released by record_handshake()
     // or by close_client() when the pending flag is cleared without a result.
     if (!shared_->try_handshake(config_.max_handshakes)) {
@@ -255,33 +264,17 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     // (setup()) and inherited by every accepted socket: no per-connection
     // setsockopt calls on the accept path.
     owned->peer = *protocol_peer;
-    if (config_.fingerprint) {
+    // Behind a PROXY-protocol front the saved SYN is the front's, not the
+    // client's: no TCP fingerprint then.
+    if (config_.fingerprint && !config_.proxy_protocol) {
         std::array<std::uint8_t, 128> syn{};
         socklen_t length = sizeof(syn);
         if (::getsockopt(owned->fd.get(), IPPROTO_TCP, TCP_SAVED_SYN, syn.data(), &length) == 0) {
             owned->syn = detail::parse_saved_syn(std::span<const std::uint8_t>(syn.data(), length));
         }
     }
-    if (!watch_.empty()) {
-        for (const auto& net : watch_) {
-            if (detail::watch_net_contains(net, owned->peer)) {
-                owned->watched = true;
-                break;
-            }
-        }
-    }
     owned->accepted_at = now;
-    bool repeat_visit = false;
-    if (config_.suspects) {
-        const auto seen = shared_->suspects.accept(owned->peer, now);
-        if (seen.known && config_.suspect_watch_score != 0 &&
-            seen.score >= static_cast<double>(config_.suspect_watch_score) &&
-            shared_->suspects.watch_budget(now)) {
-            owned->watched = true;  // known suspect: per-stage log (rate-limited)
-        }
-        repeat_visit = seen.repeat_visit;
-    }
-    owned->phase = Client::Phase::tls_hello;
+    owned->phase = config_.proxy_protocol ? Client::Phase::proxy_header : Client::Phase::tls_hello;
     owned->out.emplace(config_.connection_queue_bytes);
     owned->last_activity = now;
     owned->handshake_pending = true;
@@ -306,8 +299,7 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         deadlines_.set(token, now + config_.handshake_timeout);
         reaccount(*raw);
         update_client_interest(*raw);
-        if (raw->watched) watch_accept(*raw, now);
-        if (repeat_visit) suspect(*raw, control::SuspectSignal::repeat_visits);
+        if (!config_.proxy_protocol) admit_client_peer(*raw, now);
     } catch (...) {
         // close_client() is safe here: handshake accounting is still pending and
         // no user metrics have been attached yet.
@@ -315,6 +307,27 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
         throw;
     }
     return raw;
+}
+
+void Runtime::Impl::admit_client_peer(Client& client, Time now) {
+    for (const auto& net : watch_) {
+        if (detail::watch_net_contains(net, client.peer)) {
+            client.watched = true;
+            break;
+        }
+    }
+    bool repeat_visit = false;
+    if (config_.suspects && !client.front_peer) {
+        const auto seen = shared_->suspects.accept(client.peer, now);
+        if (seen.known && config_.suspect_watch_score != 0 &&
+            seen.score >= static_cast<double>(config_.suspect_watch_score) &&
+            shared_->suspects.watch_budget(now)) {
+            client.watched = true;  // known suspect: per-stage log (rate-limited)
+        }
+        repeat_visit = seen.repeat_visit;
+    }
+    if (client.watched) watch_accept(client, now);
+    if (repeat_visit) suspect(client, control::SuspectSignal::repeat_visits);
 }
 
 void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now) {
@@ -379,7 +392,16 @@ void Runtime::Impl::read_client(Client& client, Time now) {
     std::size_t total = 0;
     while (total < detail::kReadBatch) {
         std::size_t limit = detail::kReadBatch - total;
-        if (client.phase == Client::Phase::tls_hello) {
+        if (client.phase == Client::Phase::proxy_header) {
+            // v2 is read exactly; v1 at most up to kProxyHeaderV1Max bytes,
+            // which is less than the shortest header plus ClientHello, so a
+            // v1 over-read never passes the end of the ClientHello.
+            const auto scan = protocol::scan_proxy_header(client.hello);
+            limit = scan.status == protocol::ProxyHeaderScan::Status::NeedMoreData
+                        ? std::min(limit, scan.want)
+                        : 0;
+            if (limit == 0) break;
+        } else if (client.phase == Client::Phase::tls_hello) {
             // Read only up to the end of the current record header or body:
             // no byte after the ClientHello (one or more records) lands in
             // client.hello. A classified hello reads nothing more here.
@@ -425,40 +447,78 @@ void Runtime::Impl::read_client(Client& client, Time now) {
 
 void Runtime::Impl::consume_client_bytes(Client& client,
                                          std::span<const std::uint8_t> wire, Time now) {
+    if (client.phase == Client::Phase::proxy_header) {
+        client.hello.insert(client.hello.end(), wire.begin(), wire.end());
+        consume_proxy_header(client, now);
+        return;
+    }
     if (client.phase == Client::Phase::tls_hello) {
         client.hello.insert(client.hello.end(), wire.begin(), wire.end());
-        const auto scan = protocol::scan_client_hello(client.hello);
-        if (scan.status == protocol::HelloStatus::NotTls ||
-            scan.status == protocol::HelloStatus::Invalid) {
-            // Not a ClientHello, split or not. Masking gets the bytes exactly
-            // as they arrived; the SNI target comes from the reassembly.
-            const bool tls = scan.status == protocol::HelloStatus::Invalid;
-            const auto reassembled = protocol::reassemble_client_hello(client.hello);
-            if (client.watched) watch_hello(client, tls ? reassembled : client.hello);
-            if (tls) {
-                suspect(client, control::SuspectSignal::junk);  // malformed record(s)
-            } else {
-                suspect_first_bytes(client);
-            }
-            if (masking_enabled()) {
-                const auto original = std::move(client.hello);
-                client.hello.clear();
-                start_fallback(client, original, now, reassembled);
-                return;
-            }
-            reject_close(client, control::RejectReason::auth_failed,
-                         control::HandshakeResult::failure);
-            return;
-        }
-        if (scan.status == protocol::HelloStatus::Ok) {
-            const std::uint64_t token = client.token;
-            process_client_hello(client, now);
-            if (clients_.find(token) == clients_.end()) return;
-        }
-        reaccount(client);
+        classify_client_hello(client, now);
         return;
     }
     feed_client_tls(client, wire, now);
+}
+
+void Runtime::Impl::consume_proxy_header(Client& client, Time now) {
+    const auto scan = protocol::scan_proxy_header(client.hello);
+    if (scan.status == protocol::ProxyHeaderScan::Status::NeedMoreData) {
+        reaccount(client);
+        return;
+    }
+    if (scan.status == protocol::ProxyHeaderScan::Status::Invalid) {
+        reject_close(client, control::RejectReason::invalid_request,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    if (scan.source) {
+        client.peer = *scan.source;
+    } else {
+        client.front_peer = true;  // LOCAL / UNKNOWN: keep the socket peer
+    }
+    client.hello.erase(client.hello.begin(),
+                       client.hello.begin() + static_cast<std::ptrdiff_t>(scan.length));
+    client.phase = Client::Phase::tls_hello;
+    const std::uint64_t token = client.token;
+    admit_client_peer(client, now);
+    if (clients_.find(token) == clients_.end()) return;
+    if (client.hello.empty()) {
+        reaccount(client);
+        return;
+    }
+    classify_client_hello(client, now);
+}
+
+void Runtime::Impl::classify_client_hello(Client& client, Time now) {
+    const auto scan = protocol::scan_client_hello(client.hello);
+    if (scan.status == protocol::HelloStatus::NotTls ||
+        scan.status == protocol::HelloStatus::Invalid) {
+        // Not a ClientHello, split or not. Masking gets the bytes exactly
+        // as they arrived; the SNI target comes from the reassembly.
+        const bool tls = scan.status == protocol::HelloStatus::Invalid;
+        const auto reassembled = protocol::reassemble_client_hello(client.hello);
+        if (client.watched) watch_hello(client, tls ? reassembled : client.hello);
+        if (tls) {
+            suspect(client, control::SuspectSignal::junk);  // malformed record(s)
+        } else {
+            suspect_first_bytes(client);
+        }
+        if (masking_enabled()) {
+            const auto original = std::move(client.hello);
+            client.hello.clear();
+            start_fallback(client, original, now, reassembled);
+            return;
+        }
+        reject_close(client, control::RejectReason::auth_failed,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    if (scan.status == protocol::HelloStatus::Ok) {
+        const std::uint64_t token = client.token;
+        process_client_hello(client, now);
+        if (clients_.find(token) == clients_.end()) return;
+    }
+    reaccount(client);
 }
 
 void Runtime::Impl::process_client_hello(Client& client, Time now) {

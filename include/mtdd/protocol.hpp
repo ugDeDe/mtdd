@@ -304,6 +304,35 @@ struct ClientHelloScan {
 // only; it is never a substitute for scan_client_hello().
 [[nodiscard]] Bytes reassemble_client_hello(std::span<const std::uint8_t> wire);
 
+// ---------------------------------------------------------------------------
+// PROXY protocol (HAProxy v1 text / v2 binary) in front of the client stream
+// ---------------------------------------------------------------------------
+
+// v1 is at most 107 bytes including CRLF (spec). v2 headers longer than
+// kProxyHeaderV2Max (16-byte prefix + addresses + TLVs) are refused.
+inline constexpr std::size_t kProxyHeaderV1Max = 107;
+inline constexpr std::size_t kProxyHeaderV2Max = 2048;
+
+struct ProxyHeaderScan {
+  enum class Status { NeedMoreData, Ok, Invalid };
+  Status status{Status::NeedMoreData};
+  // NeedMoreData: bytes that may be read next (>= 1). For v2 this never passes
+  // the end of the header. A v1 header's end is only known at its CRLF, so the
+  // read may pass it, but never past kProxyHeaderV1Max bytes in total.
+  std::size_t want{0};
+  // Ok: header length; the bytes after it belong to the proxied stream.
+  std::size_t length{0};
+  // Ok: the original client address. nullopt for v2 LOCAL, v1 UNKNOWN and v2
+  // address families other than TCP over IPv4/IPv6: use the socket peer.
+  std::optional<Endpoint> source;
+};
+
+// Pure function of the received prefix, like scan_client_hello(). Rejects as
+// early as the bytes allow: a wrong signature, a malformed v1 line, a v2
+// version other than 2 or a command other than LOCAL/PROXY, an oversized
+// header, a TCP source address with port 0.
+[[nodiscard]] ProxyHeaderScan scan_proxy_header(std::span<const std::uint8_t> wire);
+
 // Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
 // x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
 std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random);

@@ -861,7 +861,9 @@ struct Runtime::Impl {
     struct MeConn;
 
     struct Client {
-        enum class Phase : std::uint8_t { tls_hello, tls_handshake, relay, fallback };
+        // proxy_header: Config::proxy_protocol is on and the PROXY header has
+        // not been read yet; `peer` is still the front's socket address.
+        enum class Phase : std::uint8_t { proxy_header, tls_hello, tls_handshake, relay, fallback };
         enum class Route : std::uint8_t { me, direct };
         enum class DeadlineKind : std::uint8_t {
             handshake,
@@ -1013,6 +1015,9 @@ struct Runtime::Impl {
         detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
         // Config::watch_ips: this connection is logged stage by stage.
         bool watched{false};
+        // PROXY protocol LOCAL/UNKNOWN: `peer` is the front itself, not a
+        // client, so it is never scored as a suspect.
+        bool front_peer{false};
         // The user's own ad tag (UserPolicy::ad_tag) for RPC_PROXY_REQ; the
         // global one when unset. Reloaded with the user snapshot.
         bool has_ad_tag{false};
@@ -1284,6 +1289,15 @@ struct Runtime::Impl {
     void handle_client(Client& client, std::uint32_t events, Time now);
     void read_client(Client& client, Time now);
     void consume_client_bytes(Client& client, std::span<const std::uint8_t> wire, Time now);
+    // Phase::proxy_header: parses client.hello as a PROXY header; once it is
+    // complete, adopts its source address and continues with the bytes after
+    // it as the start of the ClientHello.
+    void consume_proxy_header(Client& client, Time now);
+    // Classifies the buffered client.hello (Phase::tls_hello).
+    void classify_client_hello(Client& client, Time now);
+    // Peer-dependent admission work (watch_ips, suspects), run at accept or,
+    // with PROXY protocol, once the header named the client.
+    void admit_client_peer(Client& client, Time now);
     void process_client_hello(Client& client, Time now);
     void refresh_personal_domains();
     /// The configured domain (global first, then personal) that covers `sni`
@@ -1534,6 +1548,7 @@ struct Runtime::Impl {
     std::size_t accept_burst_{1};
     Time next_device_prune_{};
     std::vector<detail::WatchNet> watch_;
+    std::vector<detail::WatchNet> proxy_allow_;  // Config::proxy_protocol_allow
     // sweep_user_policy(): users with an expiry or quota, by name, valid for
     // policy_index_snapshot_ (held so the record pointers stay valid).
     std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;

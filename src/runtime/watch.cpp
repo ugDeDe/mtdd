@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 
 namespace mtdd {
@@ -127,8 +128,10 @@ const char* tls_name(detail::TlsTemplate tls) {
 }
 
 const char* phase_name(std::uint8_t phase) {
-    static constexpr const char* kNames[] = {"tls_hello", "tls_handshake", "relay", "fallback"};
-    return phase < 4 ? kNames[phase] : "?";
+    // Indexed by Runtime::Impl::Client::Phase.
+    static constexpr const char* kNames[] = {"proxy_header", "tls_hello", "tls_handshake", "relay",
+                                             "fallback"};
+    return phase < std::size(kNames) ? kNames[phase] : "?";
 }
 
 const char* close_name(control::RelayCloseReason reason) {

@@ -17,6 +17,14 @@ struct Config {
     std::string control_host{"127.0.0.1"};
     std::uint16_t control_port{9090};
     bool allow_remote_control{false};
+    // PROXY protocol (HAProxy v1/v2) on the proxy listener, for a trusted
+    // front (SNI router, load balancer) that forwards client connections.
+    // When on, every connection must start with a PROXY header, sent by a peer
+    // in proxy_protocol_allow; others are closed. The header's source address
+    // then stands for the client everywhere (limits, statistics, suspects,
+    // watch_ips, the address reported to Telegram).
+    bool proxy_protocol{false};
+    std::vector<std::string> proxy_protocol_allow{"127.0.0.0/8", "::1"};
     std::string fallback_host{"127.0.0.1"};
     std::uint16_t fallback_port{0}; // Nonzero pins the masking relay to this target.
     // Probe masking on by default: unrecognised ClientHellos are relayed to the

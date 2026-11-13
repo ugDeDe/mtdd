@@ -215,6 +215,16 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
         if (!net) throw std::invalid_argument("invalid watch_ips entry: " + entry);
         watch_.push_back(*net);
     }
+    if (config_.proxy_protocol) {
+        for (const auto& entry : config_.proxy_protocol_allow) {
+            auto net = detail::parse_watch_net(entry);
+            if (!net) throw std::invalid_argument("invalid proxy_protocol_allow entry: " + entry);
+            proxy_allow_.push_back(*net);
+        }
+        if (proxy_allow_.empty()) {
+            throw std::invalid_argument("proxy_protocol requires a non-empty proxy_protocol_allow");
+        }
+    }
     if (std::all_of(config_.ad_tag.begin(), config_.ad_tag.end(),
                     [](std::uint8_t byte) { return byte == 0; })) {
         throw std::invalid_argument("runtime requires a non-zero 16-byte ad tag");

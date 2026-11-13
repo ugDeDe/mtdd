@@ -229,7 +229,8 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds", "watch_ips",
         "suspects", "fingerprint", "cpu_affinity", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
         "api_read_token_env", "control_allow",
-        "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
+        "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes",
+        "proxy_protocol", "proxy_protocol_allow"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -279,6 +280,10 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         throw std::invalid_argument("token variables must be distinct environment variable names");
     config.control_allow = networks(value, "control_allow", {});
     config.watch_ips = networks(value, "watch_ips", {});
+    config.proxy_protocol = boolean(value, "proxy_protocol", false);
+    config.proxy_protocol_allow = networks(value, "proxy_protocol_allow", config.proxy_protocol_allow);
+    if (config.proxy_protocol && config.proxy_protocol_allow.empty())
+        throw std::invalid_argument("proxy_protocol requires a non-empty proxy_protocol_allow");
     config.suspects = boolean(value, "suspects", false);
     config.fingerprint = boolean(value, "fingerprint", false);
     config.cpu_affinity = boolean(value, "cpu_affinity", true);
@@ -430,6 +435,8 @@ nlohmann::json Config::public_view() const {
         {"control_port", control_port},
         {"allow_remote_control", allow_remote_control},
         {"control_allow", control_allow},
+        {"proxy_protocol", proxy_protocol},
+        {"proxy_protocol_allow", proxy_protocol_allow},
         {"metrics_host", metrics_host},
         {"metrics_port", metrics_port},
         {"metrics_allow", metrics_allow},
@@ -476,6 +483,8 @@ nlohmann::json Config::security_posture() const {
                      {"token", metrics_on && !metrics_token_env.empty()},
                      {"allowlist_entries", metrics_allow.size()}}},
         {"masking", masking},
+        {"proxy_protocol", {{"enabled", proxy_protocol},
+                            {"allowlist_entries", proxy_protocol ? proxy_protocol_allow.size() : 0}}},
         {"tls_domain_set", !tls_domain.empty()},
         {"global_connection_cap", max_connections != 0},
         {"handshake_cap", max_handshakes != 0}};
