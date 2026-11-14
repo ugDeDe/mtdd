@@ -1,0 +1,19 @@
+[Unit]
+Description=proxymon: proxy-agnostic load sampling (mtdd/telemt comparison)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/proxymon/collect.py --interval 10 --dir /var/lib/proxymon
+Restart=always
+RestartSec=5
+# Low priority: the collector must not compete with the proxy it measures.
+Nice=10
+CPUSchedulingPolicy=batch
+StateDirectory=proxymon
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
