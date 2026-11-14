@@ -44,6 +44,11 @@ constexpr std::array<const char*, kClockSkewBuckets> kClockSkewBucketLabels = {
     "le_300s", "le_600s", "le_1200s", "gt_1200s"};
 constexpr std::array<uint64_t, kClockSkewBuckets - 1> kClockSkewBucketLimits = {300, 600, 1200};
 
+constexpr std::array<const char*, kAutoDelayBuckets> kAutoDelayBucketLabels = {
+    "le_1ms", "le_5ms", "le_10ms", "le_25ms", "le_50ms", "le_100ms"};
+constexpr std::array<int64_t, kAutoDelayBuckets - 1> kAutoDelayBucketLimitsUs = {
+    1000, 5000, 10000, 25000, 50000};
+
 constexpr std::array<const char*, kBufferStateCount> kBufferLabels = {
     "queued", "pending_write", "relay"};
 
@@ -518,6 +523,7 @@ struct Statistics::Impl {
   Statistics::DeviceLister device_lister;
   Statistics::SuspectLister suspect_lister;
   Ja4Table ja4;
+  Statistics::ServerTimingLister server_timing_lister;
   std::array<std::atomic<uint64_t>, kSuspectSignals> suspect_events{};
   std::atomic<uint64_t> suspect_shadow_bans{0};
   std::string build_version;
@@ -536,6 +542,8 @@ struct Statistics::Impl {
   std::atomic<uint64_t> backpressure_s2c{0};
   std::array<std::atomic<uint64_t>, kBudgetRefusalKinds> budget_refusals{};
   std::array<std::atomic<uint64_t>, 2 * kClockSkewBuckets> hello_clock_skew{};
+  std::array<std::atomic<uint64_t>, kAutoDelayBuckets> auto_delay{};
+  std::atomic<uint64_t> auto_delay_us{0};
   std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
   std::atomic<uint64_t> media_throttled{0};
   std::atomic<uint64_t> hello_throttled{0};
@@ -615,6 +623,17 @@ std::vector<Statistics::SuspectInfo> Statistics::suspects() const {
 
 Ja4Table& Statistics::ja4() noexcept { return impl_->ja4; }
 const Ja4Table& Statistics::ja4() const noexcept { return impl_->ja4; }
+
+void Statistics::set_server_timing_lister(ServerTimingLister lister) {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  impl_->server_timing_lister = std::move(lister);
+}
+
+std::vector<Statistics::ServerTimingInfo> Statistics::server_timings() const {
+  std::lock_guard<std::mutex> lock(impl_->device_mutex);
+  if (!impl_->server_timing_lister) return {};
+  return impl_->server_timing_lister();
+}
 
 void Statistics::suspect_event(SuspectSignal signal) noexcept {
   const auto index = static_cast<size_t>(signal);
@@ -820,6 +839,15 @@ void Statistics::hello_clock_skew(int64_t skew_seconds) noexcept {
   }
   impl_->hello_clock_skew[side * kClockSkewBuckets + bucket].fetch_add(
       1, std::memory_order_relaxed);
+}
+void Statistics::server_hello_auto_delay(std::chrono::microseconds delay) noexcept {
+  const int64_t us = std::max<int64_t>(delay.count(), 0);
+  size_t bucket = 0;
+  while (bucket < kAutoDelayBucketLimitsUs.size() && us > kAutoDelayBucketLimitsUs[bucket]) {
+    ++bucket;
+  }
+  impl_->auto_delay[bucket].fetch_add(1, std::memory_order_relaxed);
+  impl_->auto_delay_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
 }
 void Statistics::set_replay_cache_entries(uint64_t entries) noexcept {
   set_replay_cache_entries(0, entries);
@@ -1188,6 +1216,11 @@ StatisticsSnapshot Statistics::snapshot() const {
               std::memory_order_relaxed);
     }
   }
+  for (size_t bucket = 0; bucket < kAutoDelayBuckets; ++bucket) {
+    out.server_hello_auto_delay_total[kAutoDelayBucketLabels[bucket]] =
+        impl_->auto_delay[bucket].load(std::memory_order_relaxed);
+  }
+  out.server_hello_auto_delay_us_total = impl_->auto_delay_us.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(impl_->users_mutex);
     for (const auto& [name, metrics] : impl_->users) {
@@ -1502,6 +1535,22 @@ std::string Statistics::prometheus_text() const {
                         escape_label(bucket) + "\"",
                     value);
     }
+  }
+  for (const auto& [bucket, value] : snapshot.server_hello_auto_delay_total) {
+    append_metric(out, "mtdd_server_hello_auto_delay_total",
+                  "delay=\"" + escape_label(bucket) + "\"", value);
+  }
+  append_metric(out, "mtdd_server_hello_auto_delay_us_total", "",
+                snapshot.server_hello_auto_delay_us_total);
+  for (const auto& entry : server_timings()) {
+    const std::string domain = "domain=\"" + escape_label(entry.domain) + "\"";
+    append_metric(out, "mtdd_masking_server_processing_us", domain + ",quantile=\"0.25\"",
+                  entry.low_us);
+    append_metric(out, "mtdd_masking_server_processing_us", domain + ",quantile=\"0.5\"",
+                  entry.median_us);
+    append_metric(out, "mtdd_masking_server_processing_us", domain + ",quantile=\"0.75\"",
+                  entry.high_us);
+    append_metric(out, "mtdd_masking_server_processing_samples", domain, entry.samples);
   }
   out << "# HELP mtdd_user_quota_used_bytes Payload bytes (c2s+s2c) counted "
          "against the user's data quota since the last quota reset.\n";

@@ -139,6 +139,12 @@ struct Config {
     std::chrono::milliseconds server_hello_delay_min{0};
     std::chrono::milliseconds server_hello_delay_max{0};
     static constexpr std::chrono::milliseconds kMaxServerHelloDelay{1000};
+    // With both bounds at 0 (the default), hold the ServerHello for the
+    // processing time measured on the real server of the client's masked
+    // tls_domain (its p25..p75, at most kMaxAutoServerHelloDelay); a domain not
+    // measured yet answers at once. Manual bounds above 0 always win.
+    bool server_hello_delay_auto{true};
+    static constexpr std::chrono::milliseconds kMaxAutoServerHelloDelay{100};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
     // Client socket liveness. Keepalive probes start after this much silence

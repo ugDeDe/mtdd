@@ -137,6 +137,17 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
             }
             return out;
         });
+    // masking_dns outlives the lister: the destructor clears it first.
+    statistics.set_server_timing_lister([resolver = masking_dns.get()]() {
+        std::vector<control::Statistics::ServerTimingInfo> out;
+        for (const auto& [domain, timing] : resolver->server_timings()) {
+            out.push_back({domain, static_cast<std::uint64_t>(timing.low.count()),
+                           static_cast<std::uint64_t>(timing.median.count()),
+                           static_cast<std::uint64_t>(timing.high.count()),
+                           static_cast<std::uint64_t>(timing.samples)});
+        }
+        return out;
+    });
     if (config.suspects) {
         statistics.set_suspect_lister(
             [weak = std::weak_ptr<detail::SharedState>(shared),
@@ -160,6 +171,7 @@ Runtime::RuntimeState::~RuntimeState() {
     if (statistics_) {
         statistics_->set_device_lister({});
         statistics_->set_suspect_lister({});
+        statistics_->set_server_timing_lister({});
     }
     request_stop();
     {

@@ -175,13 +175,26 @@ std::optional<MaskingResolver::ServerProfile> MaskingResolver::server_profile(
     return found->second.profile;
 }
 
+std::vector<std::pair<std::string, ServerTiming>> MaskingResolver::server_timings() {
+    std::vector<std::pair<std::string, ServerTiming>> out;
+    const std::lock_guard lock{mutex_};
+    for (const auto& [name, probe] : probes_) {
+        if (probe.profile && probe.profile->timing) out.emplace_back(name, *probe.profile->timing);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return out;
+}
+
 std::optional<MaskingResolver::ServerProfile> MaskingResolver::probe_profile(
-    const std::string& address, std::uint16_t port, const std::string& name) {
-    ServerProfile profile{protocol::kServerFlightMax, 0, 0, false, false};
+    const std::string& address, std::uint16_t port, const std::string& name,
+    std::vector<std::chrono::microseconds>& processing) {
+    ServerProfile profile{protocol::kServerFlightMax, 0, 0, false, false, std::nullopt};
     for (std::size_t i = 0; i < kServerFlightSamples; ++i) {
         const auto sample = probe_server(address, port, name, kServerFlightProbeTimeout,
                                          [this] { return cancel_.load(); });
         if (!sample) return std::nullopt;
+        if (sample->processing) processing.push_back(*sample->processing);
         profile.min = std::min(profile.min, sample->flight);
         profile.max = std::max(profile.max, sample->flight);
         if (i == 0) {
@@ -211,9 +224,12 @@ void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::s
     }
     lock.unlock();
     std::optional<ServerProfile> profile;
+    std::vector<std::chrono::microseconds> processing;
     try {
-        profile = probe_profile(address, port, name);
+        processing.reserve(kServerFlightSamples);
+        profile = probe_profile(address, port, name, processing);
     } catch (...) {
+        profile.reset();
     }
     lock.lock();
     const auto found = probes_.find(name);
@@ -221,6 +237,10 @@ void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::s
     auto& probe = found->second;
     const auto now = Clock::now();
     if (profile) {
+        // Timings of a failed probe are dropped with it: a handshake cut
+        // short says nothing reliable about the server's processing.
+        for (const auto sample : processing) probe.timing.add(sample);
+        profile->timing = probe.timing.summary();
         probe.profile = profile;
         probe.backoff = {};
         probe.next_attempt = now + kServerFlightRefresh + random_below(kServerFlightProbeJitter);
@@ -298,7 +318,7 @@ void MaskingResolver::run() {
                 const auto delay = probe_delay_ ? *probe_delay_
                                                 : kServerFlightProbeDelayMin +
                                                       random_below(kServerFlightProbeJitter);
-                probes_.emplace(name, Probe{now + delay, {}, {}});
+                probes_.emplace(name, Probe{now + delay, {}, {}, {}});
             }
         }
         std::string due;

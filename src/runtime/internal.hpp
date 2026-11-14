@@ -366,7 +366,60 @@ struct ServerProbe {
     bool key_share_first{false};  // key_share(51) before supported_versions(43)
     PqAnswer pq{PqAnswer::unknown};
     bool retried{false};  // the server sent a HelloRetryRequest first
+    // Timing of this handshake: TCP connect start -> connected, and the last
+    // ClientHello fully written -> first byte of the answer to it (the
+    // ServerHello; after a HelloRetryRequest, the answer to the second
+    // ClientHello). `processing` is server_processing_time() of the two.
+    std::chrono::microseconds connect_rtt{0};
+    std::optional<std::chrono::microseconds> hello_latency;
+    std::optional<std::chrono::microseconds> processing;
 };
+
+// The real server's own processing time before its ServerHello: the
+// ClientHello -> ServerHello latency already contains one network round trip,
+// which the TCP connect measured; the rest is the server's work (key
+// exchange, certificate selection, signature). Clamped at 0, as a noisy RTT
+// can exceed the latency.
+std::chrono::microseconds server_processing_time(std::chrono::microseconds connect_rtt,
+                                                 std::chrono::microseconds hello_latency);
+
+// Summary of the recent processing-time samples of one domain.
+struct ServerTiming {
+    std::chrono::microseconds low{0};     // p25
+    std::chrono::microseconds median{0};  // p50
+    std::chrono::microseconds high{0};    // p75
+    std::size_t samples{0};
+};
+
+// The last kCapacity processing-time samples of one domain (oldest replaced
+// first); quantiles interpolate linearly between the sorted samples.
+class ServerTimingHistory {
+public:
+    static constexpr std::size_t kCapacity = 8;
+    void add(std::chrono::microseconds sample) noexcept;
+    std::size_t size() const noexcept { return size_; }
+    // nullopt while empty.
+    std::optional<ServerTiming> summary() const;
+
+private:
+    std::array<std::chrono::microseconds, kCapacity> samples_{};
+    std::size_t next_{0};
+    std::size_t size_{0};
+};
+
+// How long one FakeTLS ServerHello is held. Manual bounds above 0 win: a
+// uniform millisecond draw from [server_hello_delay_min, _max]. Otherwise,
+// with server_hello_delay_auto and a measured `timing`, a uniform microsecond
+// draw from its [low, high], both capped at Config::kMaxAutoServerHelloDelay
+// (`automatic` is then set, also when the draw is 0). Otherwise no delay.
+// `draw` is a uniform 32-bit random value.
+struct ServerHelloDelayChoice {
+    std::chrono::microseconds delay{0};
+    bool automatic{false};
+};
+ServerHelloDelayChoice pick_server_hello_delay(const Config& config,
+                                               const std::optional<ServerTiming>& timing,
+                                               std::uint32_t draw) noexcept;
 
 // One bounded TLS 1.3 handshake with address:port (SNI `server_name`) that
 // offers what the Telegram client offers where it shapes the answer: the
@@ -433,8 +486,13 @@ public:
         // Answers a classical group although X25519MLKEM768 is offered
         // (FakeTLS then answers X25519, its only classical shape).
         bool decline_pq{false};
+        // Processing time over the domain's last ServerTimingHistory samples
+        // (successful probes only); nullopt until one probe succeeded.
+        std::optional<ServerTiming> timing;
     };
     std::optional<ServerProfile> server_profile(std::string_view domain);
+    // Every probed domain with a measured processing time, for metrics.
+    std::vector<std::pair<std::string, ServerTiming>> server_timings();
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -447,6 +505,7 @@ private:
         Clock::time_point next_attempt;
         std::chrono::milliseconds backoff;
         std::optional<ServerProfile> profile;  // last good measurement
+        ServerTimingHistory timing;            // successful probes only
     };
     struct Names {
         std::vector<std::string> resolve;
@@ -457,8 +516,10 @@ private:
     // Thread only: the configured names, or nullopt when unchanged.
     std::optional<Names> configured_names();
     // Thread only: kServerFlightSamples handshakes; nullopt if any fails.
+    // `processing` receives the processing time of each handshake.
     std::optional<ServerProfile> probe_profile(const std::string& address, std::uint16_t port,
-                                               const std::string& name);
+                                               const std::string& name,
+                                               std::vector<std::chrono::microseconds>& processing);
     // Thread only, `lock` held on entry and on return (released while the
     // due probe of `name` runs); reschedules it.
     void run_probe(std::unique_lock<std::mutex>& lock, const std::string& name);
@@ -1755,8 +1816,10 @@ struct Runtime::Impl {
                           Time now);
     void feed_client_tls(Client& client, std::span<const std::uint8_t> wire, Time now);
     void client_tls_ready(Client& client, Time now);
-    // A uniform draw from [server_hello_delay_min, server_hello_delay_max].
-    std::chrono::milliseconds server_hello_delay();
+    // pick_server_hello_delay() with a fresh random draw (none when no delay
+    // is possible).
+    detail::ServerHelloDelayChoice server_hello_delay(
+        const std::optional<detail::ServerTiming>& timing);
     // The server_hello_delay deadline: sends the held ServerHello and starts
     // the handshake deadline.
     void release_server_hello(Client& client, Time now);
