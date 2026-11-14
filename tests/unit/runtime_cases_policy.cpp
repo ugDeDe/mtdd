@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 
 #include <atomic>
+#include <set>
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -1225,4 +1226,80 @@ TEST(DeviceTable, AdmitAndReleaseStayCheapWithManyKeys) {
     EXPECT_EQ(devices.connected, 20000U);
     // 40k operations; a full scan per operation took tens of seconds here.
     EXPECT_LT(elapsed, 2s);
+}
+
+// The periodic prune and list() hold the mutex every reactor's admit/release
+// takes: with a shared user they must not walk all keys still in the window.
+TEST(DeviceTable, PruneCostsOnlyExpiredKeysWithManyIdleKeys) {
+    mtdd::detail::DeviceTable table;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({10, 0, 0, 7}, 4000);
+    mtdd::detail::DeviceTable::Count devices;
+    constexpr std::uint64_t kKeys = 50000;
+    for (std::uint64_t key = 1; key <= kKeys; ++key) {
+        const auto at = t0 + std::chrono::milliseconds(key);  // released over 50 s
+        (void)table.admit("pool", 2, key, peer, mtdd::detail::Platform::android, 0, at, 900s, devices);
+        table.release("pool", 2, key, at, 900s, devices);
+    }
+    std::vector<std::pair<std::string, mtdd::detail::DeviceTable::Count>> counts;
+    const auto started = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 20000; ++pass) table.prune(t0 + 60s, 900s, counts);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_EQ(counts.size(), 1U);
+    EXPECT_EQ(counts[0].second.recent, kKeys);
+    EXPECT_EQ(counts[0].second.connected, 0U);
+    // A full walk of 50k keys per pass would take seconds for 20k passes.
+    EXPECT_LT(elapsed, 1s);
+    // Keys expire oldest first: 900 s + 25 s after t0 half of them are gone.
+    table.prune(t0 + 900s + 25s, 900s, counts);
+    ASSERT_EQ(counts.size(), 1U);
+    EXPECT_EQ(counts[0].second.recent, kKeys - 25000U + 1U);
+    table.prune(t0 + 1000s, 900s, counts);
+    EXPECT_EQ(counts[0].second.recent, 0U);
+    table.prune(t0 + 1000s, 900s, counts);
+    EXPECT_TRUE(counts.empty());
+}
+
+TEST(DeviceTable, LimitDisplacesLeastRecentlySeenIdleKeyAndReusedKeyStaysYoung) {
+    mtdd::detail::DeviceTable table;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto peer = mtdd::protocol::Endpoint::v4({10, 0, 0, 7}, 4000);
+    constexpr auto kPlatform = mtdd::detail::Platform::android;
+    using Admit = mtdd::detail::DeviceTable::Admit;
+    mtdd::detail::DeviceTable::Count devices;
+    for (std::uint64_t key = 1; key <= 3; ++key) {
+        ASSERT_EQ(table.admit("u", 2, key, peer, kPlatform, 3, t0, 60s, devices), Admit::ok);
+    }
+    table.release("u", 2, 1, t0 + 1s, 60s, devices);
+    table.release("u", 2, 2, t0 + 2s, 60s, devices);
+    table.release("u", 2, 3, t0 + 3s, 60s, devices);
+    // Key 1 reconnects and leaves again: it is now the most recently seen.
+    ASSERT_EQ(table.admit("u", 2, 1, peer, kPlatform, 3, t0 + 4s, 60s, devices), Admit::ok);
+    table.release("u", 2, 1, t0 + 5s, 60s, devices);
+    // A new key displaces key 2 (seen at +2 s), then key 3, then key 1.
+    ASSERT_EQ(table.admit("u", 2, 10, peer, kPlatform, 3, t0 + 6s, 60s, devices), Admit::ok);
+    auto ids = [&] {
+        std::set<std::uint32_t> out;
+        for (const auto& d : table.list("u", t0 + 6s, 60s)) out.insert(d.id);
+        return out;
+    };
+    const auto tag = [](std::uint64_t key) {
+        return static_cast<std::uint32_t>((key * 0x9E3779B97F4A7C15ULL) >> 32);
+    };
+    EXPECT_EQ(ids(), (std::set<std::uint32_t>{tag(1), tag(3), tag(10)}));
+    ASSERT_EQ(table.admit("u", 2, 11, peer, kPlatform, 3, t0 + 7s, 60s, devices), Admit::ok);
+    ASSERT_EQ(table.admit("u", 2, 12, peer, kPlatform, 3, t0 + 8s, 60s, devices), Admit::ok);
+    EXPECT_EQ(ids(), (std::set<std::uint32_t>{tag(10), tag(11), tag(12)}));
+    // All three are open: no idle key to give way.
+    EXPECT_EQ(table.admit("u", 2, 13, peer, kPlatform, 3, t0 + 9s, 60s, devices), Admit::limit);
+    EXPECT_EQ(devices.recent, 3U);
+    EXPECT_EQ(devices.connected, 3U);
+    // Expired idle keys do not hold a slot at admit time, without a prune.
+    table.release("u", 2, 10, t0 + 10s, 60s, devices);
+    table.release("u", 2, 11, t0 + 10s, 60s, devices);
+    ASSERT_EQ(table.admit("u", 2, 13, peer, kPlatform, 1, t0 + 100s, 60s, devices), Admit::limit);
+    table.release("u", 2, 12, t0 + 100s, 60s, devices);
+    EXPECT_EQ(table.admit("u", 2, 13, peer, kPlatform, 1, t0 + 101s, 60s, devices), Admit::ok);
+    EXPECT_EQ(devices.recent, 1U);
+    EXPECT_EQ(devices.connected, 1U);
 }

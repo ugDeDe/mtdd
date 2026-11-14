@@ -12,42 +12,52 @@
 namespace mtdd {
 namespace detail {
 
-void DeviceTable::account(UserKeys& user, std::int16_t dc, const Entry& entry, bool add) {
-    Count& count = user.per_dc[dc];
-    if (add) {
-        ++count.recent;
-        if (entry.open != 0) ++count.connected;
-        return;
+void DeviceTable::erase_key(UserKeys& user, Keys::iterator it) {
+    PerDc& dc = user.per_dc[it->first.dc];
+    if (dc.count.recent > 0) --dc.count.recent;
+    if (it->second.open != 0) {
+        if (dc.count.connected > 0) --dc.count.connected;
+    } else {
+        dc.idle.erase(it->second.idle);
     }
-    if (count.recent > 0) --count.recent;
-    if (entry.open != 0 && count.connected > 0) --count.connected;
-    if (count.recent == 0 && count.connected == 0) user.per_dc.erase(dc);
+    user.keys.erase(it);
 }
 
-void DeviceTable::erase_key(UserKeys& user, Keys::iterator it) {
-    account(user, it->first.dc, it->second, false);
-    user.keys.erase(it);
+void DeviceTable::expire(UserKeys& user, PerDc& dc, Clock::time_point now,
+                         std::chrono::seconds window) {
+    // Oldest first: stop at the first idle key still inside the window. A key
+    // released by another reactor a few microseconds "earlier" may sit behind
+    // a newer one; it then expires on a later pass.
+    while (!dc.idle.empty()) {
+        const auto it = user.keys.find(dc.idle.front());
+        if (it == user.keys.end()) {  // never happens; keep the list consistent
+            dc.idle.pop_front();
+            continue;
+        }
+        if (now - it->second.last <= window) break;
+        erase_key(user, it);
+    }
 }
 
 DeviceTable::Count DeviceTable::total(const UserKeys& user) {
     Count devices;
-    for (const auto& [dc, count] : user.per_dc) {
+    for (const auto& [dc, entry] : user.per_dc) {
         (void)dc;
-        devices.recent = std::max(devices.recent, count.recent);
-        devices.connected = std::max(devices.connected, count.connected);
+        devices.recent = std::max(devices.recent, entry.count.recent);
+        devices.connected = std::max(devices.connected, entry.count.connected);
     }
     return devices;
 }
 
 DeviceTable::Count DeviceTable::prune_locked(UserKeys& user, Clock::time_point now,
                                              std::chrono::seconds window) {
-    for (auto it = user.keys.begin(); it != user.keys.end();) {
-        if (it->second.open == 0 && now - it->second.last > window) {
-            auto expired = it++;
-            erase_key(user, expired);
-            continue;
+    for (auto it = user.per_dc.begin(); it != user.per_dc.end();) {
+        expire(user, it->second, now, window);
+        if (it->second.count.recent == 0) {
+            it = user.per_dc.erase(it);
+        } else {
+            ++it;
         }
-        ++it;
     }
     return total(user);
 }
@@ -59,9 +69,13 @@ DeviceTable::Admit DeviceTable::admit(const std::string& user_name, std::int16_t
                                       Count& devices) {
     std::lock_guard<std::mutex> lock(mutex_);
     UserKeys& user = users_[user_name];
+    PerDc& on_dc = user.per_dc[dc];
     const Key id{key, dc};
     if (const auto found = user.keys.find(id); found != user.keys.end()) {
-        if (found->second.open++ == 0) ++user.per_dc[dc].connected;
+        if (found->second.open++ == 0) {
+            on_dc.idle.erase(found->second.idle);
+            ++on_dc.count.connected;
+        }
         found->second.last = now;
         found->second.peer = peer;
         if (platform != Platform::undefined) found->second.platform = platform;
@@ -70,39 +84,22 @@ DeviceTable::Admit DeviceTable::admit(const std::string& user_name, std::int16_t
     }
     if (max_devices != 0) {
         // The limit counts keys of this DC within the window: expired idle
-        // keys found on the way are dropped, so they never hold a slot.
-        std::uint64_t on_dc = 0;
-        auto idle = user.keys.end();
-        for (auto it = user.keys.begin(); it != user.keys.end();) {
-            if (it->first.dc != dc) {
-                ++it;
-                continue;
-            }
-            if (it->second.open == 0 && now - it->second.last > window) {
-                auto expired = it++;
-                erase_key(user, expired);
-                continue;
-            }
-            ++on_dc;
-            if (it->second.open == 0 && (idle == user.keys.end() || it->second.last < idle->second.last)) {
-                idle = it;
-            }
-            ++it;
-        }
-        if (on_dc >= max_devices) {
+        // keys are dropped first, so they never hold a slot.
+        expire(user, on_dc, now, window);
+        if (on_dc.count.recent >= max_devices) {
             // Only devices with an open connection hold a slot: the least
             // recently seen idle key gives way (a switched device, or the
             // previous temporary key of the same one).
-            if (idle == user.keys.end()) {
+            if (on_dc.idle.empty()) {
                 devices = total(user);
                 return Admit::limit;
             }
-            erase_key(user, idle);
+            erase_key(user, user.keys.find(on_dc.idle.front()));
         }
     }
-    const Entry entry{1, now, peer, platform};
-    user.keys.emplace(id, entry);
-    account(user, dc, entry, true);
+    user.keys.emplace(id, Entry{1, now, peer, platform, {}});
+    ++on_dc.count.recent;
+    ++on_dc.count.connected;
     devices = total(user);
     return Admit::ok;
 }
@@ -119,11 +116,18 @@ void DeviceTable::release(const std::string& user_name, std::int16_t dc, std::ui
     }
     UserKeys& user = user_it->second;
     if (const auto found = user.keys.find(Key{key, dc}); found != user.keys.end()) {
-        if (found->second.open > 0 && --found->second.open == 0) {
-            Count& count = user.per_dc[dc];
-            if (count.connected > 0) --count.connected;
+        Entry& entry = found->second;
+        PerDc& on_dc = user.per_dc[dc];
+        if (entry.open > 0) {
+            if (--entry.open == 0) {
+                if (on_dc.count.connected > 0) --on_dc.count.connected;
+                entry.idle = on_dc.idle.insert(on_dc.idle.end(), found->first);
+            }
+        } else {
+            // Already idle: seen again now, so it moves to the young end.
+            on_dc.idle.splice(on_dc.idle.end(), on_dc.idle, entry.idle);
         }
-        found->second.last = now;
+        entry.last = now;
     }
     devices = total(user);
 }
@@ -131,30 +135,46 @@ void DeviceTable::release(const std::string& user_name, std::int16_t dc, std::ui
 std::vector<control::Statistics::DeviceInfo> DeviceTable::list(const std::string& user,
                                                                Clock::time_point now,
                                                                std::chrono::seconds window) {
+    struct Row {
+        Key id;
+        std::uint32_t open;
+        Clock::time_point last;
+        protocol::Endpoint peer;
+        Platform platform;
+    };
+    std::vector<Row> rows;
+    {
+        // Copy under the lock, format after it: a shared user may list tens of
+        // thousands of keys, and every reactor's admit/release waits here.
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = users_.find(user);
+        if (found == users_.end()) return {};
+        prune_locked(found->second, now, window);
+        rows.reserve(found->second.keys.size());
+        for (const auto& [id, entry] : found->second.keys) {
+            rows.push_back(Row{id, entry.open, entry.last, entry.peer, entry.platform});
+        }
+    }
     std::vector<control::Statistics::DeviceInfo> out;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = users_.find(user);
-    if (found == users_.end()) return out;
-    prune_locked(found->second, now, window);
-    out.reserve(found->second.keys.size());
-    for (const auto& [id, entry] : found->second.keys) {
+    out.reserve(rows.size());
+    for (const Row& row : rows) {
         control::Statistics::DeviceInfo info;
         // A short stable tag, not the key itself.
-        info.id = static_cast<std::uint32_t>((id.auth_key_id * 0x9E3779B97F4A7C15ULL) >> 32);
-        info.dc = id.dc;
-        info.connections = entry.open;
+        info.id = static_cast<std::uint32_t>((row.id.auth_key_id * 0x9E3779B97F4A7C15ULL) >> 32);
+        info.dc = row.id.dc;
+        info.connections = row.open;
         info.idle_seconds =
-            entry.open != 0
+            row.open != 0
                 ? 0
-                : std::chrono::duration_cast<std::chrono::seconds>(now - entry.last).count();
+                : std::chrono::duration_cast<std::chrono::seconds>(now - row.last).count();
         char text[INET6_ADDRSTRLEN] = {};
-        if (entry.peer.ipv6) {
-            ::inet_ntop(AF_INET6, entry.peer.address.data(), text, sizeof(text));
+        if (row.peer.ipv6) {
+            ::inet_ntop(AF_INET6, row.peer.address.data(), text, sizeof(text));
         } else {
-            ::inet_ntop(AF_INET, entry.peer.address.data(), text, sizeof(text));
+            ::inet_ntop(AF_INET, row.peer.address.data(), text, sizeof(text));
         }
         info.ip = text;
-        info.platform = platform_name(entry.platform);
+        info.platform = platform_name(row.platform);
         out.push_back(std::move(info));
     }
     return out;

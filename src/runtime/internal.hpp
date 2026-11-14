@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1059,24 +1060,36 @@ private:
                                              0x9e3779b97f4a7c15ULL));
         }
     };
+    // Idle keys (no open connection) of one user on one DC, least recently
+    // seen first: a key is appended when its last connection closes, so the
+    // list is ordered by Entry::last up to the clock skew between reactors.
+    using IdleList = std::list<Key>;
     struct Entry {
         std::uint32_t open{0};
         Clock::time_point last{};
         protocol::Endpoint peer{};
         Platform platform{Platform::undefined};
+        IdleList::iterator idle{};  // valid only while open == 0
     };
     using Keys = std::unordered_map<Key, Entry, KeyHash>;
+    struct PerDc {
+        Count count;
+        IdleList idle;
+    };
     // Keys of one user plus per-DC counts kept incrementally: admit/release
     // run on every connection and must not scan all keys of the user (a
-    // shared pool user holds tens of thousands of them). Expired idle keys
-    // are dropped by the periodic prune() (and list()); between prunes the
-    // "recent" count may still include keys expired since the last pass.
+    // shared pool user holds tens of thousands of them). Expiry pops only the
+    // expired head of each idle list, so prune(), list() and admit() at the
+    // limit cost O(expired keys), never O(keys), under the shared mutex.
+    // Between prunes the "recent" count may still include keys expired since
+    // the last pass.
     struct UserKeys {
         Keys keys;
-        std::unordered_map<std::int16_t, Count> per_dc;
+        std::unordered_map<std::int16_t, PerDc> per_dc;
     };
-    static void account(UserKeys& user, std::int16_t dc, const Entry& entry, bool add);
     static void erase_key(UserKeys& user, Keys::iterator it);
+    static void expire(UserKeys& user, PerDc& dc, Clock::time_point now,
+                       std::chrono::seconds window);
     static Count total(const UserKeys& user);
     static Count prune_locked(UserKeys& user, Clock::time_point now, std::chrono::seconds window);
 
