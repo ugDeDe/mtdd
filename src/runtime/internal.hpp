@@ -2017,6 +2017,14 @@ struct Runtime::Impl {
     // Encoded client request bytes into `out` (overflow into `frames`)
     // without a socket write; false on an allocation failure.
     bool stage_me_bytes(MeConn& me, std::span<const std::uint8_t> bytes);
+    // RPC_CLOSE_CONN for one logical connection, staged like a request and
+    // written by flush_pending_me(): a burst of closes on one ME socket costs
+    // one sendmsg, not one each. `skipped`: nothing was encoded (no room for
+    // the frame, or the session is not ready); `failed`: seq/CBC advanced but
+    // the frame was lost, so the shared session must be failed.
+    enum class MeCloseStage : std::uint8_t { staged, skipped, failed };
+    MeCloseStage stage_me_close(MeConn& me, const detail::ConnId& conn_id,
+                                bool fail_after_encode_for_test = false);
     void schedule_me_flush(MeConn& me);
     void flush_pending_me(Time now);
     void pump_me_ready_queue(MeConn& me, Time now);
@@ -2176,6 +2184,9 @@ struct Runtime::Impl {
     std::vector<protocol::TransportDecoder::Message> decoded_messages_;
     // Reused output of encode_client_message (no allocation per request).
     std::vector<std::uint8_t> me_encode_buffer_;
+    // Reused output of encode_close (separate: a close can happen while
+    // me_encode_buffer_ still holds a request being staged).
+    std::vector<std::uint8_t> me_close_buffer_;
     // ME connections with staged, not yet written requests (by token: a
     // connection can be retired mid-iteration).
     std::vector<std::uint64_t> me_flush_tokens_;

@@ -861,6 +861,9 @@ void Runtime::Impl::update_listener_interest() {
 }
 
 int Runtime::Impl::wait_timeout_ms(Time now) const {
+    // Frames staged after flush_pending_me()'s last round (a close inside it)
+    // have no EPOLLOUT armed: poll so the next iteration writes them.
+    if (!me_flush_tokens_.empty()) return 0;
     Time limit = now + std::chrono::milliseconds(250);
     if (next_poll_ < limit) limit = next_poll_;
     if (next_gauge_ < limit) limit = next_gauge_;

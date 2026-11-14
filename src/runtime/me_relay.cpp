@@ -155,6 +155,34 @@ bool Runtime::Impl::stage_me_bytes(MeConn& me, std::span<const std::uint8_t> byt
     return true;
 }
 
+Runtime::Impl::MeCloseStage Runtime::Impl::stage_me_close(MeConn& me,
+                                                           const detail::ConnId& conn_id,
+                                                           bool fail_after_encode_for_test) {
+    if (!me.session || me.state != MeConn::State::ready || !me.out) return MeCloseStage::skipped;
+    // encode_close() advances write_seq/CBC, so the frame size is admitted
+    // BEFORE encoding: a frame that cannot be staged is skipped instead of
+    // desynchronising the shared ME stream.
+    if (me.frame_bytes + detail::kEncodedCloseFrameBytes > me_frame_capacity()) {
+        return MeCloseStage::skipped;
+    }
+    me_close_buffer_.clear();
+    try {
+        if (me.session->encode_close(conn_id, me_close_buffer_) != protocol::Status::Ok) {
+            return MeCloseStage::skipped;
+        }
+    } catch (const std::exception&) {
+        return MeCloseStage::failed;  // seq/CBC may already have advanced
+    }
+    // Same FIFO as the requests: bytes join `out` behind everything encoded
+    // before them, so the ME sees the stream in encode order.
+    if (fail_after_encode_for_test || !stage_me_bytes(me, me_close_buffer_)) {
+        return MeCloseStage::failed;
+    }
+    reaccount(me);
+    schedule_me_flush(me);
+    return MeCloseStage::staged;
+}
+
 void Runtime::Impl::schedule_me_flush(MeConn& me) {
     if (me.flush_pending) return;
     try {

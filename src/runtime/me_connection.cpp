@@ -485,24 +485,19 @@ void Runtime::Impl::flush_remote_closes(MeConn& me) {
     // keeps write_seq/CBC atomic: encode_close advances both while encoding.
     std::vector<detail::ConnId> pending;
     me.remote_close.consume(pending);
+    // Staged, not written one by one: the whole feedback batch leaves in the
+    // flush before the next epoll_wait.
     for (const auto& id : pending) {
-        if (me.frame_bytes + detail::kEncodedCloseFrameBytes > me_frame_capacity()) {
-            // No capacity: drop the optional feedback before touching seq/CBC.
+        const auto staged =
+            stage_me_close(me, id, detail::consume_remote_close_push_failure_for_test());
+        if (staged == MeCloseStage::skipped) {
+            // No capacity (or no ready session): drop the optional feedback
+            // before touching seq/CBC.
             return;
         }
-        std::vector<std::uint8_t> frame;
-        try {
-            if (me.session->encode_close(id, frame) != protocol::Status::Ok) continue;
-        } catch (const std::exception&) {
-            // seq/CBC may already have advanced; the shared session cannot be
-            // kept alive with a gap.
-            defer_me_failure(me);
-            return;
-        }
-        // Any post-encode loss also desynchronises seq/CBC: fail the session
-        // instead of dropping the frame and continuing.
-        if (detail::consume_remote_close_push_failure_for_test() ||
-            !push_me_frame(me, std::move(frame))) {
+        if (staged == MeCloseStage::failed) {
+            // seq/CBC advanced but the frame is lost; the shared session
+            // cannot be kept alive with a gap.
             defer_me_failure(me);
             return;
         }

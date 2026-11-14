@@ -455,24 +455,10 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     MeConn* const bound_me = client.me;
     if (bound_me != nullptr && bound_me->session &&
         bound_me->state == MeConn::State::ready) {
-        // Best-effort per-logical close. It must not close the shared transport.
-        // encode_close() advances write_seq/CBC, so the frame size is admitted
-        // BEFORE encoding: a frame that cannot be staged is skipped instead of
-        // desynchronising the shared ME stream.
-        if (bound_me->frame_bytes + detail::kEncodedCloseFrameBytes <=
-            me_frame_capacity()) {
-            std::vector<std::uint8_t> frame;
-            try {
-                if (bound_me->session->encode_close(client.conn_id, frame) ==
-                    protocol::Status::Ok) {
-                    // Any post-encode loss desynchronises seq/CBC.
-                    if (!push_me_frame(*bound_me, std::move(frame))) {
-                        defer_me_failure(*bound_me);
-                    }
-                }
-            } catch (const std::exception&) {
-                defer_me_failure(*bound_me);
-            }
+        // Best-effort per-logical close. It must not close the shared transport;
+        // it is written together with the other frames of this iteration.
+        if (stage_me_close(*bound_me, client.conn_id) == MeCloseStage::failed) {
+            defer_me_failure(*bound_me);  // any post-encode loss desynchronises seq/CBC
         }
     }
     release_device(client, Clock::now());

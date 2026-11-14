@@ -181,6 +181,7 @@ struct ReadyMe {
     Bytes handshake_request_enc;
     Bytes handshake_answer_enc;
     std::unique_ptr<crypto::AesCbc> read_enc;
+    std::unique_ptr<crypto::AesCbc> write_dec;  // proxy -> ME, after the handshake request
 };
 
 ReadyMe make_ready_config(MiddleEndConfig cfg) {
@@ -206,6 +207,8 @@ ReadyMe make_ready_config(MiddleEndConfig cfg) {
     }
     out.read_enc =
         std::make_unique<crypto::AesCbc>(k.read_key, last_block(out.handshake_answer_enc));
+    out.write_dec =
+        std::make_unique<crypto::AesCbc>(k.write_key, last_block(out.handshake_request_enc));
     return out;
 }
 
@@ -274,6 +277,70 @@ TEST(MeAudit, NormalCloseMustNotLoseAdvancedCbcFrame) {
     test.reactor->close_client(12345);
     EXPECT_TRUE(me.failure_deferred || me.session->write_seq() == seq_before)
         << "CBC/seq advanced but the close frame was discarded";
+}
+
+// Logical closes are staged like requests: a burst of closes on one shared ME
+// socket leaves in one write before the next epoll_wait, as one in-order,
+// seq/CBC-continuous stream the ME decodes frame by frame.
+TEST(MeAudit, LogicalClosesAreBatchedIntoOneWriteInEncodeOrder) {
+    AuditReactor test("close-batch");
+    auto ready = make_ready();
+    mtdd::Runtime::Impl::MeConn me;
+    me.dc = 2;
+    me.state = mtdd::Runtime::Impl::MeConn::State::ready;
+    me.session = std::move(ready.session);
+    me.out.emplace(test.config.connection_queue_bytes);
+    me.token = test.reactor->add_target({mtdd::Runtime::Impl::Kind::me, &me});
+    test.reactor->me_by_token_[me.token] = &me;
+    int sockets[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    me.fd.reset(sockets[0]);
+    mtdd::io::UniqueFd peer(sockets[1]);
+
+    constexpr int kClients = 3;
+    const std::int32_t seq_before = me.session->write_seq();
+    for (int i = 0; i < kClients; ++i) {
+        auto client = std::make_unique<mtdd::Runtime::Impl::Client>();
+        client->token = 5000U + static_cast<std::uint64_t>(i);
+        client->me = &me;
+        client->conn_id.fill(static_cast<std::uint8_t>(0x40 + i));
+        test.reactor->clients_.emplace(client->token, std::move(client));
+    }
+    for (int i = 0; i < kClients; ++i) {
+        test.reactor->close_client(5000U + static_cast<std::uint64_t>(i));
+    }
+    ASSERT_FALSE(me.failure_deferred);
+    ASSERT_EQ(me.session->write_seq(), seq_before + kClients);
+    std::array<std::uint8_t, 512> wire{};
+    EXPECT_LT(::recv(peer.get(), wire.data(), wire.size(), MSG_DONTWAIT), 0)
+        << "a close was written on its own instead of with the batch";
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    EXPECT_EQ(test.reactor->wait_timeout_ms(now), 0) << "staged closes must not wait in epoll";
+
+    test.reactor->flush_pending_me(now);
+    const ssize_t got = ::recv(peer.get(), wire.data(), wire.size(), MSG_DONTWAIT);
+    ASSERT_EQ(got, static_cast<ssize_t>(kClients * mtdd::detail::kEncodedCloseFrameBytes));
+    Bytes stream(wire.begin(), wire.begin() + got);
+    ready.write_dec->decrypt(stream);
+    const auto rd32 = [&](std::size_t at) {
+        return static_cast<std::uint32_t>(stream[at]) |
+               static_cast<std::uint32_t>(stream[at + 1]) << 8 |
+               static_cast<std::uint32_t>(stream[at + 2]) << 16 |
+               static_cast<std::uint32_t>(stream[at + 3]) << 24;
+    };
+    for (int i = 0; i < kClients; ++i) {
+        const std::size_t at = static_cast<std::size_t>(i) * mtdd::detail::kEncodedCloseFrameBytes;
+        EXPECT_EQ(rd32(at), 24U) << "frame " << i;
+        EXPECT_EQ(static_cast<std::int32_t>(rd32(at + 4)), seq_before + i) << "frame " << i;
+        EXPECT_EQ(rd32(at + 8), 0x1fcf425dU) << "frame " << i;  // RPC_CLOSE_CONN
+        for (std::size_t b = 0; b < 8; ++b) {
+            EXPECT_EQ(stream[at + 12 + b], 0x40 + i) << "frame " << i << " conn id byte " << b;
+        }
+    }
+    EXPECT_TRUE(me.out->empty());
+    EXPECT_TRUE(test.reactor->me_flush_tokens_.empty());
+    test.reactor->me_by_token_.erase(me.token);
+    test.reactor->remove_target(me.token);
 }
 
 TEST(MeAudit, MeFinMustReadPendingPayloadBeforeFailure) {
