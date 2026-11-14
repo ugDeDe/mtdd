@@ -239,43 +239,56 @@ TEST(ReplayHello, ReplayWithoutMaskingIsClosedAsBefore) {
     EXPECT_FALSE(first.wait_closed_for(100));
 }
 
-TEST(ReplayHello, SaturatedReplayCacheWithMaskingIsMasked) {
-    ReplayCapacityScope capacity(1);
+// Behaviour change: a full replay cache no longer refuses new handshakes
+// (formerly reason="overload" reported as replay). The soonest-expiring entry
+// of the full bucket is evicted and counted; replays of held hellos are still
+// refused.
+TEST(ReplayHello, FullReplayCacheEvictsInsteadOfRefusingWithMasking) {
+    ReplayCapacityScope capacity(1);  // a single bucket
     EchoBackend echo;
     SkewMaskingScope scope(echo.port());
     Daemon daemon(1, false, masking_on);
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
-    TestClient first(daemon.port(), secret_bytes());
-    ASSERT_TRUE(first.valid());
-    ASSERT_TRUE(first.send_hello(0, 9));
-
-    // A distinct, valid hello: the cache is full, so it is refused as replay.
-    expect_masked_verbatim(daemon, hello_skewed(0, 10));
-    EXPECT_GE(echo.accepted(), 1U);
+    const auto slots = static_cast<std::uint8_t>(mtdd::detail::kReplayBucketSlots);
+    std::vector<std::unique_ptr<TestClient>> clients;
+    for (std::uint8_t i = 0; i <= slots; ++i) {
+        clients.push_back(std::make_unique<TestClient>(daemon.port(), secret_bytes()));
+        ASSERT_TRUE(clients.back()->valid());
+        ASSERT_TRUE(clients.back()->send_hello(0, static_cast<std::uint8_t>(20 + i))) << int(i);
+    }
     EXPECT_TRUE(wait_for(
-        [&] { return stat_counter(daemon.services.stats, "handshakes", "replay") >= 1U; },
+        [&] { return daemon.services.stats.snapshot().replay_cache_evicted_total >= 1U; },
         3000ms));
-    EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "failure"), 0U);
-    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "overload"), 1U);
-    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "auth_failed"), 0U);
-    EXPECT_EQ(replay_rejections(daemon), 1U);
+    EXPECT_EQ(daemon.services.stats.snapshot().replay_cache_evicted_total, 1U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "replay"), 0U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "overload"), 0U);
+    EXPECT_EQ(replay_rejections(daemon), 0U);
     EXPECT_EQ(suspect_count(daemon, SuspectSignal::junk), 0U);
-    EXPECT_FALSE(first.wait_closed_for(100));
+    // The newest hello is still held: its replay is masked and counted.
+    expect_masked_verbatim(daemon, clients.back()->hello_bytes());
+    EXPECT_TRUE(wait_for([&] { return replay_rejections(daemon) == 1U; }, 3000ms));
+    EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "replay"), 1U);
+    EXPECT_FALSE(clients.back()->wait_closed_for(100));
 }
 
-TEST(ReplayHello, SaturatedReplayCacheWithoutMaskingIsClosedAsBefore) {
+TEST(ReplayHello, FullReplayCacheEvictsInsteadOfRefusingWithoutMasking) {
     ReplayCapacityScope capacity(1);
     Daemon daemon(1, false);
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
-    TestClient first(daemon.port(), secret_bytes());
-    ASSERT_TRUE(first.valid());
-    ASSERT_TRUE(first.send_hello(0, 11));
-    expect_closed_without_data(daemon, hello_skewed(0, 12));
+    const auto slots = static_cast<std::uint8_t>(mtdd::detail::kReplayBucketSlots);
+    std::vector<std::unique_ptr<TestClient>> clients;
+    for (std::uint8_t i = 0; i <= slots + 1; ++i) {
+        clients.push_back(std::make_unique<TestClient>(daemon.port(), secret_bytes()));
+        ASSERT_TRUE(clients.back()->valid());
+        ASSERT_TRUE(clients.back()->send_hello(0, static_cast<std::uint8_t>(40 + i))) << int(i);
+    }
     EXPECT_TRUE(wait_for(
-        [&] { return stat_counter(daemon.services.stats, "rejected", "overload") >= 1U; },
+        [&] { return daemon.services.stats.snapshot().replay_cache_evicted_total >= 2U; },
         3000ms));
-    EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "replay"), 1U);
-    EXPECT_EQ(replay_rejections(daemon), 1U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "overload"), 0U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "replay"), 0U);
+    const auto metrics = daemon.services.stats.prometheus_text();
+    EXPECT_NE(metrics.find("mtdd_replay_cache_evicted_total 2\n"), std::string::npos);
 }
 
 TEST(ClockSkewHello, SameSkewedHelloTwiceIsAReplay) {

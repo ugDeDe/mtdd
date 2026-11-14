@@ -41,6 +41,25 @@ bool ascii_iequals(std::string_view left, std::string_view right) {
     return true;
 }
 
+// Hello SNI as grouped for the key prefilter: ASCII lowercase, one trailing
+// dot dropped. Writes into `out` to reuse its storage.
+void normalize_sni(std::string_view name, std::string& out) {
+    if (!name.empty() && name.back() == '.') name.remove_suffix(1);
+    out.assign(name);
+    for (auto& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+}
+
+std::uint64_t user_name_hash(std::string_view name) noexcept {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const char c : name) {
+        hash ^= static_cast<std::uint8_t>(c);
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
 int hex_value(char value) {
     if (value >= '0' && value <= '9') return value - '0';
     if (value >= 'a' && value <= 'f') return value - 'a' + 10;
@@ -634,28 +653,19 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // ServerHello bytes are produced or the ClientHello reaches FakeTLS. The
     // cache is shared by all reactors, so a hello observed by one reactor is
     // rejected by every other one.
+    // A full bucket evicts its soonest-expiring entry instead of refusing the
+    // handshake, so a flood of valid hellos cannot lock other users out.
     const auto outcome = shared_->replay.insert(info.canonical_hmac, now);
-    stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
-    if (client.watched && outcome != detail::ReplayCache::Outcome::accepted) {
-        watch_log(client, "auth", "result=replay");
-    }
+    if (outcome == detail::ReplayCache::Outcome::evicted) stats_.replay_cache_evicted();
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
+        if (client.watched) watch_log(client, "auth", "result=replay");
         suspect(client, control::SuspectSignal::junk);
-    }
-    if (outcome == detail::ReplayCache::Outcome::duplicate) {
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
         refuse_replay(control::RejectReason::auth_failed);
         return;
     }
-    if (outcome == detail::ReplayCache::Outcome::saturated) {
-        // The bounded cache never evicts a live entry. New unique handshakes are
-        // rejected at capacity and reported as replay (documented limitation).
-        shared_->replay_rejected_per_worker[worker_index_].fetch_add(
-            1, std::memory_order_relaxed);
-        refuse_replay(control::RejectReason::overload);
-        return;
-    }
+    note_hello_success(client, *user);
 
     if (client.phase != Client::Phase::tls_hello) return;
     if (config_.fingerprint) {
@@ -712,48 +722,219 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (clients_.find(token) != clients_.end()) reaccount(client);
 }
 
+void Runtime::Impl::rebuild_hello_keys(
+    const std::shared_ptr<const control::UserSnapshot>& snapshot) {
+    // Parse and pre-key every enabled secret once per user snapshot, not once
+    // per user for every ClientHello, and group the keys by the SNI they can
+    // authenticate on.
+    hello_keys_.clear();
+    hello_key_ptrs_.clear();
+    hello_key_users_.clear();
+    hello_key_domain_.clear();
+    hello_key_name_.clear();
+    hello_key_dup_first_.clear();
+    hello_key_dup_next_.clear();
+    hello_domain_keys_.clear();
+    hello_any_domain_keys_.clear();
+    hello_key_by_name_.clear();
+    hello_keys_snapshot_.reset();
+    hello_keys_.reserve(snapshot->users.size());
+    std::vector<std::pair<std::array<std::uint8_t, 16>, std::uint32_t>> secrets;
+    secrets.reserve(snapshot->users.size());
+    for (const auto& candidate : snapshot->users) {
+        if (!candidate.enabled) continue;
+        std::array<std::uint8_t, 16> secret{};
+        if (!parse_user_secret(candidate.secret_hex, secret)) continue;
+        const auto index = static_cast<std::uint32_t>(hello_keys_.size());
+        hello_keys_.emplace_back(secret);
+        secrets.emplace_back(secret, index);
+        protocol::crypto::secure_zero(secret);
+        hello_key_users_.push_back(&candidate);
+        // A user with a personal tls_domain authenticates only on that SNI;
+        // the others on the global one (any SNI when none is configured).
+        std::string domain;
+        normalize_sni(candidate.policy.tls_domain.empty() ? config_.tls_domain
+                                                          : candidate.policy.tls_domain,
+                      domain);
+        if (domain.empty()) {
+            hello_any_domain_keys_.push_back(index);
+        } else {
+            hello_domain_keys_[domain].push_back(index);
+        }
+        hello_key_domain_.push_back(std::move(domain));
+        const std::uint64_t name = user_name_hash(candidate.name);
+        hello_key_name_.push_back(name);
+        hello_key_by_name_.emplace(name, index);
+    }
+    for (const auto& key : hello_keys_) hello_key_ptrs_.push_back(&key);
+    // Duplicate secrets: identical keys give identical HMACs, so whichever
+    // copy matched, the winner is the first in snapshot order that may use
+    // the hello's SNI (as when every key was tried in snapshot order).
+    const std::size_t count = hello_keys_.size();
+    hello_key_dup_first_.resize(count);
+    hello_key_dup_next_.assign(count, UINT32_MAX);
+    std::stable_sort(secrets.begin(), secrets.end(),
+                     [](const auto& left, const auto& right) { return left.first < right.first; });
+    for (std::size_t i = 0; i < secrets.size(); ++i) {
+        const bool same = i > 0 && secrets[i].first == secrets[i - 1].first;
+        hello_key_dup_first_[secrets[i].second] =
+            same ? hello_key_dup_first_[secrets[i - 1].second] : secrets[i].second;
+        if (same) hello_key_dup_next_[secrets[i - 1].second] = secrets[i].second;
+    }
+    for (auto& [secret, index] : secrets) protocol::crypto::secure_zero(secret);
+    hello_key_mark_.assign(count, 0);
+    hello_mark_generation_ = 0;
+    hello_candidates_.reserve(count);
+    hello_candidate_index_.reserve(count);
+    hello_keys_snapshot_ = snapshot;
+}
+
+void Runtime::Impl::note_hello_success(const Client& client, const control::UserRecord& user) {
+    const detail::IpKey ip = detail::hello_ip_key(client.peer);
+    const std::uint64_t name = user_name_hash(user.name);
+    hello_ip_hints_.upsert(ip).user = name;
+    hello_prefix_hints_.upsert(detail::hello_prefix_key(ip)).user = name;
+}
+
+namespace {
+
+std::uint64_t throttle_window(std::chrono::steady_clock::time_point now) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() /
+        detail::kHelloThrottleWindow.count());
+}
+
+}  // namespace
+
+bool Runtime::Impl::hello_throttled(const Client& client, Time now) {
+    const auto* entry = hello_failures_.find(detail::hello_ip_key(client.peer));
+    if (entry == nullptr) return false;
+    const std::uint64_t window = throttle_window(now);
+    if (entry->window + 1 < window || entry->window > window) return false;
+    const std::int64_t span = detail::kHelloThrottleWindow.count();
+    const std::int64_t into =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() % span;
+    // Sliding estimate: this window's count plus the share of the previous
+    // window that still overlaps the last kHelloThrottleWindow.
+    const std::uint64_t current = entry->window == window ? entry->current : 0;
+    const std::uint64_t previous = entry->window == window ? entry->previous : entry->current;
+    const std::uint64_t estimate =
+        current + previous * static_cast<std::uint64_t>(span - into) / static_cast<std::uint64_t>(span);
+    return estimate >= detail::kHelloThrottleFailures;
+}
+
+void Runtime::Impl::note_hello_failure(const Client& client, Time now) {
+    auto& entry = hello_failures_.upsert(detail::hello_ip_key(client.peer));
+    const std::uint64_t window = throttle_window(now);
+    if (entry.window != window) {
+        entry.previous = entry.window + 1 == window ? entry.current : 0;
+        entry.current = 0;
+        entry.window = window;
+    }
+    if (entry.current < UINT32_MAX) ++entry.current;
+}
+
 bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                                        Time now, protocol::ClientHelloInfo& info,
                                        const control::UserRecord*& user,
                                        std::optional<std::int64_t>& clock_skew) {
-    (void)client;
-    (void)now;
     const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
     if (!snapshot) return false;
-    if (hello_keys_snapshot_ != snapshot) {
-        // Parse and pre-key every enabled secret once per user snapshot, not
-        // once per user for every ClientHello. Order (and therefore which user
-        // wins a duplicate secret) is the snapshot order, as before.
-        hello_keys_.clear();
-        hello_key_ptrs_.clear();
-        hello_key_users_.clear();
-        hello_keys_snapshot_.reset();
-        hello_keys_.reserve(snapshot->users.size());
-        for (const auto& candidate : snapshot->users) {
-            if (!candidate.enabled) continue;
-            std::array<std::uint8_t, 16> secret{};
-            if (!parse_user_secret(candidate.secret_hex, secret)) continue;
-            hello_keys_.emplace_back(secret);
-            protocol::crypto::secure_zero(secret);
-            hello_key_users_.push_back(&candidate);
+    if (hello_keys_snapshot_ != snapshot) rebuild_hello_keys(snapshot);
+
+    // Only keys whose user may authenticate on the hello's SNI are tried: a
+    // foreign or missing SNI costs no HMAC. Keys hinted for the client's
+    // address and prefix go first; an address over the failed-probe threshold
+    // gets those only, so a scanner sharing a CGNAT address with a user can
+    // neither burn reactor CPU nor lock that user out.
+    struct Selection {
+        const Client& client;
+        bool throttled;
+        bool selected;
+    } selection{client, hello_throttled(client, now), false};
+    const auto allowed = [this](std::uint32_t index) {
+        return hello_key_domain_[index].empty() || hello_key_domain_[index] == hello_sni_;
+    };
+    // Two pointers: fits std::function's local storage, no allocation.
+    const protocol::HelloKeySelector select = [this, &selection](std::string_view server_name) {
+        const auto allowed_here = [this](std::uint32_t index) {
+            return hello_key_domain_[index].empty() || hello_key_domain_[index] == hello_sni_;
+        };
+        selection.selected = true;
+        normalize_sni(server_name, hello_sni_);
+        hello_candidates_.clear();
+        hello_candidate_index_.clear();
+        if (++hello_mark_generation_ == 0) {
+            std::fill(hello_key_mark_.begin(), hello_key_mark_.end(), 0U);
+            hello_mark_generation_ = 1;
         }
-        for (const auto& key : hello_keys_) hello_key_ptrs_.push_back(&key);
-        hello_keys_snapshot_ = snapshot;
-    }
+        const auto add = [&](std::uint32_t index) {
+            if (hello_key_mark_[index] == hello_mark_generation_) return;
+            hello_key_mark_[index] = hello_mark_generation_;
+            hello_candidates_.push_back(&hello_keys_[index]);
+            hello_candidate_index_.push_back(index);
+        };
+        const detail::IpKey ip = detail::hello_ip_key(selection.client.peer);
+        for (const auto* hint : {hello_ip_hints_.find(ip),
+                                 hello_prefix_hints_.find(detail::hello_prefix_key(ip))}) {
+            if (hint == nullptr) continue;
+            const auto found = hello_key_by_name_.find(hint->user);
+            if (found != hello_key_by_name_.end() && allowed_here(found->second)) {
+                add(found->second);
+            }
+        }
+        if (selection.throttled) {
+            stats_.hello_throttled();
+        } else {
+            // The SNI group and the any-SNI keys, merged in snapshot order.
+            static const std::vector<std::uint32_t> kNone;
+            const auto group = hello_sni_.empty() ? hello_domain_keys_.end()
+                                                  : hello_domain_keys_.find(hello_sni_);
+            const auto& named = group == hello_domain_keys_.end() ? kNone : group->second;
+            std::size_t left = 0;
+            std::size_t right = 0;
+            while (left < named.size() || right < hello_any_domain_keys_.size()) {
+                if (right >= hello_any_domain_keys_.size() ||
+                    (left < named.size() && named[left] < hello_any_domain_keys_[right])) {
+                    add(named[left++]);
+                } else {
+                    add(hello_any_domain_keys_[right++]);
+                }
+            }
+        }
+        return std::span<const protocol::crypto::HmacSha256Key* const>(hello_candidates_);
+    };
+
     protocol::ClientHelloInfo found;
     std::size_t matched = 0;
     const std::int64_t now_unix = unix_now();
-    const auto status = protocol::validate_client_hello(record, hello_key_ptrs_, now_unix,
-                                                        120, found, matched);
-    if (status == protocol::HelloStatus::ClockSkew && matched < hello_key_users_.size()) {
+    const auto status = protocol::validate_client_hello(
+        record, select, now_unix, config_.client_clock_skew_seconds, found, matched);
+    const bool authenticated = (status == protocol::HelloStatus::Ok ||
+                                status == protocol::HelloStatus::ClockSkew) &&
+                               matched < hello_candidate_index_.size();
+    if (selection.selected) {
+        stats_.hello_hmac_attempts(authenticated ? matched + 1 : hello_candidates_.size());
+    }
+    if (status == protocol::HelloStatus::Unauthenticated &&
+        (!hello_candidates_.empty() || selection.throttled)) {
+        // Every candidate missed (or the address is already throttled): a
+        // guess. A foreign SNI that cost nothing is not counted.
+        note_hello_failure(client, now);
+    }
+    if (!authenticated) return false;
+    // Resolve a duplicate secret to the first user, in snapshot order, that
+    // may use this SNI (the matched key itself qualifies, so this ends).
+    std::uint32_t index = hello_key_dup_first_[hello_candidate_index_[matched]];
+    while (!allowed(index)) index = hello_key_dup_next_[index];
+    const control::UserRecord* matched_user = hello_key_users_[index];
+    if (status == protocol::HelloStatus::ClockSkew) {
         clock_skew = now_unix - static_cast<std::int64_t>(found.timestamp);
-        user = hello_key_users_[matched];
+        user = matched_user;
         return false;
     }
-    if (status != protocol::HelloStatus::Ok || matched >= hello_key_users_.size()) return false;
-    // A user with a personal tls_domain authenticates only on that SNI; the
-    // others on the global one (when configured).
-    const control::UserRecord* matched_user = hello_key_users_[matched];
+    // The prefilter ignores a trailing dot; the SNI itself must still equal
+    // the expected domain, as FakeTlsConnection checks it again.
     const std::string& expected_sni = matched_user->policy.tls_domain.empty()
                                           ? config_.tls_domain
                                           : matched_user->policy.tls_domain;
@@ -771,7 +952,7 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     protocol::FakeTlsConnection::Config tls_config;
     tls_config.secret = info.secret;
     tls_config.random = random_;
-    tls_config.skew_seconds = 120;
+    tls_config.skew_seconds = config_.client_clock_skew_seconds;
     tls_config.max_client_hello = protocol::kFakeTlsMaxClientHello;
     tls_config.max_record_body = protocol::kFakeTlsMaxRecordBody;
     tls_config.max_pending_plaintext = detail::kReadBatch + 2U * protocol::kFakeTlsMaxRecordBody;

@@ -1015,6 +1015,9 @@ struct ControlServer::Impl {
         {"s2c", snapshot.backpressure_s2c_total}};
     data["buffer_budget"] = budget_json(snapshot);
     data["replay_cache_entries"] = snapshot.replay_cache_entries;
+    data["replay_cache_evicted_total"] = snapshot.replay_cache_evicted_total;
+    data["handshake_throttled_total"] = snapshot.hello_throttled_total;
+    data["handshake_hmac_attempts_total"] = snapshot.hello_hmac_attempts_total;
     data["build"] = {{"version", snapshot.build_version}};
     data["me"] = me_json(snapshot);
     status = 200;

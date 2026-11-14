@@ -587,6 +587,13 @@ struct StatisticsSnapshot {
   uint64_t suspect_shadow_bans_total{0};
   uint64_t media_throttled_total{0};
   uint64_t replay_cache_entries{0};
+  // Live replay entries dropped to make room (fixed-size cache).
+  uint64_t replay_cache_evicted_total{0};
+  // ClientHellos from a throttled address (many failed authentications)
+  // that were tried against hinted keys only.
+  uint64_t hello_throttled_total{0};
+  // ClientHello HMAC computations (one per candidate key tried).
+  uint64_t hello_hmac_attempts_total{0};
   uint64_t api_requests_total{0};
   uint64_t me_pending_buffer_bytes{0};
   std::map<std::string, MeDcSnapshot> me_dcs;  // bounded signed DC labels
@@ -747,6 +754,12 @@ class Statistics {
   // A valid-secret ClientHello outside the timestamp window. `skew_seconds` is
   // server clock - client timestamp: positive when the client clock is behind.
   void hello_clock_skew(int64_t skew_seconds) noexcept;
+  // A ClientHello from a throttled address (see hello_throttled_total).
+  void hello_throttled() noexcept;
+  // `count` HMACs were computed to authenticate one ClientHello.
+  void hello_hmac_attempts(uint64_t count) noexcept;
+  // A live replay-cache entry was evicted to admit a new handshake.
+  void replay_cache_evicted() noexcept;
 
   // Returns nullptr for names outside the store's [A-Za-z0-9_.-]{1,64}
   // contract or once max_tracked_users is reached. Callers keep the shared

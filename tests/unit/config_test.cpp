@@ -416,6 +416,25 @@ TEST(Config, UniqueIpHistoryPathIsOptionalResolvedAndSeparateFromUsers) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, ClientClockSkewDefaultsTo120AndIsRangeChecked) {
+    EXPECT_EQ(mtdd::Config::parse(minimal_config(), "/work").client_clock_skew_seconds, 120U);
+    auto value = minimal_config();
+    value["client_clock_skew_seconds"] = 0;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").client_clock_skew_seconds, 0U);
+    value["client_clock_skew_seconds"] = 600;
+    const auto parsed = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(parsed.client_clock_skew_seconds, 600U);
+    EXPECT_EQ(parsed.public_view().at("client_clock_skew_seconds"), 600);
+    value["client_clock_skew_seconds"] = 86400;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").client_clock_skew_seconds, 86400U);
+    value["client_clock_skew_seconds"] = 86401;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["client_clock_skew_seconds"] = -1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["client_clock_skew_seconds"] = "120";
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, UniqueIpMinBytesDefaultsToOneMiBAndIsRangeChecked) {
     EXPECT_EQ(mtdd::Config::parse(minimal_config(), "/work").unique_ip_min_bytes, 1048576U);
     auto value = minimal_config();

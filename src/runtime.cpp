@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <exception>
 #include <stdexcept>
 #include <system_error>
@@ -86,30 +88,132 @@ std::size_t replay_capacity() {
     return g_replay_capacity.value_or(kReplayCapacity);
 }
 
+namespace {
+
+std::uint64_t replay_mix(std::uint64_t x) noexcept {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+std::uint64_t replay_seed() noexcept {
+    std::uint64_t seed = 0;
+    try {
+        std::random_device device;
+        seed = (static_cast<std::uint64_t>(device()) << 32) ^ device();
+    } catch (...) {
+    }
+    // Still distinct per process when random_device is unavailable.
+    seed ^= static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    seed ^= static_cast<std::uint64_t>(::getpid()) << 17;
+    return replay_mix(seed);
+}
+
+}  // namespace
+
+ReplayCache::ReplayCache(std::size_t capacity)
+    : buckets_(std::max<std::size_t>(1, (capacity + kReplayBucketSlots - 1) / kReplayBucketSlots)),
+      shard_count_(std::min(buckets_, kReplayShards)), seed_(replay_seed()),
+      base_(std::chrono::steady_clock::now()), shards_(std::make_unique<Shard[]>(shard_count_)) {
+    // Bucket is an implicit-lifetime aggregate of integers: zeroed memory is a
+    // table of empty slots, and untouched pages are never committed.
+    table_ = static_cast<Bucket*>(std::calloc(buckets_, sizeof(Bucket)));
+    if (table_ == nullptr) throw std::bad_alloc();
+}
+
+ReplayCache::~ReplayCache() { std::free(table_); }
+
+void ReplayCache::set_retention(std::chrono::seconds retention) noexcept {
+    const auto seconds = std::clamp<std::int64_t>(retention.count(), 1, 86400LL * 365);
+    retention_.store(static_cast<std::uint32_t>(seconds), std::memory_order_relaxed);
+}
+
+std::uint32_t ReplayCache::tick(std::chrono::steady_clock::time_point now) const noexcept {
+    // Ticks start at 1 so 0 can mean "never used"; a time before base_ (a
+    // caller's earlier timestamp) is tick 1.
+    if (now <= base_) return 1;
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - base_).count();
+    return static_cast<std::uint32_t>(std::min<std::int64_t>(seconds, 0x7fffffffLL)) + 1U;
+}
+
+std::size_t ReplayCache::bucket_of(const std::array<std::uint8_t, 32>& key) const noexcept {
+    std::uint64_t word = 0;
+    std::memcpy(&word, key.data() + 16, sizeof(word));
+    const std::uint64_t hash = replay_mix(word ^ seed_);
+    // Multiply-shift range reduction: any bucket count, no modulo bias worth
+    // the name for counts far below 2^32.
+    return static_cast<std::size_t>(((hash >> 32) * static_cast<std::uint64_t>(buckets_)) >> 32);
+}
+
 ReplayCache::Outcome ReplayCache::insert(const std::array<std::uint8_t, 32>& key,
                                          std::chrono::steady_clock::time_point now) {
-    const std::lock_guard lock{mutex_};
-    evict_locked(now);
-    if (entries_.find(key) != entries_.end()) return Outcome::duplicate;
-    if (entries_.size() >= capacity_) return Outcome::saturated;
-    entries_.emplace(key, now);
-    order_.emplace_back(key, now);
-    return Outcome::accepted;
+    const std::uint32_t now_tick = tick(now);
+    // +1: a slot never expires before its full retention has passed.
+    const std::uint32_t expiry = now_tick + retention_.load(std::memory_order_relaxed) + 1U;
+    const std::size_t index = bucket_of(key);
+    Shard& shard = shard_of(index);
+    Bucket& bucket = table_[index];
+    const std::lock_guard lock{shard.mutex};
+    std::size_t free_slot = kReplayBucketSlots;
+    std::size_t soonest = 0;
+    for (std::size_t slot = 0; slot < kReplayBucketSlots; ++slot) {
+        const std::uint32_t slot_expiry = bucket.expiry[slot];
+        if (slot_expiry > now_tick) {
+            if (std::memcmp(bucket.keys[slot].data(), key.data(), 16) == 0) {
+                return Outcome::duplicate;
+            }
+            if (slot_expiry < bucket.expiry[soonest] || bucket.expiry[soonest] <= now_tick) {
+                soonest = slot;
+            }
+        } else if (free_slot == kReplayBucketSlots ||
+                   (slot_expiry != 0 && bucket.expiry[free_slot] == 0)) {
+            // Prefer an expired slot to a never-used one: it is still counted
+            // in `used`, so reusing it keeps size() close to the live count.
+            free_slot = slot;
+        }
+    }
+    Outcome outcome = Outcome::accepted;
+    if (free_slot == kReplayBucketSlots) {
+        free_slot = soonest;
+        outcome = Outcome::evicted;
+        evicted_.fetch_add(1, std::memory_order_relaxed);
+    } else if (bucket.expiry[free_slot] == 0) {
+        shard.used.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::memcpy(bucket.keys[free_slot].data(), key.data(), 16);
+    bucket.expiry[free_slot] = expiry;
+    return outcome;
 }
 
 void ReplayCache::evict(std::chrono::steady_clock::time_point now) {
-    const std::lock_guard lock{mutex_};
-    evict_locked(now);
+    const std::uint32_t now_tick = tick(now);
+    const std::size_t step = std::max<std::size_t>(1, (buckets_ + kReplayShards - 1) / kReplayShards);
+    const std::size_t first = sweep_cursor_.fetch_add(step, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < std::min(step, buckets_); ++i) {
+        const std::size_t index = (first + i) % buckets_;
+        Shard& shard = shard_of(index);
+        Bucket& bucket = table_[index];
+        const std::lock_guard lock{shard.mutex};
+        for (std::size_t slot = 0; slot < kReplayBucketSlots; ++slot) {
+            if (bucket.expiry[slot] != 0 && bucket.expiry[slot] <= now_tick) {
+                bucket.expiry[slot] = 0;
+                bucket.keys[slot] = {};
+                shard.used.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 
-void ReplayCache::evict_locked(std::chrono::steady_clock::time_point now) {
-    while (!order_.empty() && now - order_.front().second >= kReplayRetention) {
-        const auto key = order_.front().first;
-        const auto stamp = order_.front().second;
-        order_.pop_front();
-        const auto found = entries_.find(key);
-        if (found != entries_.end() && found->second == stamp) entries_.erase(found);
+std::size_t ReplayCache::size() const noexcept {
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < shard_count_; ++i) {
+        total += shards_[i].used.load(std::memory_order_relaxed);
     }
+    return total;
 }
 
 bool SkewSeenCache::insert(const std::array<std::uint8_t, 32>& digest,
@@ -129,14 +233,20 @@ bool SkewSeenCache::insert(const std::array<std::uint8_t, 32>& digest,
     return true;
 }
 
-std::size_t ReplayCache::size() const noexcept {
-    const std::lock_guard lock{mutex_};
-    return entries_.size();
+IpKey hello_ip_key(const protocol::Endpoint& peer) noexcept {
+    const auto wire = peer.wire20();
+    IpKey key{};
+    std::copy_n(wire.begin(), key.size(), key.begin());
+    return key;
 }
 
-bool ReplayCache::empty() const noexcept {
-    const std::lock_guard lock{mutex_};
-    return entries_.empty();
+IpKey hello_prefix_key(const IpKey& ip) noexcept {
+    constexpr std::array<std::uint8_t, 12> mapped_prefix{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    IpKey key = ip;
+    const bool v4 = std::equal(mapped_prefix.begin(), mapped_prefix.end(), ip.begin());
+    // IPv4 /24 (last octet); IPv6 /56 (bytes 7..15).
+    std::fill(key.begin() + (v4 ? 15 : 7), key.end(), std::uint8_t{0});
+    return key;
 }
 
 void SharedState::register_wake(int fd) {
@@ -209,6 +319,21 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
       signal_owner_(signal_owner), random_(protocol::buffered_random()) {
     if (config_.max_frame_bytes == 0 || config_.connection_queue_bytes == 0) {
         throw std::invalid_argument("runtime configuration has zero limits");
+    }
+    // Every reactor carries the same config: storing the same value is benign.
+    shared_->replay.set_retention(
+        detail::replay_retention_for_skew(config_.client_clock_skew_seconds));
+    {
+        std::array<std::uint8_t, 24> seeds{};
+        random_(seeds);
+        const auto seed_at = [&](std::size_t offset) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, seeds.data() + offset, sizeof(value));
+            return value;
+        };
+        hello_ip_hints_.set_seed(seed_at(0));
+        hello_prefix_hints_.set_seed(seed_at(8));
+        hello_failures_.set_seed(seed_at(16));
     }
     for (const auto& entry : config_.watch_ips) {
         auto net = detail::parse_watch_net(entry);

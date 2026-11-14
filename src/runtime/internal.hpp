@@ -146,19 +146,32 @@ inline constexpr unsigned kMeUserTimeoutMs = 30000;
 // Bound for configured reactors. Fixed-size statistic arrays use the same cap.
 inline constexpr std::size_t kMaxWorkers = 256;
 
-// Replay cache: bounded global set of authenticated canonical ClientHello
-// HMACs, retained for the FakeTLS timestamp horizon. One instance is shared by
-// every reactor, so insert/evict/size synchronize on an internal mutex; the
-// lock is taken once per handshake, never per relayed packet. The capacity is
-// sized as kReplayRetention * a sustained authenticated-hello rate, because a
-// saturated cache rejects every new unique handshake with reason="overload"
-// (documented fail-closed behaviour) and is therefore a second overload cliff
-// independent of the relay-buffer budget. 524288 covers ~2180 authenticated
-// hellos/s for the full 240 s window (the live node admitted ~890/s at peak)
-// and costs memory only as entries actually arrive (roughly 130 B/entry at
-// saturation).
-inline constexpr std::chrono::seconds kReplayRetention{240};
-inline constexpr std::size_t kReplayCapacity = 524288;
+// Replay cache: fixed-size global set of authenticated canonical ClientHello
+// HMACs, retained for the FakeTLS timestamp horizon (2 x client clock skew +
+// 30 s, see replay_retention_for_skew). One instance is shared by every
+// reactor; it is sharded, so concurrent handshakes rarely meet on a lock, and
+// the lock is taken once per handshake, never per relayed packet. A full
+// bucket evicts the entry that expires soonest (counted in
+// mtdd_replay_cache_evicted_total) instead of refusing the handshake: a flood
+// of valid hellos from someone holding a public secret cannot lock everybody
+// out. The capacity covers ~2900 authenticated hellos/s for the default 270 s
+// retention (the live node admitted ~890/s at peak); entries still expiring
+// soonest are the oldest, which are the least useful to a replay.
+// Memory at the default capacity, allocated once (calloc, so pages are
+// committed only as buckets are touched): 786432 slots x 20 B (16-byte key +
+// 4-byte expiry) = 15 MiB, plus 256 x 64 B shard locks = 16 KiB.
+inline constexpr std::chrono::seconds kReplayRetention{270};  // default skew 120 s
+// client_clock_skew_seconds == 0: no timestamp horizon; capacity eviction
+// bounds the memory.
+inline constexpr std::chrono::seconds kReplayRetentionNoSkew{3600};
+inline constexpr std::size_t kReplayCapacity = 786432;
+inline constexpr std::size_t kReplayBucketSlots = 8;
+inline constexpr std::size_t kReplayShards = 256;
+
+constexpr std::chrono::seconds replay_retention_for_skew(std::uint32_t skew_seconds) noexcept {
+    return skew_seconds == 0 ? kReplayRetentionNoSkew
+                             : std::chrono::seconds(2LL * skew_seconds + 30);
+}
 // Test-only: replay-cache capacity for SharedState objects built afterwards.
 // Production never installs one, so kReplayCapacity is used unchanged; tests
 // must not send half a million hellos to reach saturation.
@@ -510,8 +523,106 @@ struct ConnIdHash {
     }
 };
 
-// Bounded authenticated-ClientHello replay set. Saturation never evicts a live
-// entry: new unique handshakes are rejected until entries age out.
+// ClientHello admission state kept per reactor (no locks). With SO_REUSEPORT
+// the kernel may spread one address over several reactors, so each of them
+// learns hints and counts failures on its own; the bounds are per reactor.
+inline constexpr std::size_t kHelloHintEntries = 4096;
+inline constexpr std::size_t kHelloFailureEntries = 4096;
+// An address with this many failed authentications (every candidate key
+// missed) in the sliding window is throttled: its hellos are tried against the
+// keys hinted for that address and prefix only.
+inline constexpr std::uint32_t kHelloThrottleFailures = 16;
+inline constexpr std::chrono::seconds kHelloThrottleWindow{60};
+
+// Hint keys: the address itself, and its /24 (IPv4) or /56 (IPv6) prefix.
+IpKey hello_ip_key(const protocol::Endpoint& peer) noexcept;
+IpKey hello_prefix_key(const IpKey& ip) noexcept;
+
+// Fixed-capacity IpKey -> Value map: 4-way set-associative, the least
+// recently written way of a full set is replaced. Storage is allocated on the
+// first write. The set index is a keyed mix, so remote addresses cannot aim at
+// one set to push out a chosen entry. Single-threaded.
+template <typename Value>
+class BoundedIpMap {
+public:
+    static constexpr std::size_t kWays = 4;
+
+    explicit BoundedIpMap(std::size_t capacity = 4096, std::uint64_t seed = 0) noexcept
+        : sets_(std::max<std::size_t>(1, capacity / kWays)), seed_(seed) {}
+
+    void set_seed(std::uint64_t seed) noexcept { seed_ = seed; }
+
+    Value* find(const IpKey& key) noexcept {
+        if (slots_.empty()) return nullptr;
+        Slot* set = &slots_[set_of(key) * kWays];
+        for (std::size_t way = 0; way < kWays; ++way) {
+            if (set[way].stamp != 0 && set[way].key == key) return &set[way].value;
+        }
+        return nullptr;
+    }
+    // The entry for `key`, created value-initialized when absent.
+    Value& upsert(const IpKey& key) {
+        if (slots_.empty()) slots_.resize(sets_ * kWays);
+        Slot* set = &slots_[set_of(key) * kWays];
+        Slot* victim = &set[0];
+        for (std::size_t way = 0; way < kWays; ++way) {
+            Slot& slot = set[way];
+            if (slot.stamp != 0 && slot.key == key) {
+                slot.stamp = ++clock_;
+                return slot.value;
+            }
+            if (victim->stamp != 0 && (slot.stamp == 0 || slot.stamp < victim->stamp)) {
+                victim = &slot;
+            }
+        }
+        if (victim->stamp == 0) ++size_;
+        victim->key = key;
+        victim->stamp = ++clock_;
+        victim->value = Value{};
+        return victim->value;
+    }
+    std::size_t size() const noexcept { return size_; }
+    std::size_t capacity() const noexcept { return sets_ * kWays; }
+
+private:
+    struct Slot {
+        IpKey key{};
+        std::uint64_t stamp{0};  // 0 = empty; else last write order
+        Value value{};
+    };
+    std::size_t set_of(const IpKey& key) const noexcept {
+        std::uint64_t hash = seed_ ^ 0x9e3779b97f4a7c15ULL;
+        for (const auto byte : key) {
+            hash ^= byte;
+            hash *= 0x100000001b3ULL;
+        }
+        hash ^= hash >> 29;
+        hash *= 0xbf58476d1ce4e5b9ULL;
+        hash ^= hash >> 32;
+        return static_cast<std::size_t>(hash % sets_);
+    }
+
+    std::size_t sets_;
+    std::uint64_t seed_;
+    std::uint64_t clock_{0};
+    std::size_t size_{0};
+    std::vector<Slot> slots_;
+};
+
+// The user that last authenticated from an address (hash of its name: user
+// indices change with every snapshot, and a collision only reorders keys).
+struct HelloHint {
+    std::uint64_t user{0};
+};
+// Failed authentications of one address, in fixed windows of
+// kHelloThrottleWindow; the previous window decays linearly.
+struct HelloFailures {
+    std::uint64_t window{0};
+    std::uint32_t current{0};
+    std::uint32_t previous{0};
+};
+
+// FNV-1a over a 32-byte digest (SkewSeenCache).
 struct ReplayHash {
     std::size_t operator()(const std::array<std::uint8_t, 32>& key) const noexcept {
         std::uint64_t hash = 0xcbf29ce484222325ULL;
@@ -523,30 +634,61 @@ struct ReplayHash {
     }
 };
 
+// Sharded set-associative replay set (see kReplayCapacity). Each bucket holds
+// kReplayBucketSlots slots of {first 16 bytes of the canonical HMAC, expiry
+// tick in seconds}; an empty or expired slot is free. The bucket is chosen by
+// a per-process keyed mix of HMAC bytes 16..23, so a client cannot aim its
+// hellos at a victim's bucket. `duplicate` is exact for every key still held.
 class ReplayCache {
 public:
-    enum class Outcome : std::uint8_t { accepted, duplicate, saturated };
+    // evicted: accepted, after dropping the live entry that expires soonest.
+    enum class Outcome : std::uint8_t { accepted, evicted, duplicate };
 
-    explicit ReplayCache(std::size_t capacity = kReplayCapacity) noexcept
-        : capacity_(capacity) {}
+    explicit ReplayCache(std::size_t capacity = kReplayCapacity);
+    ~ReplayCache();
+    ReplayCache(const ReplayCache&) = delete;
+    ReplayCache& operator=(const ReplayCache&) = delete;
 
     Outcome insert(const std::array<std::uint8_t, 32>& key,
                    std::chrono::steady_clock::time_point now);
+    // Frees expired slots of the next slice of buckets (a full pass every
+    // kReplayShards calls), so size() follows retention without a full scan.
     void evict(std::chrono::steady_clock::time_point now);
+    // Occupied slots, expired ones included until reused or swept.
     std::size_t size() const noexcept;
-    std::size_t capacity() const noexcept { return capacity_; }
-    bool empty() const noexcept;
+    std::size_t capacity() const noexcept { return buckets_ * kReplayBucketSlots; }
+    bool empty() const noexcept { return size() == 0; }
+    // Live entries dropped to make room since construction.
+    std::uint64_t evicted() const noexcept { return evicted_.load(std::memory_order_relaxed); }
+    // Applies to entries inserted afterwards.
+    void set_retention(std::chrono::seconds retention) noexcept;
+    std::chrono::seconds retention() const noexcept {
+        return std::chrono::seconds(retention_.load(std::memory_order_relaxed));
+    }
 
 private:
-    void evict_locked(std::chrono::steady_clock::time_point now);
+    struct Bucket {
+        std::array<std::uint32_t, kReplayBucketSlots> expiry;  // 0 = never used
+        std::array<std::array<std::uint8_t, 16>, kReplayBucketSlots> keys;
+    };
+    struct alignas(64) Shard {
+        std::mutex mutex;
+        std::atomic<std::uint32_t> used{0};
+    };
 
-    std::size_t capacity_;
-    mutable std::mutex mutex_;
-    std::unordered_map<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point,
-                       ReplayHash>
-        entries_;
-    std::deque<std::pair<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point>>
-        order_;
+    std::uint32_t tick(std::chrono::steady_clock::time_point now) const noexcept;
+    std::size_t bucket_of(const std::array<std::uint8_t, 32>& key) const noexcept;
+    Shard& shard_of(std::size_t bucket) const noexcept { return shards_[bucket % shard_count_]; }
+
+    std::size_t buckets_;
+    std::size_t shard_count_;
+    std::uint64_t seed_;
+    std::chrono::steady_clock::time_point base_;
+    Bucket* table_{nullptr};
+    std::unique_ptr<Shard[]> shards_;
+    std::atomic<std::uint32_t> retention_{static_cast<std::uint32_t>(kReplayRetention.count())};
+    std::atomic<std::uint64_t> evicted_{0};
+    std::atomic<std::size_t> sweep_cursor_{0};
 };
 
 // Public ClientHello digests (record bytes 11..43) of valid-secret hellos
@@ -1394,6 +1536,12 @@ struct Runtime::Impl {
                             Time now, protocol::ClientHelloInfo& info,
                             const control::UserRecord*& user,
                             std::optional<std::int64_t>& clock_skew);
+    void rebuild_hello_keys(const std::shared_ptr<const control::UserSnapshot>& snapshot);
+    // Hints the user to the client's address and prefix (after replay check).
+    void note_hello_success(const Client& client, const control::UserRecord& user);
+    // True when the client's address is over the failed-probe threshold.
+    bool hello_throttled(const Client& client, Time now);
+    void note_hello_failure(const Client& client, Time now);
     void begin_client_tls(Client& client, const control::UserRecord& user,
                           protocol::ClientHelloInfo&& info, std::span<const std::uint8_t> record,
                           Time now);
@@ -1669,6 +1817,27 @@ struct Runtime::Impl {
     std::vector<protocol::crypto::HmacSha256Key> hello_keys_;
     std::vector<const protocol::crypto::HmacSha256Key*> hello_key_ptrs_;
     std::vector<const control::UserRecord*> hello_key_users_;
+    // Per key: the expected SNI (lowercase, no trailing dot; empty = any),
+    // the user name hash (hints), and the duplicate-secret chain in snapshot
+    // order (first key with this secret, next key with it or npos).
+    std::vector<std::string> hello_key_domain_;
+    std::vector<std::uint64_t> hello_key_name_;
+    std::vector<std::uint32_t> hello_key_dup_first_;
+    std::vector<std::uint32_t> hello_key_dup_next_;
+    // Keys by expected SNI, and keys accepting any SNI, in snapshot order.
+    std::unordered_map<std::string, std::vector<std::uint32_t>> hello_domain_keys_;
+    std::vector<std::uint32_t> hello_any_domain_keys_;
+    std::unordered_map<std::uint64_t, std::uint32_t> hello_key_by_name_;
+    // Candidates of the hello being authenticated (reused, no allocation).
+    std::vector<const protocol::crypto::HmacSha256Key*> hello_candidates_;
+    std::vector<std::uint32_t> hello_candidate_index_;
+    std::vector<std::uint32_t> hello_key_mark_;
+    std::uint32_t hello_mark_generation_{0};
+    std::string hello_sni_;
+    // Admission hints and failed-probe throttle (see kHelloHintEntries).
+    detail::BoundedIpMap<detail::HelloHint> hello_ip_hints_{detail::kHelloHintEntries};
+    detail::BoundedIpMap<detail::HelloHint> hello_prefix_hints_{detail::kHelloHintEntries};
+    detail::BoundedIpMap<detail::HelloFailures> hello_failures_{detail::kHelloFailureEntries};
     // Distinct personal tls_domain values of domains_snapshot_ (users with a
     // personal FakeTLS domain). Rebuilt on snapshot change; masking and the
     // suspect "ours" test accept any configured domain, not only the global.

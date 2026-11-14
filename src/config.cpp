@@ -343,7 +343,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "proxy_host", "proxy_port", "public_host", "public_port", "control_host", "control_port", "allow_remote_control",
         "api_token_env", "tls_domain", "ad_tag", "users_path", "me_config_path", "me_secret_path",
         "workers", "max_connections", "max_handshakes", "max_frame_bytes", "connection_queue_bytes",
-        "global_buffer_bytes", "handshake_timeout_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
+        "global_buffer_bytes", "handshake_timeout_seconds", "client_clock_skew_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
         "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
@@ -517,6 +517,8 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
             "needs at least 2*max_frame_bytes + 2*connection_queue_bytes + 64 KiB; "
             "reduce workers or raise global_buffer_bytes");
     config.handshake_timeout = std::chrono::seconds(number(value, "handshake_timeout_seconds", 15, 1, 120));
+    config.client_clock_skew_seconds =
+        static_cast<std::uint32_t>(number(value, "client_clock_skew_seconds", 120, 0, 86400));
     config.idle_timeout = std::chrono::seconds(number(value, "idle_timeout_seconds", 1800, 30, 86400));
     config.shutdown_timeout = std::chrono::seconds(number(value, "shutdown_timeout_seconds", 10, 1, 120));
     config.metadata_refresh = std::chrono::seconds(number(value, "metadata_refresh_seconds", 3600, 60, 86400));
@@ -624,6 +626,7 @@ nlohmann::json Config::public_view() const {
         {"connection_queue_bytes", connection_queue_bytes},
         {"global_buffer_bytes", global_buffer_bytes},
         {"handshake_timeout_seconds", handshake_timeout.count()},
+        {"client_clock_skew_seconds", client_clock_skew_seconds},
         {"idle_timeout_seconds", idle_timeout.count()},
         {"shutdown_timeout_seconds", shutdown_timeout.count()},
         {"metadata_refresh_seconds", metadata_refresh.count()},

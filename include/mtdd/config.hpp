@@ -110,6 +110,10 @@ struct Config {
     std::size_t global_buffer_bytes{256 * 1024 * 1024};
     bool global_buffer_auto{false};
     std::chrono::seconds handshake_timeout{15};
+    // Accepted |server clock - ClientHello timestamp|, seconds. 0 ignores the
+    // client timestamp entirely (replay protection then rests on the replay
+    // cache alone, with a fixed one-hour retention).
+    std::uint32_t client_clock_skew_seconds{120};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
     // Client socket liveness. Keepalive probes start after this much silence

@@ -699,38 +699,117 @@ TEST(Runtime, BufferBudgetReturnsToBaselineAfterClientChurn) {
 // Replay cache admission
 // ---------------------------------------------------------------------------
 
-// A saturated replay cache is fail-closed: it never evicts a live entry to make
-// room, and it rejects new unique handshakes with reason="overload". Retention
-// (not capacity pressure) is the only way entries leave, so the capacity must
-// cover the full timestamp horizon at the offered hello rate.
-TEST(ReplayCache, SaturationIsFailClosedAndRetentionReleasesEntries) {
-    using Outcome = mtdd::detail::ReplayCache::Outcome;
-    mtdd::detail::ReplayCache cache{2};
-    EXPECT_EQ(cache.capacity(), 2U);
-    const auto key = [](std::uint8_t seed) {
-        std::array<std::uint8_t, 32> out{};
-        out.fill(seed);
-        return out;
-    };
-    const auto now = std::chrono::steady_clock::now();
-    EXPECT_EQ(cache.insert(key(1), now), Outcome::accepted);
-    EXPECT_EQ(cache.insert(key(2), now), Outcome::accepted);
-    EXPECT_EQ(cache.insert(key(3), now), Outcome::saturated);
-    EXPECT_EQ(cache.size(), 2U);
-    EXPECT_EQ(cache.insert(key(1), now), Outcome::duplicate);
-
-    const auto later = now + mtdd::detail::kReplayRetention + std::chrono::seconds{1};
-    EXPECT_EQ(cache.insert(key(3), later), Outcome::accepted);
-    EXPECT_EQ(cache.size(), 1U);
+// The replay cache is a fixed-size sharded table: a full bucket evicts the
+// entry that expires soonest (and counts it) instead of refusing handshakes,
+// and every key still held is detected exactly.
+std::array<std::uint8_t, 32> replay_key(std::uint32_t seed) {
+    std::array<std::uint8_t, 32> out{};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = static_cast<std::uint8_t>((seed >> ((i % 4) * 8)) ^ (i * 37U));
+    }
+    return out;
 }
 
-TEST(ReplayCache, CapacityCoversDesignHelloRateForRetentionWindow) {
+TEST(ReplayCache, FullBucketEvictsTheSoonestExpiringEntryAndCountsIt) {
+    using Outcome = mtdd::detail::ReplayCache::Outcome;
+    mtdd::detail::ReplayCache cache{mtdd::detail::kReplayBucketSlots};  // one bucket
+    ASSERT_EQ(cache.capacity(), mtdd::detail::kReplayBucketSlots);
+    const auto now = std::chrono::steady_clock::now();
+    const auto slots = static_cast<std::uint32_t>(mtdd::detail::kReplayBucketSlots);
+    for (std::uint32_t i = 0; i < slots; ++i) {
+        EXPECT_EQ(cache.insert(replay_key(i), now + std::chrono::seconds{i}), Outcome::accepted);
+    }
+    EXPECT_EQ(cache.size(), mtdd::detail::kReplayBucketSlots);
+    EXPECT_EQ(cache.evicted(), 0U);
+    // Full of live entries: key 0 (inserted first, expires soonest) makes room.
+    const auto later = now + std::chrono::seconds{slots};
+    EXPECT_EQ(cache.insert(replay_key(100), later), Outcome::evicted);
+    EXPECT_EQ(cache.evicted(), 1U);
+    EXPECT_EQ(cache.size(), mtdd::detail::kReplayBucketSlots);
+    for (std::uint32_t i = 1; i < slots; ++i) {
+        EXPECT_EQ(cache.insert(replay_key(i), later), Outcome::duplicate) << i;
+    }
+    EXPECT_EQ(cache.insert(replay_key(100), later), Outcome::duplicate);
+    // The evicted key is no longer known; re-adding it evicts key 1.
+    EXPECT_EQ(cache.insert(replay_key(0), later), Outcome::evicted);
+    EXPECT_EQ(cache.evicted(), 2U);
+    EXPECT_EQ(cache.insert(replay_key(0), later), Outcome::duplicate);
+}
+
+TEST(ReplayCache, EntriesLiveForTheFullRetentionThenFreeTheirSlot) {
+    using Outcome = mtdd::detail::ReplayCache::Outcome;
+    mtdd::detail::ReplayCache cache{mtdd::detail::kReplayBucketSlots};
+    EXPECT_EQ(cache.retention(), mtdd::detail::kReplayRetention);
+    cache.set_retention(std::chrono::seconds{10});
+    EXPECT_EQ(cache.retention(), std::chrono::seconds{10});
+    const auto now = std::chrono::steady_clock::now();
+    EXPECT_EQ(cache.insert(replay_key(1), now), Outcome::accepted);
+    EXPECT_EQ(cache.insert(replay_key(2), now), Outcome::accepted);
+    EXPECT_EQ(cache.insert(replay_key(1), now + std::chrono::seconds{9}), Outcome::duplicate);
+    EXPECT_EQ(cache.insert(replay_key(1), now + std::chrono::seconds{10}), Outcome::duplicate);
+    // Expired: accepted again into its own (free) slot, never counted as eviction.
+    EXPECT_EQ(cache.insert(replay_key(1), now + std::chrono::seconds{12}), Outcome::accepted);
+    EXPECT_EQ(cache.evicted(), 0U);
+    EXPECT_EQ(cache.size(), 2U);
+    cache.evict(now + std::chrono::seconds{12});  // key 2 expired, key 1 renewed
+    EXPECT_EQ(cache.size(), 1U);
+    cache.evict(now + std::chrono::seconds{30});
+    EXPECT_EQ(cache.size(), 0U);
+    EXPECT_TRUE(cache.empty());
+    // Expired slots are free: a full bucket of expired entries evicts nothing.
+    const auto much_later = now + std::chrono::seconds{40};
+    for (std::uint32_t i = 0; i < 2 * mtdd::detail::kReplayBucketSlots; ++i) {
+        const auto at = much_later + std::chrono::seconds{12 * i};
+        EXPECT_EQ(cache.insert(replay_key(10 + i), at), Outcome::accepted) << i;
+    }
+    EXPECT_EQ(cache.evicted(), 0U);
+}
+
+TEST(ReplayCache, RetentionCoversTwiceTheClockSkewWindow) {
+    using mtdd::detail::replay_retention_for_skew;
+    EXPECT_EQ(replay_retention_for_skew(120), std::chrono::seconds{270});
+    EXPECT_EQ(replay_retention_for_skew(120), mtdd::detail::kReplayRetention);
+    EXPECT_EQ(replay_retention_for_skew(1), std::chrono::seconds{32});
+    EXPECT_EQ(replay_retention_for_skew(86400), std::chrono::seconds{172830});
+    // 0 ignores client timestamps: a fixed hour, capacity bounds the memory.
+    EXPECT_EQ(replay_retention_for_skew(0), std::chrono::seconds{3600});
+}
+
+TEST(ReplayCache, DefaultCapacityIsFixedMemoryAndCoversTheDesignHelloRate) {
     // Documented live peak is ~890 authenticated hellos/s; size for 2180/s so
-    // the cache is not the binding admission limit below that rate.
+    // eviction (not refusal) starts only well above that rate.
     constexpr std::size_t kDesignHellosPerSecond = 2180;
-    EXPECT_GE(mtdd::detail::kReplayCapacity,
+    mtdd::detail::ReplayCache cache;
+    EXPECT_EQ(cache.capacity(), mtdd::detail::kReplayCapacity);
+    EXPECT_GE(cache.capacity(),
               static_cast<std::size_t>(mtdd::detail::kReplayRetention.count()) *
                   kDesignHellosPerSecond);
+    // 16-byte key + 4-byte expiry per slot: 15 MiB at the default capacity.
+    EXPECT_LE(mtdd::detail::kReplayCapacity * 20U, 16U * 1024U * 1024U);
+    EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST(ReplayCache, ConcurrentInsertsStayExactAndBounded) {
+    using Outcome = mtdd::detail::ReplayCache::Outcome;
+    mtdd::detail::ReplayCache cache{1U << 18};  // load ~6%: no eviction expected
+    constexpr std::uint32_t kThreads = 4;
+    constexpr std::uint32_t kPerThread = 4000;
+    std::atomic<std::uint32_t> wrong{0};
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::thread> threads;
+    for (std::uint32_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (std::uint32_t i = 0; i < kPerThread; ++i) {
+                const auto key = replay_key(t * kPerThread + i + 1);
+                if (cache.insert(key, now) == Outcome::duplicate) wrong.fetch_add(1);
+                if (cache.insert(key, now) != Outcome::duplicate) wrong.fetch_add(1);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(wrong.load(), 0U);
+    EXPECT_LE(cache.size(), cache.capacity());
+    EXPECT_EQ(cache.size() + cache.evicted(), std::size_t{kThreads} * kPerThread);
 }
 
 // ---------------------------------------------------------------------------

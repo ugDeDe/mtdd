@@ -125,9 +125,12 @@ void ClientHelloInfo::wipe() {
 
 namespace {
 
-// Shared ClientHello validation. `authenticate(input, canonical, secret)`
-// returns true when some key's HMAC over the canonical input matches the first
-// 28 digest bytes, filling the canonical HMAC and that key's secret.
+// Shared ClientHello validation. The structure (cipher suites, extensions,
+// SNI) is checked first, so a malformed hello costs no HMAC at all and the
+// caller can choose its candidate keys by SNI. `authenticate(input, digest,
+// canonical, secret, server_name)` returns true when some key's HMAC over the
+// canonical input matches the first 28 digest bytes, filling the canonical
+// HMAC and that key's secret. skew_seconds == 0 accepts any timestamp.
 template <typename Authenticate>
 HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64_t now_unix,
                                 std::uint32_t skew_seconds, ClientHelloInfo& out,
@@ -147,46 +150,9 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   if (hs_len != rec_len - 4) return HelloStatus::Invalid;
   if (record.size() < 76) return HelloStatus::Invalid;
 
-  std::array<std::uint8_t, 32> digest{};
-  std::copy_n(record.begin() + 11, 32, digest.begin());
   const std::size_t sid_len = record[43];
   if (sid_len != 32) return HelloStatus::Invalid;
   if (record.size() < 44 + sid_len) return HelloStatus::Invalid;
-
-  Bytes hmac_input;
-  hmac_input.reserve(record.size());
-  append(hmac_input, record.first(11));
-  hmac_input.insert(hmac_input.end(), 32, 0);
-  append(hmac_input, record.subspan(43));
-  std::array<std::uint8_t, 32> canonical{};
-  std::array<std::uint8_t, 16> secret{};
-  if (!authenticate(std::span<const std::uint8_t>(hmac_input), digest, canonical, secret)) {
-    crypto::secure_zero(digest);
-    crypto::secure_zero(hmac_input);
-    return HelloStatus::Unauthenticated;
-  }
-  struct Wipe {
-    std::array<std::uint8_t, 32>& canonical;
-    std::array<std::uint8_t, 16>& secret;
-    ~Wipe() {
-      crypto::secure_zero(canonical);
-      crypto::secure_zero(secret);
-    }
-  } wipe_keys{canonical, secret};
-
-  const std::uint32_t mask = (static_cast<std::uint32_t>(digest[28]) ^ canonical[28]) |
-                             ((static_cast<std::uint32_t>(digest[29]) ^ canonical[29]) << 8) |
-                             ((static_cast<std::uint32_t>(digest[30]) ^ canonical[30]) << 16) |
-                             ((static_cast<std::uint32_t>(digest[31]) ^ canonical[31]) << 24);
-  const std::int64_t diff = now_unix - static_cast<std::int64_t>(mask);
-  if (diff < -static_cast<std::int64_t>(skew_seconds) || diff > static_cast<std::int64_t>(skew_seconds)) {
-    crypto::secure_zero(digest);
-    crypto::secure_zero(hmac_input);
-    // Only after the HMAC matched, and nothing else: the caller measures the
-    // skew. The key and canonical HMAC are wiped by wipe_keys.
-    out.timestamp = mask;
-    return HelloStatus::ClockSkew;
-  }
 
   // Cipher suites: echo the first non-GREASE TLS 1.3 suite.
   std::size_t pos = 44 + sid_len;
@@ -262,6 +228,45 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   }
   if (pos != ext_end) return HelloStatus::Invalid;
 
+  std::array<std::uint8_t, 32> digest{};
+  std::copy_n(record.begin() + 11, 32, digest.begin());
+  Bytes hmac_input;
+  hmac_input.reserve(record.size());
+  append(hmac_input, record.first(11));
+  hmac_input.insert(hmac_input.end(), 32, 0);
+  append(hmac_input, record.subspan(43));
+  std::array<std::uint8_t, 32> canonical{};
+  std::array<std::uint8_t, 16> secret{};
+  if (!authenticate(std::span<const std::uint8_t>(hmac_input), digest, canonical, secret,
+                    std::string_view(server_name))) {
+    crypto::secure_zero(digest);
+    crypto::secure_zero(hmac_input);
+    return HelloStatus::Unauthenticated;
+  }
+  struct Wipe {
+    std::array<std::uint8_t, 32>& canonical;
+    std::array<std::uint8_t, 16>& secret;
+    ~Wipe() {
+      crypto::secure_zero(canonical);
+      crypto::secure_zero(secret);
+    }
+  } wipe_keys{canonical, secret};
+
+  const std::uint32_t mask = (static_cast<std::uint32_t>(digest[28]) ^ canonical[28]) |
+                             ((static_cast<std::uint32_t>(digest[29]) ^ canonical[29]) << 8) |
+                             ((static_cast<std::uint32_t>(digest[30]) ^ canonical[30]) << 16) |
+                             ((static_cast<std::uint32_t>(digest[31]) ^ canonical[31]) << 24);
+  const std::int64_t diff = now_unix - static_cast<std::int64_t>(mask);
+  if (skew_seconds != 0 && (diff < -static_cast<std::int64_t>(skew_seconds) ||
+                            diff > static_cast<std::int64_t>(skew_seconds))) {
+    crypto::secure_zero(digest);
+    crypto::secure_zero(hmac_input);
+    // Only after the HMAC matched, and nothing else: the caller measures the
+    // skew. The key and canonical HMAC are wiped by wipe_keys.
+    out.timestamp = mask;
+    return HelloStatus::ClockSkew;
+  }
+
   out.digest = digest;
   out.canonical_hmac = canonical;
   std::copy_n(record.begin() + 44, 32, out.session_id.begin());
@@ -270,6 +275,7 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   out.timestamp = mask;
   out.server_name = std::move(server_name);
   out.offers_pq = offers_pq;
+  crypto::secure_zero(digest);
   crypto::secure_zero(hmac_input);
   return HelloStatus::Ok;
 }
@@ -291,7 +297,8 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
   return validate_hello_core(
       record, now_unix, skew_seconds, out,
       [&](std::span<const std::uint8_t> input, const std::array<std::uint8_t, 32>& digest,
-          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& matched) {
+          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& matched,
+          std::string_view) {
         canonical = crypto::hmac_sha256(secret, input);
         if (!hmac_prefix_matches(digest, canonical)) return false;
         std::copy(secret.begin(), secret.end(), matched.begin());
@@ -300,13 +307,15 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
 }
 
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
-                                  std::span<const crypto::HmacSha256Key* const> keys,
+                                  const HelloKeySelector& select_keys,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out, std::size_t& matched) {
   return validate_hello_core(
       record, now_unix, skew_seconds, out,
       [&](std::span<const std::uint8_t> input, const std::array<std::uint8_t, 32>& digest,
-          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& secret) {
+          std::array<std::uint8_t, 32>& canonical, std::array<std::uint8_t, 16>& secret,
+          std::string_view server_name) {
+        const auto keys = select_keys(server_name);
         for (std::size_t index = 0; index < keys.size(); ++index) {
           if (keys[index] == nullptr) continue;
           canonical = keys[index]->mac(input);
@@ -319,6 +328,15 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
         crypto::secure_zero(canonical);
         return false;
       });
+}
+
+HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
+                                  std::span<const crypto::HmacSha256Key* const> keys,
+                                  std::int64_t now_unix, std::uint32_t skew_seconds,
+                                  ClientHelloInfo& out, std::size_t& matched) {
+  return validate_client_hello(
+      record, HelloKeySelector([keys](std::string_view) { return keys; }), now_unix,
+      skew_seconds, out, matched);
 }
 
 std::optional<std::string> client_hello_sni(std::span<const std::uint8_t> record) {
@@ -663,7 +681,8 @@ struct FakeTlsConnection::Impl {
         if (type != 0x16) return fail("expected TLS ClientHello");
         if (len > cfg.max_client_hello) return fail("ClientHello too large");
         const auto hs = validate_client_hello(record, cfg.secret, cfg.clock(),
-                                               cfg.skew_seconds, hello);
+                                               cfg.enforce_time_skew ? cfg.skew_seconds : 0,
+                                               hello);
         if (hs == HelloStatus::ClockSkew) return fail("ClientHello clock skew");
         if (hs == HelloStatus::Unauthenticated) return fail("ClientHello authentication failed");
         if (hs != HelloStatus::Ok) return fail("invalid ClientHello");

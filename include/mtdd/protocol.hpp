@@ -257,9 +257,11 @@ enum class HelloStatus { Ok, NeedMoreData, NotTls, Invalid, Unauthenticated, Clo
 // the 16-byte FakeTLS user secret. The timestamp is masked into digest[28..32].
 // A ClientHello that offers no TLS 1.3 cipher (1301/1302/1303) is Invalid: the
 // ServerHello never invents a cipher the client did not offer.
-// ClockSkew: the HMAC matched but the timestamp is outside +-skew_seconds;
-// `out` then holds only `timestamp` (the client's clock), every other field
-// stays wiped. Any other non-Ok status leaves `out` wiped.
+// The structure is validated before any HMAC: a malformed hello is Invalid
+// whatever its secret. ClockSkew: the HMAC matched but the timestamp is
+// outside +-skew_seconds (skew_seconds == 0 accepts any timestamp); `out` then
+// holds only `timestamp` (the client's clock), every other field stays wiped.
+// Any other non-Ok status leaves `out` wiped.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const std::uint8_t, 16> secret,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
@@ -271,6 +273,18 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
 // means no key matched.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const crypto::HmacSha256Key* const> keys,
+                                  std::int64_t now_unix, std::uint32_t skew_seconds,
+                                  ClientHelloInfo& out, std::size_t& matched);
+
+// Same, with the candidate keys chosen once the hello is parsed: the selector
+// gets the first host_name SNI exactly as sent (empty when absent) and returns
+// the keys to try in order; the span must stay valid until the call returns.
+// It is called at most once, and never for a malformed hello. @p matched is an
+// index into the returned span.
+using HelloKeySelector = std::function<std::span<const crypto::HmacSha256Key* const>(
+    std::string_view server_name)>;
+HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
+                                  const HelloKeySelector& select_keys,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out, std::size_t& matched);
 

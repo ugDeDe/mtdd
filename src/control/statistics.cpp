@@ -531,6 +531,9 @@ struct Statistics::Impl {
   std::array<std::atomic<uint64_t>, 2 * kClockSkewBuckets> hello_clock_skew{};
   std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
   std::atomic<uint64_t> media_throttled{0};
+  std::atomic<uint64_t> hello_throttled{0};
+  std::atomic<uint64_t> hello_hmac_attempts{0};
+  std::atomic<uint64_t> replay_evicted{0};
   std::array<std::atomic<uint64_t>, kApiRouteCount * kApiMethodCount * kApiStatusCount>
       api_cells;
   std::atomic<uint64_t> api_total{0};
@@ -768,6 +771,15 @@ void Statistics::set_client_pool(std::size_t worker, uint64_t pooled,
 }
 void Statistics::media_throttled() noexcept {
   impl_->media_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::hello_throttled() noexcept {
+  impl_->hello_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::hello_hmac_attempts(uint64_t count) noexcept {
+  if (count != 0) impl_->hello_hmac_attempts.fetch_add(count, std::memory_order_relaxed);
+}
+void Statistics::replay_cache_evicted() noexcept {
+  impl_->replay_evicted.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Statistics::relay_closed(RelayCloseReason reason) noexcept {
@@ -1255,6 +1267,9 @@ StatisticsSnapshot Statistics::snapshot() const {
   out.suspect_shadow_bans_total = impl_->suspect_shadow_bans.load(std::memory_order_relaxed);
   out.media_throttled_total = impl_->media_throttled.load(std::memory_order_relaxed);
   out.replay_cache_entries = replay_entries;
+  out.replay_cache_evicted_total = impl_->replay_evicted.load(std::memory_order_relaxed);
+  out.hello_throttled_total = impl_->hello_throttled.load(std::memory_order_relaxed);
+  out.hello_hmac_attempts_total = impl_->hello_hmac_attempts.load(std::memory_order_relaxed);
   out.api_requests_total = impl_->api_total.load(std::memory_order_relaxed);
   out.me_pending_buffer_bytes = me_pending_bytes;
   out.buffer_budget_used = buffer_budget_used;
@@ -1528,6 +1543,10 @@ std::string Statistics::prometheus_text() const {
   }
   append_metric(out, "mtdd_replay_cache_entries",
                 "", snapshot.replay_cache_entries);
+  append_metric(out, "mtdd_replay_cache_evicted_total", "", snapshot.replay_cache_evicted_total);
+  append_metric(out, "mtdd_handshake_throttled_total", "", snapshot.hello_throttled_total);
+  append_metric(out, "mtdd_handshake_hmac_attempts_total", "",
+                snapshot.hello_hmac_attempts_total);
 
   for (size_t r = 0; r < kApiRouteCount; ++r) {
     for (size_t m = 0; m < kApiMethodCount; ++m) {
