@@ -89,6 +89,18 @@ struct Config {
     std::uint64_t unique_ip_min_bytes{1024 * 1024};
     std::filesystem::path me_config_path;
     std::filesystem::path me_secret_path;
+    // IPv6 Middle-End endpoints (getProxyConfigV6):
+    //   off   only the IPv4 list (getProxyConfig), as before;
+    //   auto  also load the IPv6 list; a DC dials IPv6 only when it has no
+    //         IPv4 endpoint or its IPv4 dials keep failing (see me.cpp);
+    //   on    IPv6 first, IPv4 as the fallback by the same rule.
+    // A failed IPv6 list never fails a metadata refresh: the previous IPv6
+    // list (or none) is kept.
+    enum class MeIpv6 : std::uint8_t { off, automatic, on };
+    MeIpv6 me_ipv6{MeIpv6::automatic};
+    // Local IPv6 list instead of the download (like me_config_path). With
+    // me_config_path set and this empty, no IPv6 list is used.
+    std::filesystem::path me_config_v6_path;
     std::uint32_t workers{0};
     // Zero means unlimited; set a positive value to enforce a global cap.
     std::uint32_t max_connections{0};
@@ -99,6 +111,11 @@ struct Config {
     // reactors keep their caches instead of migrating.
     bool cpu_affinity{true};
     std::uint32_t me_connections_per_dc{16};
+    // Process-wide ME writers per signed DC across all reactors, 1..1024;
+    // 0 = no process-wide cap. Each reactor's first writer of a DC (and of a
+    // metadata successor generation) is exempt, so no reactor is starved.
+    // Reloadable with SIGHUP.
+    std::uint32_t me_connections_per_dc_total{0};
     std::uint32_t me_clients_per_writer{400};
     // Zero means unlimited; set a positive value to cap pending handshakes.
     std::uint32_t max_handshakes{0};

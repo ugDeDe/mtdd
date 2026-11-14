@@ -48,14 +48,15 @@ public:
                     int idle_read_timeout_ms = 1500,
                     std::size_t min_inner = kBurstSize,
                     bool require_sequence = true, std::size_t orphan_answers = 0,
-                    bool inbound_control = false)
+                    bool inbound_control = false,
+                    const char* listen_host = "127.0.0.1")
         : secret_(std::move(secret)), frames_expected_(frames), delay_(delay),
           connections_(connections), handshake_delay_(handshake_delay),
           drop_delay_(drop_delay), respond_each_(respond_each),
           response_bytes_(response_bytes), idle_read_timeout_ms_(idle_read_timeout_ms),
           min_inner_(min_inner), require_sequence_(require_sequence),
           orphan_answers_(orphan_answers), inbound_control_(inbound_control) {
-        auto listener = mtdd::io::listen_tcp("127.0.0.1", 0);
+        auto listener = mtdd::io::listen_tcp(listen_host, 0);
         if (!listener.ok()) throw std::runtime_error("fake ME cannot listen");
         listener_ = std::move(listener.fd);
         const auto local = mtdd::io::local_endpoint(listener_.get());

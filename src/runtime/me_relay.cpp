@@ -28,6 +28,7 @@ void Runtime::Impl::on_me_ready(MeConn& me, Time now) {
     me.candidate = 0;
     me.attempt = 0;
     deadlines_.erase(me.token);
+    note_me_dial_result(me, true, now);
     // Successor-first replacement: publish this generation as the serving one
     // BEFORE any victim starts draining. Readiness and client routing therefore
     // never observe a gap: the previous generation keeps taking clients and

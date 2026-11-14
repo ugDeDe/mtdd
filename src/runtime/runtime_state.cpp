@@ -91,6 +91,7 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     shared = std::make_shared<detail::SharedState>(workers, per_worker_budget);
     shared->me_clients_per_writer.store(config.me_clients_per_writer, std::memory_order_relaxed);
     shared->me_connections_per_dc.store(config.me_connections_per_dc, std::memory_order_relaxed);
+    set_me_writer_cap(config.me_connections_per_dc_total);
     set_media_limits(config.media_user_rate_kbps, config.media_total_rate_kbps);
 
     // Prime the process CSPRNG on the constructing thread before any reactor
@@ -308,6 +309,17 @@ void Runtime::RuntimeState::set_tunables(std::uint32_t me_clients_per_writer,
     shared->tunables_generation.fetch_add(1, std::memory_order_release);
 }
 
+void Runtime::RuntimeState::set_me_writer_cap(std::uint32_t me_connections_per_dc_total) {
+    if (me_connections_per_dc_total > 1024) {
+        throw std::invalid_argument("me_connections_per_dc_total must be 0 or 1..1024");
+    }
+    // Read by every reactor at its next capped dial. Writers above a lowered
+    // cap are not closed: they leave through scale-down or replacement, and
+    // no capped dial succeeds until the total is below the new cap.
+    shared->me_connections_per_dc_total.store(me_connections_per_dc_total,
+                                              std::memory_order_relaxed);
+}
+
 void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
                                              std::uint64_t total_kbps) noexcept {
     // kbit/s -> bytes/s.
@@ -344,6 +356,10 @@ void Runtime::request_stop() noexcept { state_->request_stop(); }
 void Runtime::set_tunables(std::uint32_t me_clients_per_writer,
                            std::uint32_t me_connections_per_dc) {
     state_->set_tunables(me_clients_per_writer, me_connections_per_dc);
+}
+
+void Runtime::set_me_writer_cap(std::uint32_t me_connections_per_dc_total) {
+    state_->set_me_writer_cap(me_connections_per_dc_total);
 }
 
 void Runtime::on_reload(std::function<void()> hook) { state_->on_reload(std::move(hook)); }

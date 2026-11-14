@@ -554,7 +554,93 @@ TEST_F(ConfigFiles, CancelledMetadataLoadDoesNotStartIO) {
     stop.request_stop();
     EXPECT_THROW(mtdd::load_me_metadata(metadata_config(), stop.get_token()), std::runtime_error);
 }
+
+TEST_F(ConfigFiles, Ipv6MetadataIsOptionalAndNeverCostsIpv4Routes) {
+    auto config = metadata_config();
+    write("me.conf", "default 2; proxy_for 2 127.0.0.1:8888;");
+    write("me.secret", std::string(128, '\x42'));
+    // Local IPv4 metadata without a local IPv6 file: no IPv6 list, no download.
+    auto result = mtdd::load_me_metadata(config);
+    EXPECT_EQ(result.endpoints.size(), 1U);
+    EXPECT_TRUE(result.endpoints_v6.empty());
+
+    config.me_config_v6_path = directory / "me6.conf";
+    write("me6.conf", "default 2; proxy_for 2 [2001:b28:f23d:f001::d]:8888;\n"
+                      "proxy_for -2 [2001:67c:4e8:f002::d]:80;");
+    result = mtdd::load_me_metadata(config);
+    ASSERT_EQ(result.endpoints_v6.size(), 2U);
+    EXPECT_EQ(result.endpoints_v6[0].host, "2001:b28:f23d:f001::d");
+    EXPECT_EQ(result.endpoints_v6[1].dc, -2);
+    EXPECT_EQ(result.endpoints.size(), 1U);
+
+    // A broken IPv6 list keeps the previous one (or none) and the IPv4 routes.
+    const auto previous = result.endpoints_v6;
+    write("me6.conf", "proxy_for 2 nonsense;");
+    result = mtdd::load_me_metadata(config, {}, &previous);
+    EXPECT_EQ(result.endpoints.size(), 1U);
+    EXPECT_EQ(result.endpoints_v6, previous);
+    result = mtdd::load_me_metadata(config);
+    EXPECT_EQ(result.endpoints.size(), 1U);
+    EXPECT_TRUE(result.endpoints_v6.empty());
+    std::filesystem::remove(config.me_config_v6_path);
+    result = mtdd::load_me_metadata(config, {}, &previous);
+    EXPECT_EQ(result.endpoints_v6, previous);
+
+    // "off" never reads the IPv6 list.
+    write("me6.conf", "proxy_for 2 [2001:db8::1]:443;");
+    config.me_ipv6 = mtdd::Config::MeIpv6::off;
+    EXPECT_TRUE(mtdd::load_me_metadata(config).endpoints_v6.empty());
+    // The IPv4 list stays mandatory in every mode.
+    config.me_ipv6 = mtdd::Config::MeIpv6::on;
+    write("me.conf", "");
+    EXPECT_THROW(mtdd::load_me_metadata(config), std::invalid_argument);
+}
 } // namespace
+
+TEST(Config, MeWriterCapDefaultsOffAndIsBounded) {
+    auto value = minimal_config();
+    auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.me_connections_per_dc_total, 0U);
+    EXPECT_EQ(config.public_view()["me_connections_per_dc_total"], 0U);
+    for (const std::uint32_t valid : {0U, 1U, 64U, 1024U}) {
+        value["me_connections_per_dc_total"] = valid;
+        EXPECT_EQ(mtdd::Config::parse(value, "/work").me_connections_per_dc_total, valid);
+    }
+    value["me_connections_per_dc_total"] = 48;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").public_view()["me_connections_per_dc_total"], 48U);
+    for (const auto* invalid : {"1025", "-1", "\"8\"", "1.5"}) {
+        auto bad = value;
+        bad["me_connections_per_dc_total"] = nlohmann::json::parse(invalid);
+        EXPECT_THROW(mtdd::Config::parse(bad, "/work"), std::invalid_argument) << invalid;
+    }
+}
+
+TEST(Config, MeIpv6ModesAndLocalIpv6List) {
+    auto value = minimal_config();
+    auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.me_ipv6, mtdd::Config::MeIpv6::automatic);
+    EXPECT_TRUE(config.me_config_v6_path.empty());
+    EXPECT_EQ(config.public_view()["me_ipv6"], "auto");
+    value["me_ipv6"] = "on";
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").me_ipv6, mtdd::Config::MeIpv6::on);
+    value["me_ipv6"] = "off";
+    config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.me_ipv6, mtdd::Config::MeIpv6::off);
+    EXPECT_EQ(config.public_view()["me_ipv6"], "off");
+    value["me_ipv6"] = "auto";
+    value["me_config_v6_path"] = "me6.txt";
+    config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.me_config_v6_path, std::filesystem::path("/work/me6.txt"));
+    EXPECT_EQ(config.public_view()["me_config_v6_path"], "/work/me6.txt");
+    for (const auto* patch : {R"({"me_ipv6": "yes"})", R"({"me_ipv6": true})",
+                              R"({"me_ipv6": "off", "me_config_v6_path": "me6.txt"})",
+                              R"({"me_config_v6_path": "x.bin", "unique_ip_stats_path": "x.bin"})",
+                              R"({"me_config_v6_path": "q.json", "usage_state_path": "q.json"})"}) {
+        auto bad = minimal_config();
+        bad.update(nlohmann::json::parse(patch));
+        EXPECT_THROW(mtdd::Config::parse(bad, "/work"), std::invalid_argument) << patch;
+    }
+}
 
 TEST(Config, DirectFallbackIsOptInAndOnlyAcceptsSignedDcOneToFive) {
     auto value = minimal_config();

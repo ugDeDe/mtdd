@@ -401,6 +401,11 @@ struct Statistics::Impl {
     std::atomic<uint64_t> scale_up{0};
     std::atomic<uint64_t> scale_down{0};
     std::atomic<uint64_t> creation_failures{0};
+    // Process-wide (slot 0 only): writer slots, cap refusals, family
+    // fallbacks. Slots move by +1/-1 from their single owner.
+    std::atomic<uint64_t> writer_slots{0};
+    std::atomic<uint64_t> writer_cap_refusals{0};
+    std::atomic<uint64_t> family_fallbacks{0};
     // Keepalive: per-reactor DC gauge plus process-lifetime counters.
     std::atomic<uint64_t> ping_sent{0};
     std::atomic<uint64_t> ping_pong{0};
@@ -1073,6 +1078,22 @@ void Statistics::me_pool_scaling(std::size_t worker, int dc, uint64_t target,
   slot.scale_down.store(down, std::memory_order_relaxed);
   slot.creation_failures.store(failures, std::memory_order_relaxed);
 }
+void Statistics::me_writer_slot(int dc, bool acquired) noexcept {
+  auto& slots = impl_->gauges[0].me[me_slot(dc)].writer_slots;
+  if (acquired) {
+    slots.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    slots.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+void Statistics::me_writer_cap_refused(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].writer_cap_refusals.fetch_add(
+      1, std::memory_order_relaxed);
+}
+void Statistics::me_family_fallback(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].family_fallbacks.fetch_add(
+      1, std::memory_order_relaxed);
+}
 void Statistics::me_ping_sent(int dc) noexcept {
   impl_->gauges[0].me[me_slot(dc)].ping_sent.fetch_add(1, std::memory_order_relaxed);
 }
@@ -1305,6 +1326,11 @@ StatisticsSnapshot Statistics::snapshot() const {
       entry.scale_up_total += slot.scale_up.load(std::memory_order_relaxed);
       entry.scale_down_total += slot.scale_down.load(std::memory_order_relaxed);
       entry.creation_failures_total += slot.creation_failures.load(std::memory_order_relaxed);
+      entry.writer_slots += slot.writer_slots.load(std::memory_order_relaxed);
+      entry.writer_cap_refusals_total +=
+          slot.writer_cap_refusals.load(std::memory_order_relaxed);
+      entry.family_fallbacks_total +=
+          slot.family_fallbacks.load(std::memory_order_relaxed);
       // Only reactors whose pool currently has a ready member contribute to
       // the DC RTT mean: an emptied pool keeps its last value for diagnostics
       // but must not dilute the aggregate.
@@ -1591,6 +1617,15 @@ std::string Statistics::prometheus_text() const {
     append_metric(out, "mtdd_me_scale_up_total", dc_label, me.scale_up_total);
     append_metric(out, "mtdd_me_scale_down_total", dc_label, me.scale_down_total);
     append_metric(out, "mtdd_me_creation_failures_total", dc_label, me.creation_failures_total);
+    // Process-wide writer slots the me_connections_per_dc_total cap counts,
+    // and the dials it refused (at most one per pool per second).
+    append_metric(out, "mtdd_me_writer_slots", dc_label, me.writer_slots);
+    append_metric(out, "mtdd_me_writer_cap_refusals_total", dc_label,
+                  me.writer_cap_refusals_total);
+    if (me.family_fallbacks_total != 0) {
+      append_metric(out, "mtdd_me_family_fallbacks_total", dc_label,
+                    me.family_fallbacks_total);
+    }
     if (me.pings_sent_total != 0) {
       append_metric(out, "mtdd_me_pings_total",
                     dc_label + ",result=\"sent\"", me.pings_sent_total);

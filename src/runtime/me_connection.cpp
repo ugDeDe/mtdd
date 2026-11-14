@@ -45,13 +45,14 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
 
     me.socks.reset();
     std::vector<MeEndpoint> candidates;
-    if (!me_candidates(me.dc, candidates)) {
+    if (!me_dial_candidates(me.dc, now, candidates)) {
         me.state = MeConn::State::backoff;
         schedule_me_retry(me, now);
         return;
     }
     me.meta = metadata_snapshot_;
     const MeEndpoint& endpoint = candidates[me.candidate % candidates.size()];
+    me.dialed_v6 = endpoint.host.find(':') != std::string::npos;
     if (const auto target = to_protocol_endpoint(io::Endpoint{endpoint.host, endpoint.port})) {
         me.target = *target;
     }
@@ -63,6 +64,7 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
             ++found->second.creation_failures_total;
         }
         stats_.me_request(worker_index_, me.dc, control::MeResult::failure);
+        note_me_dial_result(me, false, now);
         ++me.candidate;
         // Refreshes the per-reactor pool gauge and the connected flag in one
         // place (publish_me_pool owns the readiness transition).
@@ -134,8 +136,11 @@ void Runtime::Impl::on_me_connected(MeConn& me, Time now) {
     }
     if (protocol_local && !config_.me_nat_ip.empty()) {
         // Behind NAT or a fixed-exit tunnel: Telegram sees this address; the
-        // NAT keeps the source port.
-        if (auto nat = to_protocol_endpoint(io::Endpoint{config_.me_nat_ip, protocol_local->port})) {
+        // NAT keeps the source port. It is an address of one family, so it
+        // only replaces a source of that family: an IPv6 ME connection (whose
+        // KDF needs an IPv6 source) keeps its own address under an IPv4 NAT.
+        if (auto nat = to_protocol_endpoint(io::Endpoint{config_.me_nat_ip, protocol_local->port});
+            nat && nat->ipv6 == protocol_local->ipv6) {
             protocol_local = *nat;
         }
     }
@@ -212,6 +217,7 @@ void Runtime::Impl::fail_me(MeConn& me, Time now) {
         if (const auto found = me_pool_.find(me.dc); found != me_pool_.end()) {
             ++found->second.creation_failures_total;
         }
+        note_me_dial_result(me, false, now);
     }
     me.state = MeConn::State::backoff;
     me.flush_pending = false;  // staged requests die with the session

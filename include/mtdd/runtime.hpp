@@ -84,6 +84,11 @@ public:
     /// in the ranges accepted by Config (1..1000000 and 1..24).
     void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
 
+    /// Thread-safe. Process-wide ME writers per signed DC across every reactor
+    /// (Config::me_connections_per_dc_total; 0 removes the cap, otherwise
+    /// 1..1024). Applies to the next dial; live writers are never closed for it.
+    void set_me_writer_cap(std::uint32_t me_connections_per_dc_total);
+
     /// Thread-safe. Media shaping limits in kbit/s (0 = unlimited): per proxy
     /// user across its media (signed DC < 0) connections, and process-wide.
     void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;

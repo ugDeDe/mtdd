@@ -1296,4 +1296,7 @@ TEST(Runtime, SetTunablesValidatesRanges) {
     EXPECT_NO_THROW(daemon.set_tunables(1500, 6));
     EXPECT_THROW(daemon.set_tunables(0, 6), std::invalid_argument);
     EXPECT_THROW(daemon.set_tunables(400, 25), std::invalid_argument);
+    EXPECT_NO_THROW(daemon.set_me_writer_cap(0));
+    EXPECT_NO_THROW(daemon.set_me_writer_cap(1024));
+    EXPECT_THROW(daemon.set_me_writer_cap(1025), std::invalid_argument);
 }

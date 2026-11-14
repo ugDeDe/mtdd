@@ -89,7 +89,12 @@ void Runtime::Impl::poll_metadata(Time now) {
     for (const auto& [dc, pool] : me_pool_) {
         (void)pool;
         // The secret is global: a rotation invalidates every DC route.
-        if (secret_changed ||
+        // The IPv6 list only matters when me_ipv6 may dial it.
+        const bool v6_changed =
+            config_.me_ipv6 != Config::MeIpv6::off &&
+            dc_endpoint_set(previous->endpoints_v6, dc) !=
+                dc_endpoint_set(metadata_snapshot_->endpoints_v6, dc);
+        if (secret_changed || v6_changed ||
             dc_endpoint_set(previous->endpoints, dc) !=
                 dc_endpoint_set(metadata_snapshot_->endpoints, dc)) {
             changed.push_back(dc);
@@ -111,12 +116,17 @@ void Runtime::Impl::start_warming(Time now) {
     warm_dcs_.clear();
     if (!metadata_snapshot_) return;
     std::vector<std::int16_t> distinct;
-    for (const auto& endpoint : metadata_snapshot_->endpoints) {
-        if (endpoint.dc == 0) continue;
-        if (std::find(distinct.begin(), distinct.end(), endpoint.dc) == distinct.end()) {
-            distinct.push_back(endpoint.dc);
+    const auto collect = [&distinct](const std::vector<MeEndpoint>& endpoints) {
+        for (const auto& endpoint : endpoints) {
+            if (endpoint.dc == 0) continue;
+            if (std::find(distinct.begin(), distinct.end(), endpoint.dc) == distinct.end()) {
+                distinct.push_back(endpoint.dc);
+            }
         }
-    }
+    };
+    collect(metadata_snapshot_->endpoints);
+    // A DC listed only in the IPv6 list is still a route under me_ipv6.
+    if (config_.me_ipv6 != Config::MeIpv6::off) collect(metadata_snapshot_->endpoints_v6);
     const auto rank = [](std::int16_t dc) {
         if (dc >= 1 && dc <= 5) return 0;
         if (dc <= -1 && dc >= -5) return 1;

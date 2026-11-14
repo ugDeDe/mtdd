@@ -450,6 +450,7 @@ public:
     void set_tunables(std::uint32_t clients_per_writer, std::uint32_t connections_per_dc) {
         runtime.set_tunables(clients_per_writer, connections_per_dc);
     }
+    void set_me_writer_cap(std::uint32_t total) { runtime.set_me_writer_cap(total); }
     std::vector<std::uint64_t> accepted_per_worker() const {
         return runtime.accepted_clients_per_worker();
     }

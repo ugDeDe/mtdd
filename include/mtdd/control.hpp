@@ -494,6 +494,14 @@ struct MeDcSnapshot {
   uint64_t scale_up_total{0};
   uint64_t scale_down_total{0};
   uint64_t creation_failures_total{0};
+  // Process-wide writer slots held for this DC (the count the
+  // me_connections_per_dc_total cap applies to; equals `connections` once
+  // every reactor has published), and dials that cap refused.
+  uint64_t writer_slots{0};
+  uint64_t writer_cap_refusals_total{0};
+  // Times a reactor moved new dials of this DC to the other address family
+  // (me_ipv6 failover).
+  uint64_t family_fallbacks_total{0};
   // Keepalive: mean EMA RTT of the ready pool members and lifetime counters.
   uint64_t ping_rtt_us{0};
   uint64_t pings_sent_total{0};
@@ -885,6 +893,13 @@ class Statistics {
   // label set and `values` shape as MeWorkerSnapshot; never summed with peers.
   void me_worker(std::size_t worker, int dc,
                  const MeWorkerSnapshot& values) noexcept;
+  // Process-wide ME writer slot taken (true) or returned (false). Called by
+  // the slot owner exactly once each way, so the sum is exact.
+  void me_writer_slot(int dc, bool acquired) noexcept;
+  // A dial refused by the process-wide writer cap (rate-limited per pool).
+  void me_writer_cap_refused(int dc) noexcept;
+  // New dials of the DC moved to the other address family.
+  void me_family_fallback(int dc) noexcept;
   void me_pool_scaling(std::size_t worker, int dc, uint64_t target,
                        uint64_t clients, uint64_t up, uint64_t down,
                        uint64_t failures) noexcept;

@@ -126,9 +126,11 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
         try {
             const auto fresh = mtdd::Config::load(config_path);
             runtime.set_tunables(fresh.me_clients_per_writer, fresh.me_connections_per_dc);
+            runtime.set_me_writer_cap(fresh.me_connections_per_dc_total);
             runtime.set_media_limits(fresh.media_user_rate_kbps, fresh.media_total_rate_kbps);
             std::cerr << "mtdd: reloaded me_clients_per_writer=" << fresh.me_clients_per_writer
                       << " me_connections_per_dc=" << fresh.me_connections_per_dc
+                      << " me_connections_per_dc_total=" << fresh.me_connections_per_dc_total
                       << " media_user_rate_kbps=" << fresh.media_user_rate_kbps
                       << " media_total_rate_kbps=" << fresh.media_total_rate_kbps << '\n';
         } catch (const std::exception& error) {

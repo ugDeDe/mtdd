@@ -204,7 +204,8 @@ static std::string fetch_metadata(const Config& config, const char* url, std::st
     throw std::runtime_error("ME metadata download failed");
 }
 
-MeMetadata load_me_metadata(const Config& config, std::stop_token stop) {
+MeMetadata load_me_metadata(const Config& config, std::stop_token stop,
+                            const std::vector<MeEndpoint>* previous_v6) {
     if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
     const auto config_text = config.me_config_path.empty() ? fetch_metadata(config, "https://core.telegram.org/getProxyConfig", stop) : read_file(config.me_config_path);
     if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
@@ -213,6 +214,21 @@ MeMetadata load_me_metadata(const Config& config, std::stop_token stop) {
     MeMetadata result;
     result.endpoints = parse_me_config(config_text);
     result.secret.assign(secret_text.begin(), secret_text.end());
+    if (config.me_ipv6 == Config::MeIpv6::off) return result;
+    // The IPv6 list is optional: an IPv4-only host, a blocked download or a
+    // malformed file must never cost the IPv4 routes. Local IPv4 metadata
+    // without a local IPv6 file means "no IPv6 list" (no download).
+    if (config.me_config_v6_path.empty() && !config.me_config_path.empty()) return result;
+    try {
+        if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
+        const auto v6_text = config.me_config_v6_path.empty()
+                                 ? fetch_metadata(config, "https://core.telegram.org/getProxyConfigV6", stop)
+                                 : read_file(config.me_config_v6_path);
+        result.endpoints_v6 = parse_me_config(v6_text);
+    } catch (const std::exception&) {
+        if (stop.stop_requested()) throw;
+        if (previous_v6 != nullptr) result.endpoints_v6 = *previous_v6;
+    }
     return result;
 }
 
@@ -234,9 +250,11 @@ void MetadataProvider::run(std::stop_token stop) {
     while (!stop.stop_requested()) {
         bool success{};
         try {
-            auto next = std::make_shared<MeMetadata>(load_me_metadata(config_, stop));
             const auto previous = current_.load();
-            if (!previous || previous->endpoints != next->endpoints || previous->secret != next->secret) {
+            auto next = std::make_shared<MeMetadata>(
+                load_me_metadata(config_, stop, previous ? &previous->endpoints_v6 : nullptr));
+            if (!previous || previous->endpoints != next->endpoints ||
+                previous->endpoints_v6 != next->endpoints_v6 || previous->secret != next->secret) {
                 next->generation = previous ? previous->generation + 1 : 1;
                 current_.store(std::move(next));
             }

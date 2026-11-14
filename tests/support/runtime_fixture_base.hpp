@@ -110,6 +110,9 @@ mtdd::protocol::Endpoint to_protocol(const mtdd::io::Endpoint& endpoint) {
         return mtdd::protocol::Endpoint::v4({bytes[0], bytes[1], bytes[2], bytes[3]},
                                             endpoint.port);
     }
+    // IPv6 text must be parsed too: an unparsed (all-zero) address would make
+    // the fake ME derive its keys for "::" instead of the real socket end.
+    if (::inet_pton(AF_INET6, endpoint.address.c_str(), bytes.data()) != 1) bytes.fill(0);
     return mtdd::protocol::Endpoint::v6(bytes, endpoint.port);
 }
 

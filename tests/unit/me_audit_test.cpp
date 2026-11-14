@@ -1411,3 +1411,382 @@ TEST(MeAudit, ClientClosedWhileItsHelloIsHeldLeavesNothingBehind) {
     EXPECT_EQ(std::find(due.begin(), due.end(), token), due.end());
     EXPECT_EQ(test.reactor->budget_used_, budget_before);
 }
+
+// ---------------------------------------------------------------------------
+// Process-wide ME writer cap (me_connections_per_dc_total)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// N reactors sharing one SharedState and one Statistics, as RuntimeState
+// builds them. Dials go to 127.0.0.1:1 (refused): the members stay in their
+// pools in retry backoff, which is exactly the slot-holding state under test.
+class CapReactors {
+public:
+    CapReactors(std::size_t count, std::uint32_t cap) {
+        static std::uint64_t sequence = 0;
+        path_ = std::filesystem::temp_directory_path() /
+                ("mtdd-me-cap-" + std::to_string(::getpid()) + "-" +
+                 std::to_string(sequence++));
+        std::filesystem::create_directories(path_);
+        config.proxy_host = "127.0.0.1";
+        config.proxy_port = 0;
+        config.ad_tag.fill(1);
+        config.max_frame_bytes = 4096;
+        config.connection_queue_bytes = 4096;
+        config.global_buffer_bytes = 1U << 20;
+        config.me_connections_per_dc = 8;
+        config.me_connections_per_dc_total = cap;
+        config.me_config_path = path_ / "absent-me-config";
+        config.me_secret_path = path_ / "absent-me-secret";
+        auto opened = mtdd::control::UserStore::open((path_ / "users.json").string());
+        if (!opened) throw std::runtime_error("open test store");
+        store = std::make_unique<mtdd::control::UserStore>(std::move(opened).value());
+        metadata = std::make_unique<mtdd::MetadataProvider>(config);
+        shared = std::make_shared<mtdd::detail::SharedState>(count, config.global_buffer_bytes);
+        shared->me_connections_per_dc_total.store(cap);
+        for (std::size_t index = 0; index < count; ++index) {
+            reactors.push_back(std::make_unique<mtdd::Runtime::Impl>(
+                config, *store, stats, *metadata, barrier, shared, index, false, index == 0));
+            reactors.back()->metadata_snapshot_ = me_metadata(1);
+        }
+    }
+    ~CapReactors() {
+        reactors.clear();
+        metadata.reset();
+        store.reset();
+        std::error_code ec;
+        std::filesystem::remove(path_ / "users.json", ec);
+        std::filesystem::remove(path_, ec);
+    }
+    CapReactors(const CapReactors&) = delete;
+    CapReactors& operator=(const CapReactors&) = delete;
+
+    mtdd::Runtime::Impl& at(std::size_t index) { return *reactors.at(index); }
+    std::size_t pool_size(std::size_t index) {
+        auto& pools = at(index).me_pool_;
+        const auto found = pools.find(2);
+        return found == pools.end() ? 0 : found->second.conns.size();
+    }
+    // The shared counter, its statistics mirror and the per-reactor pools
+    // must agree at every step: a mismatch is a leaked or double-freed slot.
+    std::uint64_t slots() {
+        const std::uint64_t counted = shared->me_writers_of(2);
+        std::uint64_t pooled = 0;
+        for (std::size_t index = 0; index < reactors.size(); ++index) {
+            if (reactors[index]) pooled += pool_size(index);
+        }
+        EXPECT_EQ(counted, pooled) << "slot count diverged from the pools";
+        EXPECT_EQ(stats.snapshot().me_dcs.at("2").writer_slots, counted)
+            << "the exported gauge diverged from the cap counter";
+        return counted;
+    }
+    std::uint64_t refusals() {
+        return stats.snapshot().me_dcs.at("2").writer_cap_refusals_total;
+    }
+
+    std::filesystem::path path_;
+    mtdd::Config config;
+    mtdd::control::Statistics stats{100};
+    mtdd::RevisionBarrier barrier;
+    std::unique_ptr<mtdd::control::UserStore> store;
+    std::unique_ptr<mtdd::MetadataProvider> metadata;
+    std::shared_ptr<mtdd::detail::SharedState> shared;
+    std::vector<std::unique_ptr<mtdd::Runtime::Impl>> reactors;
+};
+
+void want_writers(mtdd::Runtime::Impl& reactor, std::size_t target,
+                  mtdd::Runtime::Impl::Time now) {
+    auto& pool = reactor.me_pool_[2];
+    pool.scale_target = target;
+    (void)reactor.ensure_me(2, now);
+}
+
+} // namespace
+
+TEST(MeWriterCap, CapIsSharedAcrossReactorsAndEachKeepsItsFloor) {
+    CapReactors test(2, 3);
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    // Reactor 0: floor (exempt) plus two capped writers; the fourth is refused.
+    want_writers(test.at(0), 4, now);
+    EXPECT_EQ(test.pool_size(0), 3U);
+    EXPECT_EQ(test.slots(), 3U);
+    EXPECT_EQ(test.refusals(), 1U);
+    // Reactor 1 finds the cap exhausted but still gets its floor writer.
+    want_writers(test.at(1), 4, now);
+    EXPECT_EQ(test.pool_size(1), 1U) << "a reactor was starved by the shared cap";
+    EXPECT_EQ(test.slots(), 4U);
+    EXPECT_EQ(test.refusals(), 2U);
+    // Client attaches and housekeeping ticks within the retry interval neither
+    // dial nor count another refusal.
+    (void)test.at(1).ensure_me(2, now);
+    (void)test.at(1).ensure_me(2, now + std::chrono::milliseconds(500));
+    EXPECT_EQ(test.refusals(), 2U);
+    EXPECT_EQ(test.pool_size(1), 1U);
+    (void)test.at(1).ensure_me(2, now + mtdd::detail::kMeCapRetry);
+    EXPECT_EQ(test.refusals(), 3U);
+
+    const auto metrics = test.stats.prometheus_text();
+    EXPECT_NE(metrics.find("mtdd_me_writer_slots{dc=\"2\"} 4\n"), std::string::npos);
+    EXPECT_NE(metrics.find("mtdd_me_writer_cap_refusals_total{dc=\"2\"} 3\n"), std::string::npos);
+}
+
+TEST(MeWriterCap, FloorsAreExemptEvenWhenTheyExceedTheCap) {
+    CapReactors test(3, 1);
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    for (std::size_t index = 0; index < 3; ++index) want_writers(test.at(index), 2, now);
+    for (std::size_t index = 0; index < 3; ++index) EXPECT_EQ(test.pool_size(index), 1U);
+    EXPECT_EQ(test.slots(), 3U);
+}
+
+TEST(MeWriterCap, ZeroCapKeepsThePerReactorLimitOnly) {
+    CapReactors test(2, 0);
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    want_writers(test.at(0), 3, now);
+    want_writers(test.at(1), 3, now);
+    EXPECT_EQ(test.pool_size(0), 3U);
+    EXPECT_EQ(test.pool_size(1), 3U);
+    EXPECT_EQ(test.slots(), 6U) << "slots are still counted without a cap";
+    EXPECT_EQ(test.refusals(), 0U);
+}
+
+TEST(MeWriterCap, RetiredDrainedAndFailedWritersReturnTheirSlots) {
+    CapReactors test(2, 3);
+    using Impl = mtdd::Runtime::Impl;
+    auto now = Impl::Clock::now();
+    want_writers(test.at(0), 3, now);
+    want_writers(test.at(1), 3, now);
+    ASSERT_EQ(test.pool_size(0), 3U);
+    ASSERT_EQ(test.pool_size(1), 1U);
+    ASSERT_EQ(test.slots(), 4U);
+    auto& pool = test.at(0).me_pool_[2];
+
+    // Metadata-style drain: retired at zero clients by the reaper.
+    Impl::MeConn* drained = pool.conns.back().get();
+    drained->draining = true;
+    drained->draining_deadline = now + std::chrono::hours(1);
+    test.at(0).reap_me_pool(now);
+    EXPECT_EQ(test.slots(), 3U);
+
+    // Failure of a draining writer: it never reconnects and the reaper frees it.
+    Impl::MeConn* failing = pool.conns.back().get();
+    failing->draining = true;
+    failing->draining_deadline = now + std::chrono::hours(1);
+    failing->state = Impl::MeConn::State::connecting;
+    test.at(0).fail_me(*failing, now);
+    test.at(0).reap_me_pool(now);
+    EXPECT_EQ(test.slots(), 2U);
+
+    // The freed capacity is usable by the other reactor (after its retry gate).
+    now += mtdd::detail::kMeCapRetry;
+    (void)test.at(1).ensure_me(2, now);
+    EXPECT_EQ(test.pool_size(1), 2U);
+    EXPECT_EQ(test.slots(), 3U);
+
+    // Scale-down drain: the victim leaves once its queues are empty.
+    auto& other = test.at(1).me_pool_[2];
+    for (auto& member : other.conns) member->state = Impl::MeConn::State::ready;
+    other.scale_target = 2;
+    test.at(1).config_.me_clients_per_writer = 10;
+    test.at(1).scale_me_pool(2, now + std::chrono::seconds(20));
+    test.at(1).scale_me_pool(2, now + std::chrono::seconds(30));
+    test.at(1).scale_me_pool(2, now + std::chrono::seconds(400));
+    test.at(1).reap_me_pool(now + std::chrono::seconds(401));
+    EXPECT_EQ(test.pool_size(1), 1U) << "the scale-down victim was not retired";
+    EXPECT_EQ(test.slots(), 2U);
+
+    // Reactor teardown (finalize) returns every slot it held.
+    test.reactors[0].reset();
+    EXPECT_EQ(test.shared->me_writers_of(2), 1U);
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("2").writer_slots, 1U);
+    test.reactors[1].reset();
+    EXPECT_EQ(test.shared->me_writers_of(2), 0U);
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("2").writer_slots, 0U);
+}
+
+TEST(MeWriterCap, SuccessorReplacesOneForOneUnderAFullCap) {
+    CapReactors test(1, 3);
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    auto& reactor = test.at(0);
+    want_writers(reactor, 3, now);
+    auto& pool = reactor.me_pool_[2];
+    ASSERT_EQ(pool.conns.size(), 3U);
+    ASSERT_EQ(test.slots(), 3U);
+    // The working generation is serving; a metadata change asks for a successor.
+    pool.serving_generation = pool.desired_generation;
+    for (auto& member : pool.conns) {
+        member->state = Impl::MeConn::State::ready;
+        member->clients = 1;
+    }
+    reactor.advance_me_generation(2, now);
+    const auto successors = static_cast<std::size_t>(std::count_if(
+        pool.conns.begin(), pool.conns.end(),
+        [&](const std::unique_ptr<Impl::MeConn>& member) {
+            return member->generation == pool.desired_generation;
+        }));
+    EXPECT_EQ(successors, 3U) << "replacement stalled at the cap";
+    EXPECT_EQ(test.slots(), 6U);
+    EXPECT_EQ(test.refusals(), 0U);
+    // Growth beyond the replaced size is capped again.
+    pool.scale_target = 4;
+    (void)reactor.ensure_me(2, now);
+    EXPECT_EQ(test.slots(), 6U);
+    EXPECT_EQ(test.refusals(), 1U);
+    for (auto& member : pool.conns) member->clients = 0;
+}
+
+TEST(MeWriterCap, ReloadedCapAppliesToTheNextDial) {
+    CapReactors test(1, 0);
+    using Impl = mtdd::Runtime::Impl;
+    auto now = Impl::Clock::now();
+    auto& reactor = test.at(0);
+    want_writers(reactor, 2, now);
+    ASSERT_EQ(test.slots(), 2U);
+    // Lowering the cap closes nothing, but blocks growth.
+    test.shared->me_connections_per_dc_total.store(1);
+    want_writers(reactor, 4, now);
+    EXPECT_EQ(test.slots(), 2U);
+    EXPECT_EQ(test.refusals(), 1U);
+    // Raising it lets the pool grow at the next allowed dial.
+    test.shared->me_connections_per_dc_total.store(3);
+    now += mtdd::detail::kMeCapRetry;
+    (void)reactor.ensure_me(2, now);
+    EXPECT_EQ(test.slots(), 3U);
+    // Removing it (0) lifts the gate at once.
+    test.shared->me_connections_per_dc_total.store(0);
+    (void)reactor.ensure_me(2, now);
+    EXPECT_EQ(test.slots(), 4U);
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 Middle-End endpoints (me_ipv6)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<mtdd::MeMetadata> dual_metadata() {
+    auto snapshot = std::make_shared<mtdd::MeMetadata>();
+    snapshot->endpoints.push_back({2, "127.0.0.1", 1});
+    snapshot->endpoints.push_back({4, "127.0.0.1", 1});
+    snapshot->endpoints_v6.push_back({2, "::1", 1});
+    snapshot->endpoints_v6.push_back({5, "::1", 1});
+    snapshot->secret.assign(128, 7);
+    return snapshot;
+}
+
+using Hosts = std::vector<std::string>;
+
+Hosts dial_hosts(mtdd::Runtime::Impl& reactor, std::int16_t dc, mtdd::Runtime::Impl::Time now) {
+    std::vector<mtdd::MeEndpoint> out;
+    Hosts hosts;
+    if (!reactor.me_dial_candidates(dc, now, out)) return hosts;
+    for (const auto& endpoint : out) hosts.push_back(endpoint.host);
+    return hosts;
+}
+
+} // namespace
+
+TEST(MeIpv6, OffIgnoresTheIpv6List) {
+    AuditReactor test("v6-off");
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    test.reactor->config_.me_ipv6 = mtdd::Config::MeIpv6::off;
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"127.0.0.1"});
+    EXPECT_TRUE(dial_hosts(*test.reactor, 5, now).empty()) << "an IPv6-only DC appeared";
+}
+
+TEST(MeIpv6, AutoPrefersIpv4AndUsesIpv6OnlyWithoutIt) {
+    AuditReactor test("v6-auto");
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    ASSERT_EQ(test.reactor->config_.me_ipv6, mtdd::Config::MeIpv6::automatic);
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"127.0.0.1"});
+    EXPECT_EQ(dial_hosts(*test.reactor, 4, now), Hosts{"127.0.0.1"});
+    EXPECT_EQ(dial_hosts(*test.reactor, 5, now), Hosts{"::1"});
+}
+
+TEST(MeIpv6, OnPrefersIpv6AndFallsBackToIpv4WithoutIt) {
+    AuditReactor test("v6-on");
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    test.reactor->config_.me_ipv6 = mtdd::Config::MeIpv6::on;
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"::1"});
+    EXPECT_EQ(dial_hosts(*test.reactor, 4, now), Hosts{"127.0.0.1"});
+}
+
+TEST(MeIpv6, RepeatedIpv4FailuresMoveDialsToIpv6ForABoundedWindow) {
+    AuditReactor test("v6-failover");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    auto& pool = test.reactor->me_pool_[2];
+    Impl::MeConn me;
+    me.dc = 2;
+    me.dialed_v6 = false;
+    // A success in between resets the streak.
+    test.reactor->note_me_dial_result(me, false, now);
+    test.reactor->note_me_dial_result(me, false, now);
+    test.reactor->note_me_dial_result(me, true, now);
+    test.reactor->note_me_dial_result(me, false, now);
+    test.reactor->note_me_dial_result(me, false, now);
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"127.0.0.1"});
+    // IPv6 outcomes never steer the IPv4 preference.
+    me.dialed_v6 = true;
+    test.reactor->note_me_dial_result(me, false, now);
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"127.0.0.1"});
+    me.dialed_v6 = false;
+    test.reactor->note_me_dial_result(me, false, now);
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, now), Hosts{"::1"});
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("2").family_fallbacks_total, 1U);
+    EXPECT_EQ(pool.family_failures, 0U);
+    // Late IPv4 failures inside the window do not extend it.
+    test.reactor->note_me_dial_result(me, false, now + std::chrono::seconds(1));
+    EXPECT_EQ(pool.family_fallback_until, now + mtdd::detail::kMeFamilyFallbackWindow);
+    // The preferred family is tried again once the window ends.
+    const auto later = now + mtdd::detail::kMeFamilyFallbackWindow;
+    EXPECT_EQ(dial_hosts(*test.reactor, 2, later), Hosts{"127.0.0.1"});
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("2").family_fallbacks_total, 1U);
+}
+
+TEST(MeIpv6, FailuresWithoutTheOtherFamilyDoNotOpenAWindow) {
+    AuditReactor test("v6-no-other");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    auto& pool = test.reactor->me_pool_[4];
+    Impl::MeConn me;
+    me.dc = 4;
+    for (unsigned i = 0; i < mtdd::detail::kMeFamilyFailover * 2; ++i) {
+        test.reactor->note_me_dial_result(me, false, now);
+    }
+    EXPECT_EQ(pool.family_fallback_until, Impl::Time{});
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("4").family_fallbacks_total, 0U);
+}
+
+TEST(MeIpv6, FailedIpv4DialsOfAPoolSwitchItsWritersToIpv6) {
+    AuditReactor test("v6-dial");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->metadata_snapshot_ = dual_metadata();
+    auto& pool = test.reactor->me_pool_[2];
+    pool.scale_target = 1;
+    Impl::MeConn* me = test.reactor->ensure_me(2, now);
+    ASSERT_NE(me, nullptr);
+    EXPECT_FALSE(me->dialed_v6);
+    // Every failed attempt at the refused IPv4 endpoint counts, synchronous
+    // (connect error) or not (fail_me while connecting/handshaking).
+    for (unsigned guard = 0; pool.family_fallback_until == Impl::Time{}; ++guard) {
+        ASSERT_LT(guard, 4U * mtdd::detail::kMeFamilyFailover) << "failures were not counted";
+        ASSERT_FALSE(me->dialed_v6);
+        if (me->state == Impl::MeConn::State::backoff) {
+            test.reactor->connect_me(*me, now);
+        } else {
+            test.reactor->fail_me(*me, now);
+        }
+    }
+    if (me->state != Impl::MeConn::State::backoff) test.reactor->fail_me(*me, now);
+    test.reactor->connect_me(*me, now);
+    EXPECT_TRUE(me->dialed_v6) << "the retry did not move to the IPv6 endpoint";
+    EXPECT_EQ(test.stats.snapshot().me_dcs.at("2").family_fallbacks_total, 1U);
+}

@@ -21,12 +21,19 @@ struct MeEndpoint {
 
 struct MeMetadata {
     std::vector<MeEndpoint> endpoints;
+    // getProxyConfigV6 (or Config::me_config_v6_path); empty when
+    // Config::me_ipv6 is off or no IPv6 list was ever loaded.
+    std::vector<MeEndpoint> endpoints_v6;
     std::vector<std::uint8_t> secret;
     std::uint64_t generation{};
 };
 
 std::vector<MeEndpoint> parse_me_config(std::string_view text);
-MeMetadata load_me_metadata(const Config& config, std::stop_token stop = {});
+// Loads the IPv4 list and the secret (failure throws) and, unless
+// Config::me_ipv6 is off, the IPv6 list. A failed IPv6 list never throws: it
+// is replaced by `previous_v6` (the last list that loaded).
+MeMetadata load_me_metadata(const Config& config, std::stop_token stop = {},
+                            const std::vector<MeEndpoint>* previous_v6 = nullptr);
 
 // Refresh never runs on the reactor. Failed refresh preserves the last valid snapshot.
 class MetadataProvider {

@@ -352,7 +352,8 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "suspects", "fingerprint", "cpu_affinity", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
         "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes",
-        "proxy_protocol", "proxy_protocol_allow", "upstreams", "masking_scope", "me_nat_ip"};
+        "proxy_protocol", "proxy_protocol_allow", "upstreams", "masking_scope", "me_nat_ip",
+        "me_connections_per_dc_total", "me_ipv6", "me_config_v6_path"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -463,12 +464,26 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     if (value.contains("me_secret_path")) config.me_secret_path = resolve(base, text(value, "me_secret_path", ""));
     if (config.me_config_path.empty() != config.me_secret_path.empty())
         throw std::invalid_argument("me_config_path and me_secret_path must be provided together");
+    const auto me_ipv6 = text(value, "me_ipv6", "auto");
+    if (me_ipv6 == "auto") {
+        config.me_ipv6 = Config::MeIpv6::automatic;
+    } else if (me_ipv6 == "on") {
+        config.me_ipv6 = Config::MeIpv6::on;
+    } else if (me_ipv6 == "off") {
+        config.me_ipv6 = Config::MeIpv6::off;
+    } else {
+        throw std::invalid_argument("me_ipv6 must be \"auto\", \"on\" or \"off\"");
+    }
+    if (value.contains("me_config_v6_path")) config.me_config_v6_path = resolve(base, text(value, "me_config_v6_path", ""));
+    if (!config.me_config_v6_path.empty() && config.me_ipv6 == Config::MeIpv6::off)
+        throw std::invalid_argument("me_config_v6_path requires me_ipv6 \"auto\" or \"on\"");
     config.unique_ip_min_bytes = number(value, "unique_ip_min_bytes", config.unique_ip_min_bytes, 0, 1ULL << 40);
     if (value.contains("unique_ip_stats_path")) {
         config.unique_ip_stats_path = resolve(base, text(value, "unique_ip_stats_path", ""));
         if (config.unique_ip_stats_path == config.users_path ||
             config.unique_ip_stats_path == config.me_config_path ||
-            config.unique_ip_stats_path == config.me_secret_path)
+            config.unique_ip_stats_path == config.me_secret_path ||
+            (!config.me_config_v6_path.empty() && config.unique_ip_stats_path == config.me_config_v6_path))
             throw std::invalid_argument("unique IP statistics must use a separate file");
     }
     if (value.contains("usage_state_path")) {
@@ -476,12 +491,16 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         if (config.usage_state_path == config.users_path ||
             config.usage_state_path == config.me_config_path ||
             config.usage_state_path == config.me_secret_path ||
+            (!config.me_config_v6_path.empty() && config.usage_state_path == config.me_config_v6_path) ||
             (!config.usage_state_path.empty() && config.usage_state_path == config.unique_ip_stats_path))
             throw std::invalid_argument("usage state must use a separate file");
     }
     config.workers = static_cast<std::uint32_t>(number(value, "workers", 0, 0, 256));
     config.me_connections_per_dc = static_cast<std::uint32_t>(
         number(value, "me_connections_per_dc", config.me_connections_per_dc, 1, 24));
+    // 0 (the default) keeps the per-reactor limit as the only bound.
+    config.me_connections_per_dc_total = static_cast<std::uint32_t>(
+        number(value, "me_connections_per_dc_total", 0, 0, 1024));
     config.me_clients_per_writer = static_cast<std::uint32_t>(
         number(value, "me_clients_per_writer", config.me_clients_per_writer, 1, 1000000));
     if (value.contains("max_connections")) {
@@ -626,9 +645,12 @@ nlohmann::json Config::public_view() const {
         {"unique_ip_min_bytes", unique_ip_min_bytes},
         {"me_config_path", me_config_path.string()},
         {"me_secret_path", me_secret_path.string()},
+        {"me_ipv6", me_ipv6 == MeIpv6::off ? "off" : me_ipv6 == MeIpv6::on ? "on" : "auto"},
+        {"me_config_v6_path", me_config_v6_path.string()},
         {"workers", workers},
         {"max_connections", max_connections},
         {"me_connections_per_dc", me_connections_per_dc},
+        {"me_connections_per_dc_total", me_connections_per_dc_total},
         {"me_clients_per_writer", me_clients_per_writer},
         {"max_handshakes", max_handshakes},
         {"max_frame_bytes", max_frame_bytes},

@@ -178,6 +178,16 @@ inline constexpr std::size_t kMePendingBatch = 4;
 // reached over several ticks, and a synchronously failing endpoint cannot turn
 // one call into a connect storm.
 inline constexpr std::size_t kMeDialBatch = 4;
+// After the process-wide writer cap refused a dial, the pool does not ask
+// again (and does not count another refusal) for this long: client attaches
+// and housekeeping ticks would otherwise retry on every event.
+inline constexpr std::chrono::seconds kMeCapRetry{1};
+// Address-family fallback of ME dials (Config::me_ipv6): this many
+// consecutive failed attempts of the preferred family move new dials of the
+// DC to the other family for kMeFamilyFallbackWindow; then the preferred
+// family is tried again.
+inline constexpr unsigned kMeFamilyFailover = 3;
+inline constexpr std::chrono::seconds kMeFamilyFallbackWindow{300};
 // TCP_USER_TIMEOUT for ME sockets (milliseconds).
 inline constexpr unsigned kMeUserTimeoutMs = 30000;
 
@@ -1026,6 +1036,34 @@ struct SharedState {
     std::atomic<std::uint32_t> me_clients_per_writer{0};
     std::atomic<std::uint32_t> me_connections_per_dc{0};
     std::atomic<std::uint64_t> tunables_generation{0};
+    // Process-wide ME writer cap per signed DC (Config::
+    // me_connections_per_dc_total, 0 = none). Read at every non-floor dial,
+    // so a reload applies to the next dial without a generation.
+    std::atomic<std::uint32_t> me_connections_per_dc_total{0};
+    // Live ME writer slots per signed DC across every reactor. A pool member
+    // holds its slot (MeWriterSlot) from creation until it leaves the pool,
+    // whatever the path (retire, rollback, finalize). The map only grows (one
+    // node per DC ever served) and nodes never move, so a reactor resolves
+    // the counter once under the mutex and then uses the atomic lock-free.
+    std::atomic<std::uint64_t>& me_writer_counter(std::int16_t dc) {
+        const std::lock_guard lock{me_writers_mutex};
+        return me_writers[dc];
+    }
+    std::uint64_t me_writers_of(std::int16_t dc) {
+        const std::lock_guard lock{me_writers_mutex};
+        const auto found = me_writers.find(dc);
+        return found == me_writers.end() ? 0 : found->second.load(std::memory_order_relaxed);
+    }
+    // Takes one slot: a floor slot (cap 0) always succeeds, a capped one only
+    // while fewer than `cap` slots are held process-wide.
+    static bool reserve_me_writer(std::atomic<std::uint64_t>& counter,
+                                  std::uint64_t cap) noexcept {
+        if (cap == 0) {
+            counter.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return reserve_below(counter, cap);
+    }
     // Live ad-tag override (Runtime::set_ad_tag). The value is read under the
     // mutex only when the generation changed, never per relayed packet.
     std::mutex ad_tag_mutex;
@@ -1110,6 +1148,9 @@ struct SharedState {
     void stop_all() noexcept;
 
 private:
+    std::mutex me_writers_mutex;
+    std::map<std::int16_t, std::atomic<std::uint64_t>> me_writers;
+
     static bool reserve_below(std::atomic<std::uint64_t>& counter,
                               std::uint64_t limit) noexcept {
         std::uint64_t current = counter.load(std::memory_order_relaxed);
@@ -1122,6 +1163,53 @@ private:
         }
         return false;
     }
+};
+
+// SharedState of a reactor constructed without one (a single-reactor
+// embedding or a unit test): the shared limits come from `config`.
+std::shared_ptr<SharedState> standalone_shared_state(const Config& config);
+
+// One process-wide ME writer slot (SharedState::me_writer_counter), owned by
+// the pool member it was taken for. Destruction releases it, so every path a
+// member leaves its pool by (retire, failed creation, finalize, reactor
+// destruction) returns the slot exactly once. The statistics mirror moves by
+// the same +1/-1, which keeps the exported gauge exact under concurrency.
+class MeWriterSlot {
+public:
+    MeWriterSlot() = default;
+    MeWriterSlot(std::atomic<std::uint64_t>& counter, control::Statistics& stats,
+                 std::int16_t dc) noexcept
+        : counter_(&counter), stats_(&stats), dc_(dc) {
+        stats_->me_writer_slot(dc_, true);
+    }
+    ~MeWriterSlot() { release(); }
+    MeWriterSlot(const MeWriterSlot&) = delete;
+    MeWriterSlot& operator=(const MeWriterSlot&) = delete;
+    MeWriterSlot(MeWriterSlot&& other) noexcept
+        : counter_(std::exchange(other.counter_, nullptr)),
+          stats_(std::exchange(other.stats_, nullptr)), dc_(other.dc_) {}
+    MeWriterSlot& operator=(MeWriterSlot&& other) noexcept {
+        if (this != &other) {
+            release();
+            counter_ = std::exchange(other.counter_, nullptr);
+            stats_ = std::exchange(other.stats_, nullptr);
+            dc_ = other.dc_;
+        }
+        return *this;
+    }
+    bool held() const noexcept { return counter_ != nullptr; }
+    void release() noexcept {
+        if (counter_ == nullptr) return;
+        counter_->fetch_sub(1, std::memory_order_relaxed);
+        if (stats_ != nullptr) stats_->me_writer_slot(dc_, false);
+        counter_ = nullptr;
+        stats_ = nullptr;
+    }
+
+private:
+    std::atomic<std::uint64_t>* counter_{nullptr};
+    control::Statistics* stats_{nullptr};
+    std::int16_t dc_{0};
 };
 
 // Per-worker acceptance counters are part of SharedState; tests read them
@@ -1476,6 +1564,11 @@ struct Runtime::Impl {
         bool draining{false};
         bool scale_draining{false};
         Time draining_deadline{};
+        // Address family of the current/last dial attempt (me_ipv6 failover).
+        bool dialed_v6{false};
+        // Process-wide writer slot (me_connections_per_dc_total). Released
+        // when this object is destroyed, i.e. when it leaves the pool.
+        detail::MeWriterSlot slot;
     };
 
     struct DcPool {
@@ -1516,6 +1609,13 @@ struct Runtime::Impl {
         // rotates (see fold_me_counters).
         std::uint64_t rx_bytes{0};
         std::uint64_t tx_bytes{0};
+        // Process-wide writer cap: no further capped dial is attempted (or
+        // counted as refused) before this time.
+        Time cap_retry_at{};
+        // me_ipv6 failover: consecutive failed dials of the preferred family,
+        // and while now < family_fallback_until new dials use the other one.
+        unsigned family_failures{0};
+        Time family_fallback_until{};
         // unique_ptr keeps MeConn addresses stable across vector growth: open
         // epoll targets, sink callbacks and Client::me all store raw pointers.
         std::vector<std::unique_ptr<MeConn>> conns;
@@ -1808,6 +1908,11 @@ struct Runtime::Impl {
     // instead of leaving the node not-ready while it relays traffic.
     bool restore_me_serving_generation();
     bool me_candidates(std::int16_t dc, std::vector<MeEndpoint>& out) const;
+    // The endpoints a new dial of `dc` uses: me_candidates() narrowed to one
+    // address family by Config::me_ipv6 and the pool's failover state.
+    bool me_dial_candidates(std::int16_t dc, Time now, std::vector<MeEndpoint>& out);
+    // Feeds the me_ipv6 failover with the outcome of one dial attempt.
+    void note_me_dial_result(MeConn& me, bool success, Time now);
     void connect_me(MeConn& me, Time now);
     void on_me_connected(MeConn& me, Time now);
     void fail_me(MeConn& me, Time now);
@@ -2062,6 +2167,7 @@ struct Runtime::RuntimeState {
     std::vector<std::uint64_t> accepted_clients_per_worker() const;
     std::vector<std::uint64_t> replay_rejections_per_worker() const;
     void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
+    void set_me_writer_cap(std::uint32_t me_connections_per_dc_total);
     void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
     void set_ad_tag(const std::array<std::uint8_t, 16>& tag);
     void on_reload(std::function<void()> hook);

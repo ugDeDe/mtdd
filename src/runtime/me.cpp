@@ -79,13 +79,70 @@ Runtime::Impl::to_protocol_endpoint(const io::Endpoint& endpoint) {
     return std::nullopt;
 }
 
+namespace {
+// Metadata hosts are numeric (parse_me_config), so a colon means IPv6.
+bool me_host_is_v6(const std::string& host) noexcept {
+    return host.find(':') != std::string::npos;
+}
+} // namespace
+
 bool Runtime::Impl::me_candidates(std::int16_t dc, std::vector<MeEndpoint>& out) const {
     out.clear();
     if (!metadata_snapshot_ || metadata_snapshot_->secret.empty()) return false;
     for (const auto& endpoint : metadata_snapshot_->endpoints) {
         if (endpoint.dc == dc) out.push_back(endpoint);
     }
+    if (config_.me_ipv6 != Config::MeIpv6::off) {
+        for (const auto& endpoint : metadata_snapshot_->endpoints_v6) {
+            if (endpoint.dc == dc) out.push_back(endpoint);
+        }
+    }
     return !out.empty();
+}
+
+bool Runtime::Impl::me_dial_candidates(std::int16_t dc, Time now, std::vector<MeEndpoint>& out) {
+    if (!me_candidates(dc, out)) return false;
+    if (config_.me_ipv6 == Config::MeIpv6::off) return true;
+    // Preferred family: IPv4 for "auto", IPv6 for "on"; the other one while the
+    // pool's failover window is open. A family the DC has no endpoint in is
+    // never chosen, so a DC listed only in one list always dials that one.
+    bool want_v6 = config_.me_ipv6 == Config::MeIpv6::on;
+    if (const auto found = me_pool_.find(dc);
+        found != me_pool_.end() && now < found->second.family_fallback_until) {
+        want_v6 = !want_v6;
+    }
+    const auto chosen_end = std::stable_partition(
+        out.begin(), out.end(),
+        [want_v6](const MeEndpoint& endpoint) { return me_host_is_v6(endpoint.host) == want_v6; });
+    if (chosen_end != out.begin()) out.erase(chosen_end, out.end());
+    return true;
+}
+
+void Runtime::Impl::note_me_dial_result(MeConn& me, bool success, Time now) {
+    if (config_.me_ipv6 == Config::MeIpv6::off) return;
+    const auto found = me_pool_.find(me.dc);
+    if (found == me_pool_.end()) return;
+    DcPool& pool = found->second;
+    const bool preferred_v6 = config_.me_ipv6 == Config::MeIpv6::on;
+    // Only the preferred family steers the failover: a fallback dial that
+    // fails says nothing about whether the preferred one recovered.
+    if (me.dialed_v6 != preferred_v6) return;
+    if (success) {
+        pool.family_failures = 0;
+        return;
+    }
+    if (now < pool.family_fallback_until) return;
+    if (++pool.family_failures < detail::kMeFamilyFailover) return;
+    pool.family_failures = 0;
+    std::vector<MeEndpoint> candidates;
+    (void)me_candidates(me.dc, candidates);
+    const bool other_family = std::any_of(
+        candidates.begin(), candidates.end(), [preferred_v6](const MeEndpoint& endpoint) {
+            return me_host_is_v6(endpoint.host) != preferred_v6;
+        });
+    if (!other_family) return;
+    pool.family_fallback_until = now + detail::kMeFamilyFallbackWindow;
+    stats_.me_family_fallback(me.dc);
 }
 
 std::size_t Runtime::Impl::me_frame_capacity() const noexcept {
@@ -523,6 +580,20 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
     const bool successor = pool.serving_generation != 0 &&
                            generation != pool.serving_generation;
     const std::size_t reactor_limit = successor ? 64 : 63;
+    // Process-wide writer cap (me_connections_per_dc_total, 0 = none). Two
+    // kinds of dial are exempt and always take their slot:
+    //  - the floor: the first writer of the generation in this pool, so every
+    //    reactor keeps one writer per DC it serves however many reactors
+    //    share the cap;
+    //  - one-for-one replacement: while older generations of the pool still
+    //    hold writers (successor-first metadata replacement), the successor
+    //    may grow up to their number. The pool never exceeds its size before
+    //    the replacement, and the overshoot ends when the old writers drain
+    //    (zero clients or the drain deadline). Reserving headroom instead
+    //    would idle capacity all the time, or stall replacement at the cap.
+    const std::uint64_t cap =
+        shared_->me_connections_per_dc_total.load(std::memory_order_relaxed);
+    std::atomic<std::uint64_t>* writers = nullptr;
     // Fill the slots of the requested generation only. The working generation
     // may still be present (successor-first replacement), so counting every
     // non-draining slot would suppress the successor entirely.
@@ -532,13 +603,30 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
            reactor_writers < reactor_limit &&
            pending < detail::kMePendingBatch &&
            dialed < detail::kMeDialBatch) {
-        if (me_generation_count(pool, generation) > 0 && !budget_allows(65536)) {
+        const std::size_t members = me_generation_count(pool, generation);
+        if (members > 0 && !budget_allows(65536)) {
             note_budget_refusal(control::BudgetRefusal::me_dial);
             break;
         }
+        std::size_t older = 0;
+        for (const auto& member : pool.conns) {
+            if (member && member->generation < generation) ++older;
+        }
+        const bool exempt = members == 0 || members < older;
+        if (!exempt && cap != 0 && now < pool.cap_retry_at) break;
+        if (writers == nullptr) writers = &shared_->me_writer_counter(dc);
+        if (!detail::SharedState::reserve_me_writer(*writers, exempt ? 0 : cap)) {
+            pool.cap_retry_at = now + detail::kMeCapRetry;
+            stats_.me_writer_cap_refused(dc);
+            break;
+        }
+        // Owns the reserved slot from here: a throw below releases it with
+        // the local, a later retire or rollback with the pool member.
+        detail::MeWriterSlot reserved(*writers, stats_, dc);
         MeConn* connection = nullptr;
         try {
             auto owned = std::make_unique<MeConn>();
+            owned->slot = std::move(reserved);
             owned->dc = dc;
             owned->generation = generation;
             owned->meta = metadata_snapshot_;

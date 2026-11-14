@@ -302,6 +302,13 @@ void clear_reactor_fatal_for_test() noexcept {
     for (auto& slot : g_reactor_fatal) slot.store(false, std::memory_order_relaxed);
 }
 
+std::shared_ptr<SharedState> standalone_shared_state(const Config& config) {
+    auto state = std::make_shared<SharedState>(1, config.global_buffer_bytes);
+    state->me_connections_per_dc_total.store(config.me_connections_per_dc_total,
+                                             std::memory_order_relaxed);
+    return state;
+}
+
 } // namespace detail
 
 Runtime::Impl::Impl(const Config& config, control::UserStore& users,
@@ -312,9 +319,7 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
                     bool signal_owner)
     : config_(config), ping_tuning_(detail::me_ping_tuning()), users_(users),
       stats_(statistics), metadata_(metadata), barrier_(barrier),
-      shared_(shared ? std::move(shared)
-                     : std::make_shared<detail::SharedState>(
-                           1, config.global_buffer_bytes)),
+      shared_(shared ? std::move(shared) : detail::standalone_shared_state(config)),
       worker_index_(worker_index), reuse_port_(reuse_port),
       signal_owner_(signal_owner), random_(protocol::buffered_random()) {
     if (config_.max_frame_bytes == 0 || config_.connection_queue_bytes == 0) {

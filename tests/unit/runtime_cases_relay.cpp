@@ -420,6 +420,54 @@ TEST(Runtime, FullRelayThroughFakeMiddleEnd) {
     EXPECT_GE(snapshot.me_dcs.at("2").requests_success, 1U);
 }
 
+// A DC listed only in the IPv6 list (me_ipv6 "auto") is reached over IPv6: the
+// runtime derives the ME keys from the IPv6 socket ends, advertises the IPv6
+// listener address and sends a zero IPv4 field in the handshake process id.
+TEST(Runtime, FullRelayThroughIpv6MiddleEnd) {
+    std::unique_ptr<FakeMe> me;
+    try {
+        me = std::make_unique<FakeMe>(me_secret(), 1, 0ms, 1, 0ms, 0ms, false, 0, 1500,
+                                      kBurstSize, true, 0, false, "::1");
+    } catch (const std::exception&) {
+        GTEST_SKIP() << "no IPv6 loopback on this host";
+    }
+    const std::uint16_t me_port = me->port();
+    Daemon daemon(me_port, true, [me_port](mtdd::Config& config) {
+        // DC 2 only in the IPv6 list; the IPv4 list names another DC.
+        std::ofstream v4{config.me_config_path, std::ios::binary | std::ios::trunc};
+        v4 << "proxy_for 4 127.0.0.1:1;\n";
+        config.me_config_v6_path = config.me_config_path.parent_path() / "me6.txt";
+        std::ofstream v6{config.me_config_v6_path, std::ios::binary};
+        v6 << "proxy_for 2 [::1]:" << me_port << ";\n";
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 5s));
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    const Bytes request = burst_payload(0);
+    ASSERT_TRUE(client.send_message(request));
+    ASSERT_EQ(me->future().wait_for(5s), std::future_status::ready);
+    const auto observation = me->future().get();
+    ASSERT_TRUE(observation.ok) << "the IPv6 ME handshake or relay failed";
+    EXPECT_EQ(observation.inner, request);
+    std::array<std::uint8_t, 16> loopback{};
+    loopback[15] = 1;
+    EXPECT_EQ(observation.our_addr,
+              mtdd::protocol::Endpoint::v6(loopback, daemon.port()).wire20());
+    ASSERT_TRUE(observation.saw_sender_pid);
+    const Bytes sender(observation.sender_pid.begin(), observation.sender_pid.end());
+    EXPECT_EQ(rd32(sender, 0), 0U) << "IPv6 process ids carry no IPv4 address";
+    EXPECT_EQ(rd32(sender, 4) & 0xffffu, observation.peer_port);
+
+    Bytes response;
+    ASSERT_TRUE(client.read_message(response));
+    const Bytes expected{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44};
+    EXPECT_EQ(response, expected);
+}
+
 // Live ad-tag override: an ME session already open when the override arrives
 // carries the new tag in its next RPC_PROXY_REQ, without a reconnect.
 TEST(Runtime, LiveAdTagOverrideReachesOpenMiddleEndSession) {

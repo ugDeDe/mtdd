@@ -509,13 +509,16 @@ hex) **необязателен**: без него прокси работает
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
 | `cpu_affinity` | Закрепить reactor *i* за *i*-м доступным ядром, если reactors не больше ядер (по умолчанию `true`) |
 | `me_connections_per_dc` | Максимум активных ME writers на signed DC **в каждом reactor**, 1–24, по умолчанию 16. Это потолок, а не число соединений: пул растёт по спросу и не открывает новый writer, когда бюджет буферов исчерпан |
+| `me_connections_per_dc_total` | Общий предел ME writers на signed DC **для всего процесса** (сумма по reactors), 1–1024; `0` (по умолчанию) — предела нет, действует только `me_connections_per_dc`. Первый writer каждого reactor для DC не учитывается пределом, поэтому ни один reactor не остаётся без соединения (при `workers` больше предела сумма может его превышать). При замене метаданных новое поколение поднимается «один к одному» вместо старого, даже если предел исчерпан; превышение исчезает, когда старые writers уходят в дренаж. Понижение не закрывает живые writers, а только запрещает новые. Метрики: `mtdd_me_writer_slots`, `mtdd_me_writer_cap_refusals_total` |
 | `me_clients_per_writer` | Порог клиентов на writer для роста пула, по умолчанию 400. Это не жёсткий лимит: при достижении `me_connections_per_dc` клиенты продолжают распределяться по существующим writers |
-| | `me_clients_per_writer` и `me_connections_per_dc` применяются без обрыва клиентов командой `systemctl reload mtdd`; остальные параметры требуют перезапуска |
+| | `me_clients_per_writer`, `me_connections_per_dc` и `me_connections_per_dc_total` применяются без обрыва клиентов командой `systemctl reload mtdd`; остальные параметры требуют перезапуска |
 | `metadata_refresh_seconds` | Интервал обновления метаданных |
 | `direct_fallback_enabled`, `direct_fallback_dcs` | Явно включаемый Direct fallback для перечисленных signed DC |
 | `masking` | `true` по умолчанию: ClientHello, не прошедший аутентификацию, релеится на реальный сервер запрошенного SNI, если имя принадлежит `tls_domain` (сам домен или поддомен) — активная проба получает настоящий сертификат. Чужой или отсутствующий SNI и байты, которые вовсе не TLS (HTTP-запрос, текст), релеятся на сам `tls_domain`:443 — пробе отвечает настоящий сайт, а не RST. При заданном `fallback_host`/`fallback_port` цель фиксирована; при ошибке DNS/connect или выключенном `masking` соединение закрывается. Повторный (replay) ClientHello релеится так же, как неаутентифицированный. Реальный сервер каждого маскируемого домена (`tls_domain` и личные) периодически опрашивается обычным TLS 1.3-рукопожатием, и FakeTLS-ответ повторяет его: размер зашифрованного первого полёта, выбранный шифр, порядок расширений ServerHello и группу ключа (X25519, если сервер не отвечает X25519MLKEM768). До первого замера — прежний ответ |
 | `fallback_host`, `fallback_port` | Необязательный фикс-оверрайд: при заданном порте проба релеится на `fallback_host:fallback_port` вместо SNI-цели (совместимость с внешним TLS-бэкендом) |
 | `me_config_path`, `me_secret_path` | Локальные метаданные ME вместо загрузки по HTTPS |
+| `me_ipv6` | IPv6-адреса ME из `getProxyConfigV6`: `"auto"` (по умолчанию), `"on"` или `"off"`. `"off"` — только IPv4-список, как раньше. `"auto"` дополнительно загружает IPv6-список и подключается к DC по IPv6, только если у DC нет IPv4-адреса или три попытки подряд по IPv4 не удались (тогда новые подключения этого DC идут по IPv6 5 минут, затем снова пробуется IPv4). `"on"` — наоборот: сначала IPv6, IPv4 как запасной по тому же правилу. Ошибка загрузки IPv6-списка не мешает запуску и работе по IPv4 (остаётся предыдущий список). `me_nat_ip` подменяет адрес только своего семейства. Метрика переключений: `mtdd_me_family_fallbacks_total` |
+| `me_config_v6_path` | Локальный IPv6-список ME вместо загрузки (как `me_config_path`). Если задан `me_config_path`, а этот параметр нет, IPv6-список не используется |
 | `unique_ip_stats_path` | Необязательный файл контрольных точек HLL для приватной статистики уникальных IP |
 | `upstreams` | Через что выходят исходящие соединения: ME, Direct DC, маскировка и загрузка метаданных. По умолчанию напрямую. См. [Апстримы: WARP, AWG, донор](#апстримы-warp-awg-донор) |
 | `masking_scope` | Область (scope) апстримов для соединений маскировки, аналог `tls_fetch_scope` у telemt; пусто — общая |
@@ -661,6 +664,8 @@ ME привязывает ключи к адресу и порту, с кото�
 Бюджет делится между reactors (здесь 8 × 512 МиБ). Каждый reactor
 открывает собственный пул ME-соединений, поэтому `me_connections_per_dc`
 — это потолок на DC в одном reactor: в сумме до 8 × 24 writers на DC.
+Общее число соединений к Telegram на DC можно ограничить
+`me_connections_per_dc_total`.
 Также нужен лимит дескрипторов (`LimitNOFILE`, установщик ставит 1048576).
 
 Как понять, что упёрлись в бюджет:
@@ -788,7 +793,8 @@ curl -fsS -X POST -H "Authorization: Bearer $MTDD_API_TOKEN" \
 
 Полезные метрики: `mtdd_me_pool_connections`, `mtdd_me_pool_ready`,
 `mtdd_me_pool_target`, `mtdd_me_bound_clients`, `mtdd_me_scale_up_total`,
-`mtdd_me_scale_down_total`, `mtdd_me_creation_failures_total` и
+`mtdd_me_scale_down_total`, `mtdd_me_creation_failures_total`,
+`mtdd_me_writer_slots`, `mtdd_me_writer_cap_refusals_total` и
 `mtdd_me_ping_rtt_us`. Значения по DC суммируются по reactors.
 
 ## Сборка и проверка
