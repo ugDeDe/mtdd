@@ -396,6 +396,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
+    if (!client.held_server_hello.empty()) return;  // released by its deadline
     if (client.c2s_backpressured) return;  // resumed by flush_direct()/pump_c2s()
     if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
     if (!budget_allows(detail::kClientReadReservation)) {
@@ -440,6 +441,8 @@ void Runtime::Impl::read_client(Client& client, Time now) {
                                  now);
             if (clients_.find(token) == clients_.end()) return;
             if (client.phase == Client::Phase::fallback) return;
+            // The ServerHello is held back: read nothing past the ClientHello.
+            if (!client.held_server_hello.empty()) break;
             // Leave the rest in the kernel once the upstream queue is full.
             if (client.rate_pause_c2s || client.c2s_backpressured) break;
             // A short read drained the socket. The listener is level-triggered
@@ -963,12 +966,17 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     } else if (!config_.tls_domain.empty()) {
         tls_config.expected_server_name = config_.tls_domain;
     }
-    // The real server of the user's domain sized this flight (measured off
-    // the reactor); unmeasured, the protocol layer draws a fallback length.
+    // The real server of the user's domain sized this flight and chose this
+    // suite, extension order and group (measured off the reactor); unmeasured,
+    // the protocol layer draws a fallback length and echoes the client.
     if (tls_config.expected_server_name && masking_dns_) {
-        if (const auto flight = masking_dns_->server_flight(*tls_config.expected_server_name)) {
-            tls_config.server_hello.app_data_min = flight->min - detail::kServerFlightJitter;
-            tls_config.server_hello.app_data_max = flight->max + detail::kServerFlightJitter;
+        if (const auto profile = masking_dns_->server_profile(*tls_config.expected_server_name)) {
+            auto& options = tls_config.server_hello;
+            options.app_data_min = profile->min - detail::kServerFlightJitter;
+            options.app_data_max = profile->max + detail::kServerFlightJitter;
+            options.cipher = profile->cipher;
+            options.key_share_first = profile->key_share_first;
+            options.decline_pq = profile->decline_pq;
         }
     }
     if (!x25519_pool_.empty()) {
@@ -985,7 +993,13 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
                      control::HandshakeResult::failure);
         return;
     }
-    if (!push_client_wire(client, wire_buffer_)) {
+    // A real server answers after its own key exchange and signature; with
+    // server_hello_delay_* the flight is held (and the client not read) until
+    // the per-client server_hello_delay deadline releases it.
+    const auto delay = server_hello_delay();
+    if (delay.count() > 0) {
+        client.held_server_hello.assign(wire_buffer_.begin(), wire_buffer_.end());
+    } else if (!push_client_wire(client, wire_buffer_)) {
         stats_.add_backpressure(control::Direction::server_to_client);
         reject_close(client, control::RejectReason::overload,
                      control::HandshakeResult::failure);
@@ -1003,12 +1017,51 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     stats_.observe_ip_history(client.ip_key);
     note_ip_payload(client, 0);  // unique_ip_min_bytes == 0: active at handshake
     client.phase = Client::Phase::tls_handshake;
-    client.deadline_kind = Client::DeadlineKind::handshake;
-    deadlines_.set(client.token, now + config_.handshake_timeout);
+    if (!client.held_server_hello.empty()) {
+        client.deadline_kind = Client::DeadlineKind::server_hello_delay;
+        deadlines_.set(client.token, now + delay);
+        if (client.watched) {
+            watch_log(client, "server_hello", "delay_ms=" + std::to_string(delay.count()));
+        }
+    } else {
+        client.deadline_kind = Client::DeadlineKind::handshake;
+        deadlines_.set(client.token, now + config_.handshake_timeout);
+    }
     update_client_interest(client);
     detail::trim_buffer(wire_buffer_);
     detail::trim_buffer(plain_buffer_);
     reaccount(client);
+}
+
+std::chrono::milliseconds Runtime::Impl::server_hello_delay() {
+    const auto low = config_.server_hello_delay_min;
+    const auto high = std::max(config_.server_hello_delay_max, low);
+    if (high.count() <= 0) return std::chrono::milliseconds{0};
+    if (low == high) return low;
+    std::array<std::uint8_t, 4> draw{};
+    random_(draw);
+    const std::uint32_t value = (static_cast<std::uint32_t>(draw[0]) << 24) |
+                                (static_cast<std::uint32_t>(draw[1]) << 16) |
+                                (static_cast<std::uint32_t>(draw[2]) << 8) | draw[3];
+    const auto span = static_cast<std::uint64_t>((high - low).count()) + 1U;
+    return low + std::chrono::milliseconds(static_cast<std::int64_t>(value % span));
+}
+
+void Runtime::Impl::release_server_hello(Client& client, Time now) {
+    std::vector<std::uint8_t> wire;
+    wire.swap(client.held_server_hello);
+    if (!push_client_wire(client, wire)) {
+        stats_.add_backpressure(control::Direction::server_to_client);
+        reaccount(client);
+        reject_close(client, control::RejectReason::overload,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    client.deadline_kind = Client::DeadlineKind::handshake;
+    deadlines_.set(client.token, now + config_.handshake_timeout);
+    reaccount(client);
+    // Writes now and re-arms EPOLLIN (the held hello no longer blocks it).
+    pump_client_out(client);
 }
 
 void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t> wire, Time now) {

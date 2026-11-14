@@ -349,6 +349,37 @@ TEST(Config, ExplicitConnectionAndHandshakeCapsAreIndependent) {
     EXPECT_EQ(parsed.max_handshakes, 3U);
 }
 
+TEST(Config, ServerHelloDelayIsOffByDefaultAndBounded) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.server_hello_delay_min.count(), 0);
+    EXPECT_EQ(defaults.server_hello_delay_max.count(), 0);
+    EXPECT_EQ(defaults.public_view()["server_hello_delay_max_ms"].get<std::int64_t>(), 0);
+
+    auto value = minimal_config();
+    value["server_hello_delay_min_ms"] = 8;
+    value["server_hello_delay_max_ms"] = 24;
+    const auto parsed = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(parsed.server_hello_delay_min, std::chrono::milliseconds(8));
+    EXPECT_EQ(parsed.server_hello_delay_max, std::chrono::milliseconds(24));
+    EXPECT_EQ(parsed.public_view()["server_hello_delay_min_ms"].get<std::int64_t>(), 8);
+    EXPECT_EQ(parsed.public_view()["server_hello_delay_max_ms"].get<std::int64_t>(), 24);
+
+    value["server_hello_delay_max_ms"] = 1000;
+    EXPECT_NO_THROW(mtdd::Config::parse(value, "/work"));
+    value["server_hello_delay_max_ms"] = 1001;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["server_hello_delay_max_ms"] = 5;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument) << "min > max";
+    value["server_hello_delay_max_ms"] = -1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value.erase("server_hello_delay_max_ms");
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").server_hello_delay_max,
+              std::chrono::milliseconds(8))
+        << "a minimum alone is a fixed delay";
+    value["server_hello_delay_min_ms"] = 1001;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, RequiresEnoughGlobalMemoryForOneMaximumFrameAndQueues) {
     auto value = minimal_config();
     value["global_buffer_bytes"] = 262144;

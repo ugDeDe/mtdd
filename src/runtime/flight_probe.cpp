@@ -1,7 +1,9 @@
-// Server-flight probe: one ordinary TLS 1.3 handshake with the real server of
-// a masked tls_domain, measuring the encrypted EncryptedExtensions..Finished
-// flight that FakeTLS imitates with its single ApplicationData record. Runs on
-// MaskingResolver's background thread only.
+// Server probe: one ordinary TLS 1.3 handshake with the real server of a
+// masked tls_domain, measuring the encrypted EncryptedExtensions..Finished
+// flight that FakeTLS imitates with its single ApplicationData record, and
+// reading the server's own ServerHello (suite, extension order, key-share
+// group) that FakeTLS mirrors. Runs on MaskingResolver's background thread
+// only.
 //
 // The TLS engine works on memory BIOs and this file moves the bytes, so every
 // socket write uses MSG_NOSIGNAL (a peer reset cannot raise SIGPIPE) and every
@@ -15,6 +17,8 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 
 namespace mtdd::detail {
@@ -41,9 +45,24 @@ struct FlightCounter {
     bool done{false};
 };
 
-void on_record(int write_p, int, int content_type, const void* buf, std::size_t len, SSL*,
-               void* arg) {
-    auto* counter = static_cast<FlightCounter*>(arg);
+struct Observed {
+    FlightCounter counter;
+    ServerHelloCapture hello;
+};
+
+constexpr std::uint16_t kPqGroup = 0x11ec;
+
+// Message callback: record headers feed the flight counter; the server's
+// handshake messages (whole, header included) feed the ServerHello capture.
+void on_message(int write_p, int, int content_type, const void* buf, std::size_t len, SSL*,
+                void* arg) {
+    auto* observed = static_cast<Observed*>(arg);
+    if (content_type == SSL3_RT_HANDSHAKE && write_p == 0 && buf != nullptr) {
+        observed->hello.observe(
+            std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(buf), len));
+        return;
+    }
+    auto* counter = &observed->counter;
     if (content_type != SSL3_RT_HEADER || len < 5 || counter->done) return;
     const auto* header = static_cast<const std::uint8_t*>(buf);
     if (write_p != 0) {
@@ -140,9 +159,9 @@ private:
     const std::function<bool()>& cancelled_;
 };
 
-std::optional<std::size_t> handshake(int fd, const std::string& server_name,
+std::optional<ServerProbe> handshake(int fd, const std::string& server_name,
                                      Clock::time_point deadline,
-                                     const std::function<bool()>& cancelled) {
+                                     const std::function<bool()>& cancelled, bool offer_pq) {
     const Probe probe(fd, deadline, cancelled);
     std::unique_ptr<SSL_CTX, SslFree> ctx(SSL_CTX_new(TLS_client_method()));
     if (!ctx) return std::nullopt;
@@ -150,6 +169,24 @@ std::optional<std::size_t> handshake(int fd, const std::string& server_name,
     // echoes the choice in EncryptedExtensions, which is part of the flight.
     static constexpr unsigned char kAlpn[] = "\x02h2\x08http/1.1";
     if (SSL_CTX_set_alpn_protos(ctx.get(), kAlpn, sizeof(kAlpn) - 1) != 0) return std::nullopt;
+    // The Chrome/Telegram suite order: a server that honours the client's
+    // order picks AES-128-GCM, one with its own preference shows it here.
+    if (SSL_CTX_set_ciphersuites(ctx.get(), "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                                            "TLS_CHACHA20_POLY1305_SHA256") != 1) {
+        return std::nullopt;
+    }
+    // Key shares for both X25519MLKEM768 and X25519, as the Telegram client
+    // sends them ('*' marks a key share, OpenSSL >= 3.5). Older OpenSSL, or a
+    // build without ML-KEM, rejects the list: classical groups only then.
+    const bool pq_offered =
+        offer_pq &&
+        SSL_CTX_set1_groups_list(ctx.get(), "*X25519MLKEM768:*X25519:secp256r1:secp384r1") == 1;
+    if (!pq_offered) {
+        ERR_clear_error();
+        if (SSL_CTX_set1_groups_list(ctx.get(), "X25519:secp256r1:secp384r1") != 1) {
+            return std::nullopt;
+        }
+    }
     std::unique_ptr<SSL, SslFree> ssl(SSL_new(ctx.get()));
     BIO* in = BIO_new(BIO_s_mem());
     BIO* out = BIO_new(BIO_s_mem());
@@ -161,9 +198,9 @@ std::optional<std::size_t> handshake(int fd, const std::string& server_name,
     BIO_set_mem_eof_return(in, -1);  // empty means "want more", not EOF
     SSL_set_bio(ssl.get(), in, out);  // owned by ssl from here on
     if (SSL_set_tlsext_host_name(ssl.get(), server_name.c_str()) != 1) return std::nullopt;
-    FlightCounter counter;
-    SSL_set_msg_callback(ssl.get(), &on_record);
-    SSL_set_msg_callback_arg(ssl.get(), &counter);
+    Observed observed;
+    SSL_set_msg_callback(ssl.get(), &on_message);
+    SSL_set_msg_callback_arg(ssl.get(), &observed);
 
     while (true) {
         const int status = SSL_connect(ssl.get());
@@ -172,9 +209,25 @@ std::optional<std::size_t> handshake(int fd, const std::string& server_name,
         if (SSL_get_error(ssl.get(), status) != SSL_ERROR_WANT_READ) return std::nullopt;
         if (probe.fill(in, deadline) != 1) return std::nullopt;
     }
-    std::optional<std::size_t> flight;
+    std::optional<ServerProbe> result;
+    const auto& counter = observed.counter;
     if (SSL_version(ssl.get()) == TLS1_3_VERSION && counter.done && counter.records > 0) {
-        flight = counter.bodies + 5 * (counter.records - 1);
+        result.emplace();
+        result->flight = counter.bodies + 5 * (counter.records - 1);
+        result->retried = observed.hello.retried;
+        if (const auto& hello = observed.hello.hello) {
+            result->cipher = hello->cipher;
+            result->group = hello->group;
+            result->extensions = hello->extensions;
+            const auto& types = hello->extensions;
+            const auto share = std::find(types.begin(), types.end(), std::uint16_t{0x0033});
+            const auto versions = std::find(types.begin(), types.end(), std::uint16_t{0x002b});
+            result->key_share_first =
+                share != types.end() && versions != types.end() && share < versions;
+            if (pq_offered && hello->group != 0) {
+                result->pq = hello->group == kPqGroup ? PqAnswer::pq : PqAnswer::classical;
+            }
+        }
     }
 
     // close_notify and nothing else; then read until the server closes.
@@ -184,31 +237,99 @@ std::optional<std::size_t> handshake(int fd, const std::string& server_name,
         while (probe.fill(nullptr, until) == 1) {
         }
     }
-    return flight;
+    return result;
 }
+
+std::uint16_t read16(std::span<const std::uint8_t> bytes, std::size_t at) {
+    return static_cast<std::uint16_t>((bytes[at] << 8) | bytes[at + 1]);
+}
+
+// SHA-256("HelloRetryRequest"), the random of every HelloRetryRequest.
+constexpr std::array<std::uint8_t, 32> kRetryRandom{
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c};
 
 }  // namespace
 
-std::optional<std::size_t> measure_server_flight(const std::string& address, std::uint16_t port,
-                                                 const std::string& server_name,
-                                                 std::chrono::milliseconds timeout,
-                                                 const std::function<bool()>& cancelled) {
+std::optional<ServerHelloFacts> parse_server_hello(std::span<const std::uint8_t> message) {
+    // type(1) length(3) | legacy_version(2) random(32) session_id(1+n)
+    // cipher_suite(2) compression(1) extensions(2+n)
+    if (message.size() < 4 || message[0] != 0x02) return std::nullopt;
+    const std::size_t length = (static_cast<std::size_t>(message[1]) << 16) |
+                               (static_cast<std::size_t>(message[2]) << 8) | message[3];
+    if (message.size() != 4 + length) return std::nullopt;
+    const auto body = message.subspan(4);
+    std::size_t pos = 2 + 32;
+    if (body.size() < pos + 1) return std::nullopt;
+    ServerHelloFacts facts;
+    facts.retry = std::equal(kRetryRandom.begin(), kRetryRandom.end(), body.begin() + 2);
+    const std::size_t session = body[pos];
+    if (session > 32) return std::nullopt;
+    pos += 1 + session;
+    if (body.size() < pos + 2 + 1 + 2) return std::nullopt;
+    facts.cipher = read16(body, pos);
+    pos += 3;  // cipher_suite, legacy_compression_method
+    const std::size_t extensions = read16(body, pos);
+    pos += 2;
+    if (body.size() != pos + extensions) return std::nullopt;
+    while (pos < body.size()) {
+        if (body.size() - pos < 4) return std::nullopt;
+        const std::uint16_t type = read16(body, pos);
+        const std::size_t size = read16(body, pos + 2);
+        pos += 4;
+        if (body.size() - pos < size) return std::nullopt;
+        if (std::find(facts.extensions.begin(), facts.extensions.end(), type) !=
+            facts.extensions.end()) {
+            return std::nullopt;  // a repeated extension is malformed
+        }
+        facts.extensions.push_back(type);
+        // key_share: KeyShareEntry (group, key) or, in an HRR, the group.
+        if (type == 0x0033 && size >= 2) facts.group = read16(body, pos);
+        pos += size;
+    }
+    return facts;
+}
+
+void ServerHelloCapture::observe(std::span<const std::uint8_t> message) {
+    if (message.empty() || message[0] != 0x02) return;  // not a ServerHello
+    auto facts = parse_server_hello(message);
+    if (!facts) return;
+    if (facts->retry) {
+        retried = true;  // the real ServerHello follows the second ClientHello
+        return;
+    }
+    hello = std::move(facts);
+}
+
+std::optional<ServerProbe> probe_server(const std::string& address, std::uint16_t port,
+                                        const std::string& server_name,
+                                        std::chrono::milliseconds timeout,
+                                        const std::function<bool()>& cancelled, bool offer_pq) {
     if (cancelled && cancelled()) return std::nullopt;
     const auto deadline = Clock::now() + timeout;
     auto connection = io::connect_tcp(address, port);
     if (!connection.ok()) return std::nullopt;
-    std::optional<std::size_t> flight;
+    std::optional<ServerProbe> result;
     if (!connection.in_progress ||
         Probe(connection.fd.get(), deadline, cancelled).connected()) {
-        flight = handshake(connection.fd.get(), server_name, deadline, cancelled);
+        result = handshake(connection.fd.get(), server_name, deadline, cancelled, offer_pq);
     }
     // OpenSSL's error queue is per thread; leave nothing behind on this one.
     ERR_clear_error();
     // A larger flight cannot fit the one record the client accepts: the
     // closest legal imitation is the largest record.
-    if (flight && *flight < protocol::kServerFlightMin) return std::nullopt;
-    if (flight) flight = std::min(*flight, protocol::kServerFlightMax);
-    return flight;
+    if (result && result->flight < protocol::kServerFlightMin) return std::nullopt;
+    if (result) result->flight = std::min(result->flight, protocol::kServerFlightMax);
+    return result;
+}
+
+std::optional<std::size_t> measure_server_flight(const std::string& address, std::uint16_t port,
+                                                 const std::string& server_name,
+                                                 std::chrono::milliseconds timeout,
+                                                 const std::function<bool()>& cancelled) {
+    const auto result = probe_server(address, port, server_name, timeout, cancelled);
+    if (!result) return std::nullopt;
+    return result->flight;
 }
 
 }  // namespace mtdd::detail

@@ -796,8 +796,11 @@ void Runtime::Impl::update_client_interest(Client& client) {
     const bool rate_paused =
         client.rate_pause_c2s ||
         (client.rate_pause_s2c && client.route != Client::Route::direct);
+    // A held ServerHello stops reading too: nothing the client sends may be
+    // processed (or answered) before the hello is out.
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested && !rate_paused && !client.c2s_backpressured) {
+        !client.close_requested && !rate_paused && !client.c2s_backpressured &&
+        client.held_server_hello.empty()) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;

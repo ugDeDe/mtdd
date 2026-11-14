@@ -14,6 +14,7 @@
 // access adjustment is confined to this translation unit.
 
 #include <gtest/gtest.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1322,4 +1323,91 @@ TEST(MeAudit, AcceptBudgetPauseCountsTransitionsNotReevaluations) {
     test.reactor->update_listener_interest();
     EXPECT_EQ(refusals(), 2U);
     test.reactor->budget_used_ = 0;
+}
+
+// server_hello_delay_*: a held ServerHello blocks reading, is released by its
+// own deadline kind, and a client closed while it is held leaves no deadline,
+// no budget and no object behind.
+namespace {
+
+mtdd::Runtime::Impl::Client& add_held_hello_client(AuditReactor& test, mtdd::io::UniqueFd& peer,
+                                                   const Bytes& hello,
+                                                   mtdd::Runtime::Impl::Clock::time_point due) {
+    using Impl = mtdd::Runtime::Impl;
+    auto& client = add_handshaking_client(test, peer);
+    client.out.emplace(test.config.connection_queue_bytes);
+    client.phase = Impl::Client::Phase::tls_handshake;
+    client.held_server_hello = hello;
+    client.deadline_kind = Impl::Client::DeadlineKind::server_hello_delay;
+    test.reactor->deadlines_.set(client.token, due);
+    test.reactor->reaccount(client);
+    test.reactor->update_client_interest(client);
+    return client;
+}
+
+int readable_bytes(int fd) {
+    int pending = 0;
+    if (::ioctl(fd, FIONREAD, &pending) != 0) return -1;
+    return pending;
+}
+
+}  // namespace
+
+TEST(MeAudit, HeldServerHelloStopsReadingUntilItsDeadlineReleasesIt) {
+    AuditReactor test("held-hello");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    const std::size_t budget_before = test.reactor->budget_used_;
+    mtdd::io::UniqueFd peer;
+    Bytes hello(3000, 0x5a);
+    hello[0] = 0x16;
+    const auto due = now + std::chrono::milliseconds(200);
+    auto& client = add_held_hello_client(test, peer, hello, due);
+    const std::uint64_t token = client.token;
+    EXPECT_EQ(client.armed & EPOLLIN, 0U) << "a held hello stops reading";
+    EXPECT_EQ(client.armed & EPOLLOUT, 0U) << "and has nothing to write yet";
+    EXPECT_GE(test.reactor->budget_used_, budget_before + hello.size());
+
+    // Bytes the client pipelines behind its hello stay in the kernel.
+    const std::array<std::uint8_t, 6> ccs{0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
+    ASSERT_EQ(::send(peer.get(), ccs.data(), ccs.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(ccs.size()));
+    test.reactor->read_client(client, now);
+    EXPECT_EQ(readable_bytes(client.fd.get()), static_cast<int>(ccs.size()));
+    EXPECT_EQ(readable_bytes(peer.get()), 0);
+
+    test.reactor->on_client_deadline(client, due);
+    ASSERT_NE(test.reactor->clients_.find(token), test.reactor->clients_.end());
+    EXPECT_TRUE(client.held_server_hello.empty());
+    EXPECT_EQ(client.held_server_hello.capacity(), 0U);
+    EXPECT_EQ(client.deadline_kind, Impl::Client::DeadlineKind::handshake);
+    EXPECT_EQ(test.reactor->deadlines_.next(), due + test.config.handshake_timeout);
+    EXPECT_NE(client.armed & EPOLLIN, 0U) << "reading resumes";
+    Bytes received(hello.size());
+    ASSERT_EQ(::recv(peer.get(), received.data(), received.size(), MSG_DONTWAIT),
+              static_cast<ssize_t>(hello.size()));
+    EXPECT_EQ(received, hello);
+    test.reactor->close_client(token);
+    EXPECT_EQ(test.reactor->budget_used_, budget_before);
+}
+
+TEST(MeAudit, ClientClosedWhileItsHelloIsHeldLeavesNothingBehind) {
+    AuditReactor test("held-hello-close");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    const std::size_t budget_before = test.reactor->budget_used_;
+    const std::size_t deadlines_before = test.reactor->deadlines_.size();
+    mtdd::io::UniqueFd peer;
+    auto& client = add_held_hello_client(test, peer, Bytes(2000, 0x16),
+                                         now + std::chrono::milliseconds(500));
+    const std::uint64_t token = client.token;
+    EXPECT_EQ(test.reactor->deadlines_.size(), deadlines_before + 1);
+
+    peer.reset();  // the client is gone during the delay
+    test.reactor->handle_client(client, EPOLLHUP | EPOLLRDHUP, now);
+    EXPECT_EQ(test.reactor->clients_.find(token), test.reactor->clients_.end());
+    EXPECT_EQ(test.reactor->deadlines_.size(), deadlines_before);
+    const auto due = test.reactor->deadlines_.due(now + std::chrono::hours(1));
+    EXPECT_EQ(std::find(due.begin(), due.end(), token), due.end());
+    EXPECT_EQ(test.reactor->budget_used_, budget_before);
 }

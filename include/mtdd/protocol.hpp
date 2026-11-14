@@ -233,6 +233,11 @@ struct ClientHelloInfo {
   std::uint32_t timestamp{0};
   std::string server_name;  // first host_name SNI entry, empty when absent
   bool offers_pq{false};
+  // A 32-byte X25519 key share is offered (Telegram and browsers send one
+  // next to the X25519MLKEM768 share).
+  bool offers_x25519{false};
+  // TLS 1.3 suites offered, bit i = suite 0x1301 + i (0x1301..0x1305).
+  std::uint8_t tls13_suites{0};
 
   ClientHelloInfo() = default;
   ClientHelloInfo(ClientHelloInfo&&) = default;
@@ -415,12 +420,33 @@ struct ServerHelloOptions {
   // A pre-generated X25519 public key. When absent, a private key is drawn
   // from the random source and its public key derived in place.
   std::optional<std::array<std::uint8_t, 32>> x25519_public;
+  // What the real server of the domain answers in its own ServerHello (the
+  // masking probe measures it); the defaults are the unmeasured answer.
+  // The suite it picks from the Chrome/Telegram order 1301:1302:1303; used
+  // only when this client offered it. 0: echo the client's first suite.
+  std::uint16_t cipher{0};
+  // key_share(51) before supported_versions(43), as BoringSSL/Cloudflare
+  // order them; false: 43 then 51, as OpenSSL and Go do.
+  bool key_share_first{false};
+  // The server answers X25519 even when X25519MLKEM768 is offered too (it
+  // does not support or does not prefer it). Applies only when the client
+  // also offered an X25519 share; a PQ-only client still gets the PQ shape.
+  bool decline_pq{false};
 };
 
 // Builds ServerHello + CCS + fake encrypted flight. Uses the classical
-// x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set. The
-// X25519 share (the whole classical share, the last 32 bytes of the PQ one) is
-// always a real X25519 public key; the ML-KEM ciphertext part is random.
+// x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set
+// (and the options do not decline it). The X25519 share (the whole classical
+// share, the last 32 bytes of the PQ one) is always a real X25519 public key;
+// the ML-KEM ciphertext part is random.
+//
+// The Telegram clients never parse the ServerHello body: tdlib
+// TlsInit::wait_hello_response (and tdesktop's TlsSocket checkHelloParts12/
+// checkHelloParts34/checkHelloDigest alike) check only the record prefixes
+// 16 03 03 <len>, then 14 03 03 00 01 01 17 03 03 <len>, and the HMAC over
+// client_random || response with the server random zeroed. Cipher, extension
+// order and group can therefore follow the real server freely: the record
+// lengths are recomputed and the HMAC covers the bytes as sent.
 std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random,
                                              const ServerHelloOptions& options = {});
 

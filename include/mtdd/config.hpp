@@ -114,6 +114,14 @@ struct Config {
     // client timestamp entirely (replay protection then rests on the replay
     // cache alone, with a fixed one-hour retention).
     std::uint32_t client_clock_skew_seconds{120};
+    // FakeTLS ServerHello held back by a uniform draw from this inclusive
+    // range, as a real server answers only after its own key exchange and
+    // signature. 0/0 (the default) answers at once: every Telegram connection
+    // pays the delay. At most kMaxServerHelloDelay, min <= max; the maximum
+    // defaults to the minimum.
+    std::chrono::milliseconds server_hello_delay_min{0};
+    std::chrono::milliseconds server_hello_delay_max{0};
+    static constexpr std::chrono::milliseconds kMaxServerHelloDelay{1000};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
     // Client socket liveness. Keepalive probes start after this much silence

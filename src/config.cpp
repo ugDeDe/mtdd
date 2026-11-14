@@ -344,6 +344,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "api_token_env", "tls_domain", "ad_tag", "users_path", "me_config_path", "me_secret_path",
         "workers", "max_connections", "max_handshakes", "max_frame_bytes", "connection_queue_bytes",
         "global_buffer_bytes", "handshake_timeout_seconds", "client_clock_skew_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
+        "server_hello_delay_min_ms", "server_hello_delay_max_ms",
         "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "client_keepalive_seconds", "client_ack_timeout_seconds",
@@ -519,6 +520,14 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     config.handshake_timeout = std::chrono::seconds(number(value, "handshake_timeout_seconds", 15, 1, 120));
     config.client_clock_skew_seconds =
         static_cast<std::uint32_t>(number(value, "client_clock_skew_seconds", 120, 0, 86400));
+    // A minimum alone is a fixed delay (the maximum defaults to it).
+    const auto max_delay = static_cast<std::uint64_t>(Config::kMaxServerHelloDelay.count());
+    const auto delay_min = number(value, "server_hello_delay_min_ms", 0, 0, max_delay);
+    config.server_hello_delay_min = std::chrono::milliseconds(delay_min);
+    config.server_hello_delay_max = std::chrono::milliseconds(
+        number(value, "server_hello_delay_max_ms", delay_min, 0, max_delay));
+    if (config.server_hello_delay_min > config.server_hello_delay_max)
+        throw std::invalid_argument("server_hello_delay_min_ms must not exceed server_hello_delay_max_ms");
     config.idle_timeout = std::chrono::seconds(number(value, "idle_timeout_seconds", 1800, 30, 86400));
     config.shutdown_timeout = std::chrono::seconds(number(value, "shutdown_timeout_seconds", 10, 1, 120));
     config.metadata_refresh = std::chrono::seconds(number(value, "metadata_refresh_seconds", 3600, 60, 86400));
@@ -627,6 +636,8 @@ nlohmann::json Config::public_view() const {
         {"global_buffer_bytes", global_buffer_bytes},
         {"handshake_timeout_seconds", handshake_timeout.count()},
         {"client_clock_skew_seconds", client_clock_skew_seconds},
+        {"server_hello_delay_min_ms", server_hello_delay_min.count()},
+        {"server_hello_delay_max_ms", server_hello_delay_max.count()},
         {"idle_timeout_seconds", idle_timeout.count()},
         {"shutdown_timeout_seconds", shutdown_timeout.count()},
         {"metadata_refresh_seconds", metadata_refresh.count()},

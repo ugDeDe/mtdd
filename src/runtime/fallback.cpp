@@ -166,26 +166,31 @@ std::string MaskingResolver::address(std::string_view host) {
     return {};
 }
 
-std::optional<MaskingResolver::ServerFlight> MaskingResolver::server_flight(
+std::optional<MaskingResolver::ServerProfile> MaskingResolver::server_profile(
     std::string_view domain) {
     const auto key = dns_key(domain);
     const std::lock_guard lock{mutex_};
     const auto found = probes_.find(key);
     if (found == probes_.end()) return std::nullopt;
-    return found->second.flight;
+    return found->second.profile;
 }
 
-std::optional<MaskingResolver::ServerFlight> MaskingResolver::probe_flight(
+std::optional<MaskingResolver::ServerProfile> MaskingResolver::probe_profile(
     const std::string& address, std::uint16_t port, const std::string& name) {
-    ServerFlight flight{protocol::kServerFlightMax, 0};
+    ServerProfile profile{protocol::kServerFlightMax, 0, 0, false, false};
     for (std::size_t i = 0; i < kServerFlightSamples; ++i) {
-        const auto sample = measure_server_flight(address, port, name, kServerFlightProbeTimeout,
-                                                  [this] { return cancel_.load(); });
+        const auto sample = probe_server(address, port, name, kServerFlightProbeTimeout,
+                                         [this] { return cancel_.load(); });
         if (!sample) return std::nullopt;
-        flight.min = std::min(flight.min, *sample);
-        flight.max = std::max(flight.max, *sample);
+        profile.min = std::min(profile.min, sample->flight);
+        profile.max = std::max(profile.max, sample->flight);
+        if (i == 0) {
+            profile.cipher = sample->cipher;
+            profile.key_share_first = sample->key_share_first;
+            profile.decline_pq = sample->pq == PqAnswer::classical;
+        }
     }
-    return flight;
+    return profile;
 }
 
 void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::string& name) {
@@ -205,9 +210,9 @@ void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::s
         return;
     }
     lock.unlock();
-    std::optional<ServerFlight> flight;
+    std::optional<ServerProfile> profile;
     try {
-        flight = probe_flight(address, port, name);
+        profile = probe_profile(address, port, name);
     } catch (...) {
     }
     lock.lock();
@@ -215,8 +220,8 @@ void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::s
     if (found == probes_.end()) return;  // evicted meanwhile
     auto& probe = found->second;
     const auto now = Clock::now();
-    if (flight) {
-        probe.flight = flight;
+    if (profile) {
+        probe.profile = profile;
         probe.backoff = {};
         probe.next_attempt = now + kServerFlightRefresh + random_below(kServerFlightProbeJitter);
     } else {

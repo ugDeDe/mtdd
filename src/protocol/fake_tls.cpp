@@ -13,6 +13,7 @@ namespace mtdd::protocol {
 namespace {
 
 constexpr std::uint16_t kPqGroup = 0x11ec;
+constexpr std::uint16_t kX25519Group = 0x001d;
 
 std::uint16_t be16(std::span<const std::uint8_t> b, std::size_t off) {
   return static_cast<std::uint16_t>((b[off] << 8) | b[off + 1]);
@@ -121,6 +122,8 @@ void ClientHelloInfo::wipe() {
   timestamp = 0;
   server_name.clear();
   server_name.shrink_to_fit();
+  offers_x25519 = false;
+  tls13_suites = 0;
 }
 
 namespace {
@@ -154,20 +157,22 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   if (sid_len != 32) return HelloStatus::Invalid;
   if (record.size() < 44 + sid_len) return HelloStatus::Invalid;
 
-  // Cipher suites: echo the first non-GREASE TLS 1.3 suite.
+  // Cipher suites: echo the first non-GREASE TLS 1.3 suite (unless the real
+  // server is measured to pick another offered one); note every TLS 1.3 one.
   std::size_t pos = 44 + sid_len;
   if (pos + 2 > record.size()) return HelloStatus::Invalid;
   const std::size_t cs_len = be16(record, pos);
   pos += 2;
   if (cs_len == 0 || cs_len % 2 != 0 || pos + cs_len > record.size()) return HelloStatus::Invalid;
   std::uint16_t cipher = 0;
+  std::uint8_t tls13_suites = 0;
   for (std::size_t i = 0; i < cs_len; i += 2) {
     const std::uint16_t suite = be16(record, pos + i);
     if ((suite & 0x0f0f) == 0x0a0a) continue;  // GREASE
-    if (suite == 0x1301 || suite == 0x1302 || suite == 0x1303) {
-      cipher = suite;
-      break;
+    if (suite >= 0x1301 && suite <= 0x1305) {
+      tls13_suites = static_cast<std::uint8_t>(tls13_suites | (1u << (suite - 0x1301)));
     }
+    if (cipher == 0 && (suite == 0x1301 || suite == 0x1302 || suite == 0x1303)) cipher = suite;
   }
   if (cipher == 0) return HelloStatus::Invalid;  // no TLS 1.3 suite offered
   pos += cs_len;
@@ -180,6 +185,7 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   if (pos + ext_len > record.size()) return HelloStatus::Invalid;
 
   bool offers_pq = false;
+  bool offers_x25519 = false;
   std::string server_name;
   const std::size_t ext_end = pos + ext_len;
   while (pos + 4 <= ext_end) {
@@ -198,6 +204,7 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
         const std::size_t key_len = be16(record, kp + 2);
         if (kp + 4 + key_len > ks_end) return HelloStatus::Invalid;
         if (group == kPqGroup && key_len == kPqClientKeyShare) offers_pq = true;
+        if (group == kX25519Group && key_len == 32) offers_x25519 = true;
         kp += 4 + key_len;
       }
       if (kp != ks_end) return HelloStatus::Invalid;
@@ -276,6 +283,8 @@ HelloStatus validate_hello_core(std::span<const std::uint8_t> record, std::int64
   out.server_name = std::move(server_name);
   out.offers_pq = offers_pq;
   crypto::secure_zero(digest);
+  out.offers_x25519 = offers_x25519;
+  out.tls13_suites = tls13_suites;
   crypto::secure_zero(hmac_input);
   return HelloStatus::Ok;
 }
@@ -426,8 +435,16 @@ std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const 
     crypto::secure_zero(private_key);
   }
   const std::size_t flight = server_flight_length(options, random);
-  const bool pq = info.offers_pq;
-  const std::size_t sh_record = pq ? 95 + kPqServerKeyShare : 127;
+  // The answer the real server would give this ClientHello (see
+  // ServerHelloOptions); unmeasured, the client's own first choices.
+  const bool pq = info.offers_pq && !(options.decline_pq && info.offers_x25519);
+  std::uint16_t cipher = info.cipher;
+  if (options.cipher >= 0x1301 && options.cipher <= 0x1305 &&
+      (info.tls13_suites & (1u << (options.cipher - 0x1301))) != 0) {
+    cipher = options.cipher;
+  }
+  const std::size_t key_share_len = 4 + 4 + (pq ? kPqServerKeyShare : 32);
+  const std::size_t sh_record = 81 + 6 + key_share_len;
   const std::size_t out_len = sh_record + 6 + 5 + flight;
   Bytes out(out_len, 0);
 
@@ -442,29 +459,30 @@ std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const 
   // out[11..43] is the zeroed server-random / HMAC placeholder.
   out[43] = 32;
   std::copy(info.session_id.begin(), info.session_id.end(), out.begin() + 44);
-  wr16(out, 76, info.cipher);
+  wr16(out, 76, cipher);
   out[78] = 0;
+  wr16(out, 79, static_cast<std::uint16_t>(6 + key_share_len));
 
+  // Extensions: supported_versions then key_share, or the other way round.
+  const std::size_t versions_at = options.key_share_first ? 81 + key_share_len : 81;
+  const std::size_t share_at = options.key_share_first ? 81 : 87;
+  const std::uint8_t supported_versions[6] = {0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
+  std::copy_n(supported_versions, 6, out.begin() + static_cast<std::ptrdiff_t>(versions_at));
+  wr16(out, share_at, 0x0033);
+  wr16(out, share_at + 2, static_cast<std::uint16_t>(key_share_len - 4));
+  const std::size_t key = share_at + 8;
   if (!pq) {
-    wr16(out, 79, 46);
-    const std::uint8_t supported_versions[6] = {0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
-    std::copy_n(supported_versions, 6, out.begin() + 81);
-    const std::uint8_t key_share[8] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
-    std::copy_n(key_share, 8, out.begin() + 87);
-    std::copy(x25519.begin(), x25519.end(), out.begin() + 95);
+    wr16(out, share_at + 4, kX25519Group);
+    wr16(out, share_at + 6, 32);
+    std::copy(x25519.begin(), x25519.end(), out.begin() + static_cast<std::ptrdiff_t>(key));
   } else {
-    wr16(out, 79, static_cast<std::uint16_t>(6 + 4 + 4 + kPqServerKeyShare));
-    const std::uint8_t supported_versions[6] = {0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
-    std::copy_n(supported_versions, 6, out.begin() + 81);
-    out[87] = 0x00;
-    out[88] = 0x33;
-    wr16(out, 89, static_cast<std::uint16_t>(4 + kPqServerKeyShare));
-    wr16(out, 91, kPqGroup);
-    wr16(out, 93, static_cast<std::uint16_t>(kPqServerKeyShare));
+    wr16(out, share_at + 4, kPqGroup);
+    wr16(out, share_at + 6, static_cast<std::uint16_t>(kPqServerKeyShare));
     // ML-KEM-768 ciphertext (random), then the X25519 share.
-    std::span<std::uint8_t> ciphertext(out.data() + 95, kPqServerKeyShare - 32);
+    std::span<std::uint8_t> ciphertext(out.data() + key, kPqServerKeyShare - 32);
     random(ciphertext);
-    std::copy(x25519.begin(), x25519.end(), out.begin() + 95 + kPqServerKeyShare - 32);
+    std::copy(x25519.begin(), x25519.end(),
+              out.begin() + static_cast<std::ptrdiff_t>(key + kPqServerKeyShare - 32));
   }
 
   const std::size_t ccs = sh_record;

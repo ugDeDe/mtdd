@@ -373,6 +373,10 @@ void Runtime::Impl::schedule_client_deadline(Client& client, Time now) {
 
 void Runtime::Impl::on_client_deadline(Client& client, Time now) {
     const std::uint64_t token = client.token;
+    if (client.deadline_kind == Client::DeadlineKind::server_hello_delay) {
+        release_server_hello(client, now);
+        return;
+    }
     if (client.deadline_kind == Client::DeadlineKind::fallback_idle) {
         on_fallback_deadline(client, now);
         return;

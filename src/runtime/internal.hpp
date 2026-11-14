@@ -321,15 +321,64 @@ struct MaskingResolveHooks {
 };
 void set_masking_resolve_hooks_for_test(std::optional<MaskingResolveHooks> hooks);
 
-// One bounded TLS handshake (OpenSSL defaults plus the browser ALPN list,
-// SNI `server_name`) with address:port that measures the server's encrypted
-// first flight: the ApplicationData records it sends between ServerHello and
-// its Finished, expressed as the body length of the one record that would
-// carry the same bytes (sum of the bodies plus the headers of all records but
-// one), capped at kServerFlightMax. nullopt on any failure, a non-TLS-1.3
-// answer, a flight below kServerFlightMin, after `timeout`, or as soon as
-// `cancelled` returns true. Sends close_notify and nothing else after the
-// handshake. Blocking: resolver thread (and tests) only, never a reactor.
+// What FakeTLS can mirror of one TLS 1.3 ServerHello handshake message
+// (type 2, 24-bit length, body), parsed from the raw bytes so the extension
+// order is the server's own.
+struct ServerHelloFacts {
+    bool retry{false};       // a HelloRetryRequest (RFC 8446 special random)
+    std::uint16_t cipher{0};
+    std::uint16_t group{0};  // key_share: selected group (HRR: requested one)
+    std::vector<std::uint16_t> extensions;  // types in wire order
+};
+// nullopt for anything that is not one well-formed ServerHello message.
+std::optional<ServerHelloFacts> parse_server_hello(std::span<const std::uint8_t> message);
+
+// Observes the server's handshake messages in order and keeps the final
+// ServerHello: a HelloRetryRequest is noted and never taken for it.
+struct ServerHelloCapture {
+    std::optional<ServerHelloFacts> hello;
+    bool retried{false};
+    void observe(std::span<const std::uint8_t> message);
+};
+
+// The group a server answers when offered X25519MLKEM768 and X25519 shares:
+// unknown when the probe could not offer X25519MLKEM768 (OpenSSL without it).
+enum class PqAnswer : std::uint8_t { unknown, pq, classical };
+
+// What one probe handshake learned about the real server.
+struct ServerProbe {
+    // Encrypted first flight as one record body (see measure_server_flight).
+    std::size_t flight{0};
+    // From its final ServerHello; 0 / empty when it could not be parsed.
+    std::uint16_t cipher{0};  // chosen from 1301:1302:1303 offered in that order
+    std::uint16_t group{0};
+    std::vector<std::uint16_t> extensions;
+    bool key_share_first{false};  // key_share(51) before supported_versions(43)
+    PqAnswer pq{PqAnswer::unknown};
+    bool retried{false};  // the server sent a HelloRetryRequest first
+};
+
+// One bounded TLS 1.3 handshake with address:port (SNI `server_name`) that
+// offers what the Telegram client offers where it shapes the answer: the
+// browser ALPN list, the suites TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
+// TLS_CHACHA20_POLY1305_SHA256 in that order, and key shares for
+// X25519MLKEM768 and X25519 (supported groups also P-256, P-384). Without
+// X25519MLKEM768 in the linked OpenSSL (or with `offer_pq` false) only the
+// classical groups are offered and the PQ answer stays unknown.
+// The flight is the ApplicationData records the server sends between
+// ServerHello and its Finished, expressed as the body length of the one
+// record that would carry the same bytes (sum of the bodies plus the headers
+// of all records but one), capped at kServerFlightMax. nullopt on any
+// failure, a non-TLS-1.3 answer, a flight below kServerFlightMin, after
+// `timeout`, or as soon as `cancelled` returns true. Sends close_notify and
+// nothing else after the handshake. Blocking: resolver thread (and tests)
+// only, never a reactor.
+std::optional<ServerProbe> probe_server(const std::string& address, std::uint16_t port,
+                                        const std::string& server_name,
+                                        std::chrono::milliseconds timeout,
+                                        const std::function<bool()>& cancelled = {},
+                                        bool offer_pq = true);
+// probe_server(...)->flight.
 std::optional<std::size_t> measure_server_flight(const std::string& address, std::uint16_t port,
                                                  const std::string& server_name,
                                                  std::chrono::milliseconds timeout,
@@ -342,7 +391,7 @@ std::optional<std::size_t> measure_server_flight(const std::string& address, std
 // Reactors only call address(), a short locked map lookup; the lock is never
 // held across a lookup. The same thread probes the real server of every
 // automatically masked domain (tls_domain and personal ones, at its cached
-// address or the test endpoint override) for server_flight(). Owned by
+// address or the test endpoint override) for server_profile(). Owned by
 // Runtime::RuntimeState, which starts it before the reactors run and stops it
 // when they finish.
 class MaskingResolver {
@@ -361,14 +410,21 @@ public:
     // a newly configured name). Never blocks on DNS.
     std::string address(std::string_view host);
 
-    // Inclusive range of the real server's encrypted first-flight size over
-    // the samples of the last successful probe of `domain`, or nullopt while
-    // unmeasured. A short locked lookup; never blocks on I/O.
-    struct ServerFlight {
+    // The last successful probe of `domain`, or nullopt while unmeasured: the
+    // inclusive range of the real server's encrypted first-flight size over
+    // its samples, and the ServerHello choices of its first sample (a
+    // load-balanced origin may mix stacks; any one observed answer is a real
+    // one). A short locked lookup; never blocks on I/O.
+    struct ServerProfile {
         std::size_t min{0};
         std::size_t max{0};
+        std::uint16_t cipher{0};  // 0: not measured
+        bool key_share_first{false};
+        // Answers a classical group although X25519MLKEM768 is offered
+        // (FakeTLS then answers X25519, its only classical shape).
+        bool decline_pq{false};
     };
-    std::optional<ServerFlight> server_flight(std::string_view domain);
+    std::optional<ServerProfile> server_profile(std::string_view domain);
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -380,7 +436,7 @@ private:
     struct Probe {
         Clock::time_point next_attempt;
         std::chrono::milliseconds backoff;
-        std::optional<ServerFlight> flight;  // last good measurement
+        std::optional<ServerProfile> profile;  // last good measurement
     };
     struct Names {
         std::vector<std::string> resolve;
@@ -391,8 +447,8 @@ private:
     // Thread only: the configured names, or nullopt when unchanged.
     std::optional<Names> configured_names();
     // Thread only: kServerFlightSamples handshakes; nullopt if any fails.
-    std::optional<ServerFlight> probe_flight(const std::string& address, std::uint16_t port,
-                                             const std::string& name);
+    std::optional<ServerProfile> probe_profile(const std::string& address, std::uint16_t port,
+                                               const std::string& name);
     // Thread only, `lock` held on entry and on return (released while the
     // due probe of `name` runs); reschedules it.
     void run_probe(std::unique_lock<std::mutex>& lock, const std::string& name);
@@ -1125,7 +1181,9 @@ struct Runtime::Impl {
             wait_me,
             idle,
             fallback_connect,
-            fallback_idle
+            fallback_idle,
+            // held_server_hello is released when it fires (server_hello_delay_*)
+            server_hello_delay
         };
 
         std::uint64_t token{};
@@ -1139,6 +1197,10 @@ struct Runtime::Impl {
         std::optional<protocol::TransportDecoder> decoder;
         std::optional<io::ByteQueue> out;
         std::vector<std::uint8_t> s2c_wire; // ordered TLS wire not yet queued
+        // The FakeTLS ServerHello flight while server_hello_delay_* holds it
+        // back. Non-empty only then; the client is not read meanwhile, so no
+        // byte of its can be answered before this is sent.
+        std::vector<std::uint8_t> held_server_hello;
         // ME answers for this client decoded during the current ME read,
         // coalesced into open TLS records and written once per read by
         // flush_s2c_batches(). Empty outside read_me().
@@ -1587,6 +1649,11 @@ struct Runtime::Impl {
                           Time now);
     void feed_client_tls(Client& client, std::span<const std::uint8_t> wire, Time now);
     void client_tls_ready(Client& client, Time now);
+    // A uniform draw from [server_hello_delay_min, server_hello_delay_max].
+    std::chrono::milliseconds server_hello_delay();
+    // The server_hello_delay deadline: sends the held ServerHello and starts
+    // the handshake deadline.
+    void release_server_hello(Client& client, Time now);
     void pump_client_out(Client& client);
     bool push_client_wire(Client& client, std::span<const std::uint8_t> wire,
                           bool rearm_interest = true);

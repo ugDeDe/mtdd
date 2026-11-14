@@ -1,5 +1,6 @@
 #include "../support/runtime_fixture.hpp"
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -54,6 +55,13 @@ std::pair<PKey, Cert> self_signed(std::string_view name, int extra_names) {
     return {std::move(key), std::move(cert)};
 }
 
+// How the local server negotiates (nullptr: OpenSSL defaults).
+struct ServerTls {
+    const char* suites{nullptr};
+    bool server_preference{false};
+    const char* groups{nullptr};
+};
+
 // TLS 1.3-only OpenSSL server on 127.0.0.1, one connection at a time. It
 // computes, from its own record callback, the flight the probe must report
 // for each SNI: the ApplicationData records it writes before reading the
@@ -63,7 +71,7 @@ class LocalTlsServer {
 public:
     enum class Mode { serve, stall };
 
-    explicit LocalTlsServer(Mode mode = Mode::serve) : mode_(mode) {
+    explicit LocalTlsServer(Mode mode = Mode::serve, ServerTls tls = {}) : mode_(mode) {
         auto global = self_signed(kDomain, 0);
         auto front = self_signed(kFront, 40);
         global_key_ = std::move(global.first);
@@ -73,6 +81,13 @@ public:
         ctx_.reset(SSL_CTX_new(TLS_server_method()));
         if (!ctx_) throw std::runtime_error("SSL_CTX_new");
         SSL_CTX_set_min_proto_version(ctx_.get(), TLS1_3_VERSION);
+        if (tls.suites != nullptr && SSL_CTX_set_ciphersuites(ctx_.get(), tls.suites) != 1) {
+            throw std::runtime_error("SSL_CTX_set_ciphersuites");
+        }
+        if (tls.server_preference) SSL_CTX_set_options(ctx_.get(), SSL_OP_CIPHER_SERVER_PREFERENCE);
+        if (tls.groups != nullptr && SSL_CTX_set1_groups_list(ctx_.get(), tls.groups) != 1) {
+            throw std::runtime_error("SSL_CTX_set1_groups_list");
+        }
         SSL_CTX_use_certificate(ctx_.get(), global_cert_.get());
         SSL_CTX_use_PrivateKey(ctx_.get(), global_key_.get());
         SSL_CTX_set_tlsext_servername_callback(ctx_.get(), &LocalTlsServer::on_servername);
@@ -270,7 +285,248 @@ bool in_fallback_range(std::optional<std::size_t> length) {
            *length <= mtdd::protocol::kServerFlightFallbackMax;
 }
 
+using mtdd::detail::PqAnswer;
+
+// Whether the linked OpenSSL can offer X25519MLKEM768 key shares (>= 3.5);
+// otherwise the probe offers classical groups only and reports `unknown`.
+bool openssl_offers_pq() {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_client_method()),
+                                                          &SSL_CTX_free);
+    const bool ok = ctx && SSL_CTX_set1_groups_list(ctx.get(), "*X25519MLKEM768:*X25519") == 1;
+    ERR_clear_error();
+    return ok;
+}
+
+PqAnswer declined() { return openssl_offers_pq() ? PqAnswer::classical : PqAnswer::unknown; }
+
+constexpr const char* kChachaFirst =
+    "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256";
+const std::vector<std::uint16_t> kVersionsThenShare{0x002b, 0x0033};
+
+// The daemon's ServerHello to one authenticated hello: suite, extension types
+// in order, key_share group.
+struct Answer {
+    std::uint16_t cipher{0};
+    std::vector<std::uint16_t> extensions;
+    std::uint16_t group{0};
+};
+std::optional<Answer> daemon_answer(std::uint16_t port, bool offer_pq) {
+    const int fd = connect_loopback(port);
+    if (fd < 0) return std::nullopt;
+    const auto ts = static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    static std::atomic<unsigned> variant{100};
+    const auto hello = make_client_hello(secret_bytes(), ts, kDomain,
+                                         static_cast<std::uint8_t>(variant.fetch_add(1)), offer_pq);
+    std::optional<Answer> out;
+    std::array<std::uint8_t, 5> header{};
+    if (send_all(fd, hello) && recv_exact(fd, header.data(), header.size(), 2000) &&
+        header[0] == 0x16) {
+        Bytes record(header.begin(), header.end());
+        record.resize(5 + (static_cast<std::size_t>(header[3]) << 8 | header[4]));
+        if (record.size() >= 81 && recv_exact(fd, record.data() + 5, record.size() - 5, 2000)) {
+            if (auto facts = mtdd::detail::parse_server_hello(
+                    std::span<const std::uint8_t>(record).subspan(5))) {
+                out = Answer{facts->cipher, facts->extensions, facts->group};
+            }
+        }
+    }
+    ::close(fd);
+    return out;
+}
+
+Bytes cat_bytes(const Bytes& first, const Bytes& second) {
+    Bytes out = first;
+    append(out, second);
+    return out;
+}
+
+// A raw ServerHello handshake message: legacy_version, random, a 32-byte
+// session id, `cipher`, null compression, then `extensions` as given.
+Bytes server_hello_message(const std::array<std::uint8_t, 32>& random, std::uint16_t cipher,
+                           const Bytes& extensions) {
+    Bytes body{0x03, 0x03};
+    append(body, random);
+    body.push_back(0x20);
+    body.insert(body.end(), 32, 0x44);
+    put16(body, cipher);
+    body.push_back(0x00);
+    put16(body, static_cast<std::uint16_t>(extensions.size()));
+    append(body, extensions);
+    Bytes message{0x02, static_cast<std::uint8_t>(body.size() >> 16),
+                  static_cast<std::uint8_t>(body.size() >> 8),
+                  static_cast<std::uint8_t>(body.size())};
+    append(message, body);
+    return message;
+}
+
+Bytes extension(std::uint16_t type, const Bytes& data) {
+    Bytes out;
+    put16(out, type);
+    put16(out, static_cast<std::uint16_t>(data.size()));
+    append(out, data);
+    return out;
+}
+
+const Bytes kVersions = extension(0x002b, Bytes{0x03, 0x04});
+Bytes x25519_share() {
+    Bytes data{0x00, 0x1d, 0x00, 0x20};
+    data.insert(data.end(), 32, 0x09);
+    return extension(0x0033, data);
+}
+// SHA-256("HelloRetryRequest").
+constexpr std::array<std::uint8_t, 32> kRetryRandom{
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c};
+constexpr std::array<std::uint8_t, 32> kPlainRandom{0x01, 0x02, 0x03};
+
 }  // namespace
+
+TEST(ServerHelloProbe, ParsesTheExtensionOrderOfARawServerHello) {
+    const auto share_first = mtdd::detail::parse_server_hello(
+        server_hello_message(kPlainRandom, 0x1302, cat_bytes(x25519_share(), kVersions)));
+    ASSERT_TRUE(share_first.has_value());
+    EXPECT_FALSE(share_first->retry);
+    EXPECT_EQ(share_first->cipher, 0x1302);
+    EXPECT_EQ(share_first->group, 0x001d);
+    EXPECT_EQ(share_first->extensions, (std::vector<std::uint16_t>{0x0033, 0x002b}));
+
+    const auto versions_first = mtdd::detail::parse_server_hello(
+        server_hello_message(kPlainRandom, 0x1301, cat_bytes(kVersions, x25519_share())));
+    ASSERT_TRUE(versions_first.has_value());
+    EXPECT_EQ(versions_first->extensions, kVersionsThenShare);
+}
+
+TEST(ServerHelloProbe, RejectsMalformedServerHellos) {
+    const Bytes good =
+        server_hello_message(kPlainRandom, 0x1301, cat_bytes(kVersions, x25519_share()));
+    ASSERT_TRUE(mtdd::detail::parse_server_hello(good).has_value());
+    const Bytes truncated(good.begin(), good.end() - 1);
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(truncated).has_value());
+    Bytes trailing = good;
+    trailing.push_back(0);
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(trailing).has_value());
+    Bytes client_hello = good;
+    client_hello[0] = 0x01;
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(client_hello).has_value());
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(
+                     server_hello_message(kPlainRandom, 0x1301, cat_bytes(kVersions, kVersions)))
+                     .has_value())
+        << "a repeated extension";
+    // An extension longer than the extension block.
+    Bytes overrun = server_hello_message(kPlainRandom, 0x1301, extension(0x002b, Bytes(4, 0)));
+    overrun[79] = 0x40;  // low byte of the first extension's length
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(overrun).has_value());
+    EXPECT_FALSE(mtdd::detail::parse_server_hello(Bytes{}).has_value());
+}
+
+TEST(ServerHelloProbe, HelloRetryRequestIsNotTakenForTheServerHello) {
+    // An HRR names the group it wants (two bytes, no key); the real ServerHello
+    // follows the client's second hello.
+    const Bytes retry = server_hello_message(
+        kRetryRandom, 0x1302, cat_bytes(kVersions, extension(0x0033, Bytes{0x00, 0x17})));
+    const auto parsed = mtdd::detail::parse_server_hello(retry);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(parsed->retry);
+    EXPECT_EQ(parsed->group, 0x0017);
+
+    mtdd::detail::ServerHelloCapture capture;
+    capture.observe(retry);
+    EXPECT_TRUE(capture.retried);
+    EXPECT_FALSE(capture.hello.has_value()) << "an HRR alone is no ServerHello";
+    Bytes final_share{0x00, 0x17, 0x00, 0x41};
+    final_share.insert(final_share.end(), 65, 0x04);
+    capture.observe(server_hello_message(
+        kPlainRandom, 0x1302, cat_bytes(extension(0x0033, final_share), kVersions)));
+    // Later handshake messages (EncryptedExtensions, ...) change nothing.
+    capture.observe(Bytes{0x08, 0x00, 0x00, 0x02, 0x00, 0x00});
+    ASSERT_TRUE(capture.hello.has_value());
+    EXPECT_FALSE(capture.hello->retry);
+    EXPECT_EQ(capture.hello->cipher, 0x1302);
+    EXPECT_EQ(capture.hello->group, 0x0017);
+    EXPECT_EQ(capture.hello->extensions, (std::vector<std::uint16_t>{0x0033, 0x002b}));
+}
+
+TEST(ServerHelloProbe, CapturesTheServerHelloOfADefaultOpenSslServer) {
+    LocalTlsServer server;
+    const auto probe =
+        mtdd::detail::probe_server("127.0.0.1", server.port(), std::string(kDomain), 5s);
+    ASSERT_TRUE(probe.has_value());
+    EXPECT_EQ(probe->flight, server.flight_for(kDomain));
+    EXPECT_EQ(probe->cipher, 0x1301) << "the client's (Chrome) order is honoured";
+    EXPECT_EQ(probe->extensions, kVersionsThenShare) << "OpenSSL: 43 then 51";
+    EXPECT_FALSE(probe->key_share_first);
+    EXPECT_FALSE(probe->retried);
+    if (openssl_offers_pq()) {
+        EXPECT_EQ(probe->group, 0x11ec);
+        EXPECT_EQ(probe->pq, PqAnswer::pq);
+    } else {
+        EXPECT_EQ(probe->group, 0x001d);
+        EXPECT_EQ(probe->pq, PqAnswer::unknown);
+    }
+}
+
+TEST(ServerHelloProbe, CapturesServerCipherPreferenceAndAClassicalOnlyServer) {
+    LocalTlsServer server(LocalTlsServer::Mode::serve, ServerTls{kChachaFirst, true, "X25519"});
+    const auto probe =
+        mtdd::detail::probe_server("127.0.0.1", server.port(), std::string(kDomain), 5s);
+    ASSERT_TRUE(probe.has_value());
+    EXPECT_EQ(probe->cipher, 0x1303) << "server-side preference";
+    EXPECT_EQ(probe->group, 0x001d);
+    EXPECT_EQ(probe->pq, declined()) << "X25519 although X25519MLKEM768 was offered";
+    EXPECT_FALSE(probe->retried) << "an X25519 share was offered as well";
+}
+
+TEST(ServerHelloProbe, WithoutPqTheGroupAnswerStaysUnknown) {
+    LocalTlsServer server;
+    const auto probe = mtdd::detail::probe_server("127.0.0.1", server.port(),
+                                                  std::string(kDomain), 5s, {}, false);
+    ASSERT_TRUE(probe.has_value()) << "the classical fallback still measures";
+    EXPECT_EQ(probe->flight, server.flight_for(kDomain));
+    EXPECT_EQ(probe->group, 0x001d);
+    EXPECT_EQ(probe->pq, PqAnswer::unknown);
+}
+
+TEST(ServerHelloProbe, FollowsAHelloRetryRequestToTheFinalServerHello) {
+    // P-256 is offered without a key share: the server asks for one.
+    LocalTlsServer server(LocalTlsServer::Mode::serve, ServerTls{nullptr, false, "P-256"});
+    const auto probe =
+        mtdd::detail::probe_server("127.0.0.1", server.port(), std::string(kDomain), 5s);
+    ASSERT_TRUE(probe.has_value());
+    EXPECT_TRUE(probe->retried);
+    EXPECT_EQ(probe->group, 0x0017) << "the final ServerHello's group";
+    EXPECT_EQ(probe->extensions, kVersionsThenShare);
+    EXPECT_EQ(probe->pq, declined());
+    EXPECT_EQ(probe->flight, server.flight_for(kDomain)) << "the HRR is not part of the flight";
+}
+
+TEST(ServerHelloProbe, HandshakesMirrorTheMeasuredServerHello) {
+    LocalTlsServer server(LocalTlsServer::Mode::serve, ServerTls{kChachaFirst, true, "X25519"});
+    ProbeScope scope(server.port());
+    Daemon daemon(1, false, masking_on);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] {
+        return server.handshakes(kDomain) >= mtdd::detail::kServerFlightSamples;
+    }, 10s));
+    // The client offers 1301 and 1303 and both an X25519MLKEM768 and an
+    // X25519 share; the measured server answers CHACHA20 and X25519.
+    ASSERT_TRUE(wait_for([&] {
+        const auto answer = daemon_answer(daemon.port(), true);
+        return answer && answer->cipher == 0x1303;
+    }, 5s)) << "the measured suite reaches the handshakes";
+    const auto answer = daemon_answer(daemon.port(), true);
+    ASSERT_TRUE(answer.has_value());
+    EXPECT_EQ(answer->extensions, kVersionsThenShare);
+    EXPECT_EQ(answer->group, openssl_offers_pq() ? 0x001d : 0x11ec)
+        << "a declined PQ group is mirrored; an unknown answer keeps PQ";
+    // Without a PQ offer: the measured suite, the X25519 answer as always.
+    const auto classical = daemon_answer(daemon.port(), false);
+    ASSERT_TRUE(classical.has_value());
+    EXPECT_EQ(classical->cipher, 0x1303);
+    EXPECT_EQ(classical->group, 0x001d);
+}
 
 TEST(ServerHelloProbe, MeasuresTheFlightOfALocalTls13Server) {
     LocalTlsServer server;

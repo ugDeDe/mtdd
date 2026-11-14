@@ -257,8 +257,10 @@ bool wait_closed(int fd, int timeout_ms) {
 // Client Hello / obfuscation builder (mirrors the client side of FakeTLS)
 // ---------------------------------------------------------------------------
 
+// `offer_pq`: an X25519MLKEM768 share precedes the X25519 one, as the
+// Telegram client (like Chrome) sends both.
 Bytes make_client_hello(const A16& secret, std::uint32_t timestamp, std::string_view sni,
-                        std::uint8_t variant = 0) {
+                        std::uint8_t variant = 0, bool offer_pq = false) {
     Bytes random;
     for (int i = 0; i < 32; ++i) {
         random.push_back(static_cast<std::uint8_t>(0x20 + i + variant));
@@ -270,7 +272,14 @@ Bytes make_client_hello(const A16& secret, std::uint32_t timestamp, std::string_
     Bytes key;
     for (int i = 0; i < 32; ++i) key.push_back(static_cast<std::uint8_t>(0x80 + i + variant));
 
-    Bytes entry{0x00, 0x1d, 0x00, 0x20};
+    Bytes entry;
+    if (offer_pq) {
+        entry = {0x11, 0xec};
+        put16(entry, static_cast<std::uint16_t>(mtdd::protocol::kPqClientKeyShare));
+        entry.insert(entry.end(), mtdd::protocol::kPqClientKeyShare,
+                     static_cast<std::uint8_t>(0x90 + variant));
+    }
+    entry.insert(entry.end(), {0x00, 0x1d, 0x00, 0x20});
     append(entry, key);
     Bytes key_share;
     put16(key_share, static_cast<std::uint16_t>(entry.size()));

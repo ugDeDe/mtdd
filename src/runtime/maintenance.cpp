@@ -217,6 +217,7 @@ void Runtime::Impl::reaccount(Client& client) {
     if (client.c2b) next += client.c2b->capacity_bytes();
     if (client.direct_out) next += client.direct_out->capacity_bytes();
     next += client.s2c_wire.capacity();
+    next += client.held_server_hello.capacity();
     next += client.s2c_batch.capacity();
     next += client.c2s_capacity;
     if (next >= client.accounted) {
