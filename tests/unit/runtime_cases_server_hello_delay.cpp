@@ -178,3 +178,199 @@ TEST(ServerHelloDelay, ShutdownDuringTheDelayClosesTheHeldClient) {
     EXPECT_TRUE(wait_closed(fd, 1000));
     ::close(fd);
 }
+
+// ---------------------------------------------------------------------------
+// server_hello_delay_auto: the processing time measured on the real server
+// (ClientHello -> ServerHello latency minus the TCP connect round trip) over
+// the last few probe handshakes, and the per-client delay drawn from it.
+// Pure functions: injected timings, no network.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using std::chrono::microseconds;
+using mtdd::detail::ServerTiming;
+using mtdd::detail::ServerTimingHistory;
+
+ServerTiming timing_us(std::int64_t low, std::int64_t median, std::int64_t high) {
+    return ServerTiming{microseconds(low), microseconds(median), microseconds(high), 8};
+}
+
+}  // namespace
+
+TEST(ServerHelloAutoDelay, ProcessingIsTheHelloLatencyMinusOneConnectRoundTrip) {
+    using mtdd::detail::server_processing_time;
+    EXPECT_EQ(server_processing_time(microseconds(20000), microseconds(32000)), microseconds(12000));
+    EXPECT_EQ(server_processing_time(microseconds(0), microseconds(4500)), microseconds(4500))
+        << "an immediate connect measures no round trip";
+    EXPECT_EQ(server_processing_time(microseconds(20000), microseconds(20000)), microseconds(0));
+    EXPECT_EQ(server_processing_time(microseconds(25000), microseconds(19000)), microseconds(0))
+        << "a noisy RTT above the latency clamps at 0, never negative";
+}
+
+TEST(ServerHelloAutoDelay, HistoryKeepsTheLastEightSamplesAndItsQuartiles) {
+    ServerTimingHistory history;
+    EXPECT_FALSE(history.summary().has_value()) << "unmeasured";
+
+    history.add(microseconds(7000));
+    const auto one = history.summary();
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ(one->low, microseconds(7000));
+    EXPECT_EQ(one->median, microseconds(7000));
+    EXPECT_EQ(one->high, microseconds(7000));
+    EXPECT_EQ(one->samples, 1U);
+
+    // Out of order on purpose: the summary sorts. {1,2,3,4,7}: 2, 3, 4.
+    for (const int ms : {4, 1, 3, 2}) history.add(microseconds(ms * 1000));
+    const auto five = history.summary();
+    ASSERT_TRUE(five.has_value());
+    EXPECT_EQ(five->low, microseconds(2000));
+    EXPECT_EQ(five->median, microseconds(3000));
+    EXPECT_EQ(five->high, microseconds(4000));
+    EXPECT_EQ(five->samples, 5U);
+
+    // Interpolated between neighbours for an even count.
+    ServerTimingHistory even;
+    for (int ms = 1; ms <= 8; ++ms) even.add(microseconds(ms * 1000));
+    const auto eight = even.summary();
+    ASSERT_TRUE(eight.has_value());
+    EXPECT_EQ(eight->low, microseconds(2750));  // 1 + 7 * 0.25
+    EXPECT_EQ(eight->median, microseconds(4500));
+    EXPECT_EQ(eight->high, microseconds(6250));
+    EXPECT_EQ(eight->samples, ServerTimingHistory::kCapacity);
+
+    // Bounded: eight newer samples push every old one out.
+    for (int i = 0; i < 8; ++i) even.add(microseconds(90000));
+    EXPECT_EQ(even.size(), ServerTimingHistory::kCapacity);
+    const auto replaced = even.summary();
+    ASSERT_TRUE(replaced.has_value());
+    EXPECT_EQ(replaced->low, microseconds(90000));
+    EXPECT_EQ(replaced->high, microseconds(90000));
+
+    // One more replaces only the oldest: {0, 90 x 7}.
+    even.add(microseconds(0));
+    const auto mixed = even.summary();
+    ASSERT_TRUE(mixed.has_value());
+    EXPECT_EQ(mixed->low, microseconds(90000));
+    EXPECT_EQ(mixed->high, microseconds(90000));
+    EXPECT_EQ(mixed->samples, ServerTimingHistory::kCapacity);
+
+    ServerTimingHistory negative;
+    negative.add(microseconds(-5));
+    EXPECT_EQ(negative.summary()->low, microseconds(0)) << "a negative sample is stored as 0";
+}
+
+TEST(ServerHelloAutoDelay, PicksWithinTheMeasuredSpreadOnlyWhenEnabledAndUnset) {
+    using mtdd::detail::pick_server_hello_delay;
+    mtdd::Config config;
+    ASSERT_TRUE(config.server_hello_delay_auto) << "on by default";
+    const std::optional<ServerTiming> measured = timing_us(3000, 4000, 6000);
+
+    // Within [p25, p75] for any draw, both ends included.
+    for (const std::uint32_t draw : {0U, 1U, 2999U, 3000U, 12345U, 0xffffffffU}) {
+        const auto choice = pick_server_hello_delay(config, measured, draw);
+        EXPECT_TRUE(choice.automatic);
+        EXPECT_GE(choice.delay, microseconds(3000)) << draw;
+        EXPECT_LE(choice.delay, microseconds(6000)) << draw;
+    }
+    EXPECT_EQ(pick_server_hello_delay(config, measured, 0).delay, microseconds(3000));
+    EXPECT_EQ(pick_server_hello_delay(config, measured, 3000).delay, microseconds(6000));
+
+    // Unmeasured: no delay, as before the feature.
+    const auto unmeasured = pick_server_hello_delay(config, std::nullopt, 12345);
+    EXPECT_FALSE(unmeasured.automatic);
+    EXPECT_EQ(unmeasured.delay, microseconds(0));
+
+    // Disabled: the measurement is ignored.
+    config.server_hello_delay_auto = false;
+    const auto disabled = pick_server_hello_delay(config, measured, 12345);
+    EXPECT_FALSE(disabled.automatic);
+    EXPECT_EQ(disabled.delay, microseconds(0));
+}
+
+TEST(ServerHelloAutoDelay, ManualBoundsOverrideTheMeasurement) {
+    using mtdd::detail::pick_server_hello_delay;
+    mtdd::Config config;
+    const std::optional<ServerTiming> measured = timing_us(40000, 50000, 60000);
+    delay_ms(config, 7, 7);
+    const auto fixed = pick_server_hello_delay(config, measured, 0xffffffffU);
+    EXPECT_FALSE(fixed.automatic);
+    EXPECT_EQ(fixed.delay, microseconds(7000));
+
+    delay_ms(config, 10, 20);
+    for (const std::uint32_t draw : {0U, 5U, 10U, 11U, 0xffffffffU}) {
+        const auto choice = pick_server_hello_delay(config, measured, draw);
+        EXPECT_FALSE(choice.automatic);
+        EXPECT_GE(choice.delay, microseconds(10000));
+        EXPECT_LE(choice.delay, microseconds(20000));
+        EXPECT_EQ(choice.delay.count() % 1000, 0) << "whole milliseconds, as before";
+    }
+    // A minimum alone is still manual.
+    mtdd::Config min_only;
+    min_only.server_hello_delay_min = std::chrono::milliseconds(5);
+    EXPECT_EQ(pick_server_hello_delay(min_only, measured, 99).delay, microseconds(5000));
+}
+
+TEST(ServerHelloAutoDelay, AutomaticDelayIsCappedAtOneHundredMilliseconds) {
+    using mtdd::detail::pick_server_hello_delay;
+    const mtdd::Config config;
+    const microseconds cap = mtdd::Config::kMaxAutoServerHelloDelay;
+    ASSERT_EQ(cap, microseconds(100000));
+    // Entirely above the cap: exactly the cap.
+    for (const std::uint32_t draw : {0U, 7U, 0xffffffffU}) {
+        const auto choice =
+            pick_server_hello_delay(config, timing_us(400000, 500000, 900000), draw);
+        EXPECT_TRUE(choice.automatic);
+        EXPECT_EQ(choice.delay, cap);
+    }
+    // Straddling it: the upper end is cut, the lower one kept.
+    for (std::uint32_t draw = 0; draw < 50000; draw += 997) {
+        const auto choice =
+            pick_server_hello_delay(config, timing_us(80000, 120000, 300000), draw);
+        EXPECT_GE(choice.delay, microseconds(80000));
+        EXPECT_LE(choice.delay, cap);
+    }
+    // A measured 0 (processing within the RTT noise) is an automatic 0.
+    const auto zero = pick_server_hello_delay(config, timing_us(0, 0, 0), 12345);
+    EXPECT_TRUE(zero.automatic);
+    EXPECT_EQ(zero.delay, microseconds(0));
+}
+
+TEST(ServerHelloAutoDelay, AppliedDelaysAreCountedByBucket) {
+    mtdd::control::Statistics stats;
+    for (const int us : {0, 1000, 1001, 5000, 9999, 25000, 50001, 100000}) {
+        stats.server_hello_auto_delay(microseconds(us));
+    }
+    stats.server_hello_auto_delay(microseconds(-3));  // clamped to 0
+    const auto snapshot = stats.snapshot();
+    const auto& buckets = snapshot.server_hello_auto_delay_total;
+    ASSERT_EQ(buckets.size(), mtdd::control::kAutoDelayBuckets) << "every label present";
+    EXPECT_EQ(buckets.at("le_1ms"), 3U);
+    EXPECT_EQ(buckets.at("le_5ms"), 2U);
+    EXPECT_EQ(buckets.at("le_10ms"), 1U);
+    EXPECT_EQ(buckets.at("le_25ms"), 1U);
+    EXPECT_EQ(buckets.at("le_50ms"), 0U);
+    EXPECT_EQ(buckets.at("le_100ms"), 2U);
+    EXPECT_EQ(snapshot.server_hello_auto_delay_us_total, 192001U);
+    const auto text = stats.prometheus_text();
+    EXPECT_NE(text.find("mtdd_server_hello_auto_delay_total{delay=\"le_100ms\"} 2"),
+              std::string::npos);
+    EXPECT_NE(text.find("mtdd_server_hello_auto_delay_us_total 192001"), std::string::npos);
+    EXPECT_EQ(text.find("mtdd_masking_server_processing_us"), std::string::npos)
+        << "no domain measured, no per-domain gauge";
+
+    stats.set_server_timing_lister([] {
+        return std::vector<mtdd::control::Statistics::ServerTimingInfo>{
+            {"front.example", 1500, 2000, 2750, 8}};
+    });
+    const auto with_domain = stats.prometheus_text();
+    EXPECT_NE(with_domain.find("mtdd_masking_server_processing_us{domain=\"front.example\","
+                               "quantile=\"0.5\"} 2000"),
+              std::string::npos);
+    EXPECT_NE(with_domain.find("mtdd_masking_server_processing_us{domain=\"front.example\","
+                               "quantile=\"0.75\"} 2750"),
+              std::string::npos);
+    EXPECT_NE(with_domain.find("mtdd_masking_server_processing_samples{domain=\"front.example\"} 8"),
+              std::string::npos);
+    stats.set_server_timing_lister({});
+}

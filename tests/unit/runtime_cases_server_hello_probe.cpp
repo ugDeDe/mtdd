@@ -1,5 +1,7 @@
 #include "../support/runtime_fixture.hpp"
 
+#include <sys/ioctl.h>
+
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -60,6 +62,8 @@ struct ServerTls {
     const char* suites{nullptr};
     bool server_preference{false};
     const char* groups{nullptr};
+    // Held before answering each ClientHello: the server's processing time.
+    std::chrono::milliseconds processing{0};
 };
 
 // TLS 1.3-only OpenSSL server on 127.0.0.1, one connection at a time. It
@@ -71,7 +75,8 @@ class LocalTlsServer {
 public:
     enum class Mode { serve, stall };
 
-    explicit LocalTlsServer(Mode mode = Mode::serve, ServerTls tls = {}) : mode_(mode) {
+    explicit LocalTlsServer(Mode mode = Mode::serve, ServerTls tls = {})
+        : mode_(mode), processing_(tls.processing) {
         auto global = self_signed(kDomain, 0);
         auto front = self_signed(kFront, 40);
         global_key_ = std::move(global.first);
@@ -136,6 +141,7 @@ private:
 
     static int on_servername(SSL* ssl, int*, void* arg) {
         auto* self = static_cast<LocalTlsServer*>(arg);
+        if (self->processing_.count() > 0) std::this_thread::sleep_for(self->processing_);
         const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
         if (name != nullptr && std::string_view(name) == kFront) {
             SSL_use_certificate(ssl, self->front_cert_.get());
@@ -197,6 +203,7 @@ private:
     }
 
     Mode mode_;
+    std::chrono::milliseconds processing_;
     PKey global_key_{nullptr, &EVP_PKEY_free};
     Cert global_cert_{nullptr, &X509_free};
     PKey front_key_{nullptr, &EVP_PKEY_free};
@@ -626,4 +633,257 @@ TEST(ServerHelloProbe, UnreachableDomainFallsBackToARandomLength) {
         seen.insert(*length);
     }
     EXPECT_GT(seen.size(), 1U) << "the fallback is a distribution, not a constant";
+}
+
+// ---------------------------------------------------------------------------
+// Server processing time (server_hello_delay_auto): the probe measures how
+// long the real server takes before its ServerHello, and FakeTLS handshakes
+// of that domain are then held for a draw from the measured spread.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using AutoClock = std::chrono::steady_clock;
+
+// One authenticated FakeTLS hello: the time from the hello written to the
+// first byte of the answer, which must be ServerHello, one CCS and one
+// ApplicationData record (the shape the Telegram client accepts).
+std::optional<AutoClock::duration> auto_hello_latency(std::uint16_t port) {
+    const int fd = connect_loopback(port);
+    if (fd < 0) return std::nullopt;
+    const auto ts = static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    static std::atomic<unsigned> variant{200};
+    const auto hello =
+        make_client_hello(secret_bytes(), ts, kDomain, static_cast<std::uint8_t>(variant.fetch_add(1)));
+    std::optional<AutoClock::duration> first;
+    bool shaped = send_all(fd, hello);
+    const auto sent = AutoClock::now();
+    for (const std::uint8_t type : {std::uint8_t{0x16}, std::uint8_t{0x14}, std::uint8_t{0x17}}) {
+        if (!shaped) break;
+        std::array<std::uint8_t, 5> header{};
+        shaped = recv_exact(fd, header.data(), header.size(), 3000) && header[0] == type;
+        if (!first) first = AutoClock::now() - sent;
+        Bytes body((static_cast<std::size_t>(header[3]) << 8) | header[4]);
+        if (shaped && !body.empty()) shaped = recv_exact(fd, body.data(), body.size(), 3000);
+    }
+    ::close(fd);
+    if (!shaped) return std::nullopt;
+    return first;
+}
+
+std::uint64_t auto_delays(const mtdd::control::Statistics& stats) {
+    std::uint64_t total = 0;
+    for (const auto& [bucket, count] : stats.snapshot().server_hello_auto_delay_total) {
+        total += count;
+    }
+    return total;
+}
+
+// The per-domain processing-time gauge appears once a probe succeeded.
+bool processing_measured(const mtdd::control::Statistics& stats) {
+    return stats.prometheus_text().find("mtdd_masking_server_processing_samples{domain=\"" +
+                                        std::string(kDomain) + "\"}") != std::string::npos;
+}
+
+void masking_auto(mtdd::Config& config) {
+    config.masking = true;
+    config.server_hello_delay_auto = true;
+}
+
+}  // namespace
+
+TEST(ServerHelloProbe, MeasuresTheServersProcessingTime) {
+    ServerTls tls;
+    tls.processing = 40ms;
+    LocalTlsServer server(LocalTlsServer::Mode::serve, tls);
+    const auto probe =
+        mtdd::detail::probe_server("127.0.0.1", server.port(), std::string(kDomain), 5s);
+    ASSERT_TRUE(probe.has_value());
+    ASSERT_TRUE(probe->hello_latency.has_value());
+    ASSERT_TRUE(probe->processing.has_value());
+    EXPECT_GE(*probe->hello_latency, 40ms) << "the server slept before its ServerHello";
+    EXPECT_LT(probe->connect_rtt, 40ms) << "loopback connect";
+    EXPECT_EQ(*probe->processing, *probe->hello_latency - probe->connect_rtt);
+    EXPECT_GE(*probe->processing, 39ms);
+    EXPECT_LT(*probe->processing, 2s);
+
+    // After a HelloRetryRequest the answer to the second ClientHello is the
+    // one timed; it is still a measurement.
+    ServerTls retry{nullptr, false, "P-256", 40ms};
+    LocalTlsServer retrying(LocalTlsServer::Mode::serve, retry);
+    const auto retried =
+        mtdd::detail::probe_server("127.0.0.1", retrying.port(), std::string(kDomain), 5s);
+    ASSERT_TRUE(retried.has_value());
+    EXPECT_TRUE(retried->retried);
+    ASSERT_TRUE(retried->processing.has_value());
+    EXPECT_GE(retried->processing->count(), 0);
+}
+
+TEST(ServerHelloAutoDelay, MeasuredDomainHoldsTheHelloForItsProcessingTime) {
+    ServerTls tls;
+    tls.processing = 30ms;
+    LocalTlsServer server(LocalTlsServer::Mode::serve, tls);
+    ProbeScope scope(server.port());
+    Daemon daemon(1, false, masking_auto);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return processing_measured(daemon.services.stats); }, 10s));
+
+    const auto text = daemon.services.stats.prometheus_text();
+    const std::string median = "mtdd_masking_server_processing_us{domain=\"" +
+                               std::string(kDomain) + "\",quantile=\"0.5\"} ";
+    const auto at = text.find(median);
+    ASSERT_NE(at, std::string::npos) << text;
+    EXPECT_GE(std::stoull(text.substr(at + median.size())), 29000U);
+
+    for (int i = 0; i < 4; ++i) {
+        const auto latency = auto_hello_latency(daemon.port());
+        ASSERT_TRUE(latency.has_value()) << "one ServerHello, one CCS, one ApplicationData";
+        EXPECT_GE(*latency, 29ms) << "held for the measured processing time";
+        EXPECT_LT(*latency, 1s);
+    }
+    const auto snapshot = daemon.services.stats.snapshot();
+    EXPECT_EQ(auto_delays(daemon.services.stats), 4U);
+    EXPECT_EQ(snapshot.server_hello_auto_delay_total.at("le_50ms"), 4U);
+    EXPECT_GE(snapshot.server_hello_auto_delay_us_total, 4U * 29000U);
+}
+
+TEST(ServerHelloAutoDelay, UnmeasuredDomainAnswersAtOnce) {
+    ProbeScope scope(closed_port());
+    Daemon daemon(1, false, masking_auto);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    std::this_thread::sleep_for(300ms);  // the first probe has failed by now
+    std::vector<AutoClock::duration> latencies;
+    for (int i = 0; i < 5; ++i) {
+        const auto latency = auto_hello_latency(daemon.port());
+        ASSERT_TRUE(latency.has_value());
+        latencies.push_back(*latency);
+    }
+    EXPECT_LT(*std::min_element(latencies.begin(), latencies.end()), 100ms);
+    EXPECT_EQ(auto_delays(daemon.services.stats), 0U) << "no measurement, no automatic delay";
+    EXPECT_FALSE(processing_measured(daemon.services.stats));
+}
+
+TEST(ServerHelloAutoDelay, ManualBoundsAndDisablingOverrideTheMeasurement) {
+    ServerTls tls;
+    tls.processing = 30ms;
+    LocalTlsServer server(LocalTlsServer::Mode::serve, tls);
+    ProbeScope scope(server.port());
+    {
+        Daemon daemon(1, false, [](mtdd::Config& config) {
+            masking_auto(config);
+            config.server_hello_delay_min = 200ms;
+            config.server_hello_delay_max = 200ms;
+        });
+        ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+        ASSERT_TRUE(wait_for([&] { return processing_measured(daemon.services.stats); }, 10s));
+        const auto latency = auto_hello_latency(daemon.port());
+        ASSERT_TRUE(latency.has_value());
+        EXPECT_GE(*latency, 200ms) << "the manual delay, not the measured 30 ms";
+        EXPECT_EQ(auto_delays(daemon.services.stats), 0U);
+    }
+    {
+        Daemon daemon(1, false, [](mtdd::Config& config) {
+            config.masking = true;
+            config.server_hello_delay_auto = false;
+        });
+        ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+        ASSERT_TRUE(wait_for([&] { return processing_measured(daemon.services.stats); }, 10s))
+            << "still measured and exported";
+        std::vector<AutoClock::duration> latencies;
+        for (int i = 0; i < 4; ++i) {
+            const auto latency = auto_hello_latency(daemon.port());
+            ASSERT_TRUE(latency.has_value());
+            latencies.push_back(*latency);
+        }
+        EXPECT_LT(*std::min_element(latencies.begin(), latencies.end()), 25ms)
+            << "disabled: answered at once";
+        EXPECT_EQ(auto_delays(daemon.services.stats), 0U);
+    }
+}
+
+TEST(ServerHelloAutoDelay, SlowServerIsCappedAndAResetDuringTheDelayIsClean) {
+    ServerTls tls;
+    tls.processing = 250ms;
+    LocalTlsServer server(LocalTlsServer::Mode::serve, tls);
+    ProbeScope scope(server.port());
+    testing::internal::CaptureStderr();
+    {
+        Daemon daemon(1, false, [](mtdd::Config& config) {
+            masking_auto(config);
+            config.watch_ips = {"127.0.0.1"};
+        });
+        ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+        ASSERT_TRUE(wait_for([&] { return processing_measured(daemon.services.stats); }, 15s));
+
+        // Every sample is above the cap: exactly 100 ms, not 250.
+        std::vector<AutoClock::duration> latencies;
+        for (int i = 0; i < 3; ++i) {
+            const auto latency = auto_hello_latency(daemon.port());
+            ASSERT_TRUE(latency.has_value());
+            EXPECT_GE(*latency, 100ms);
+            latencies.push_back(*latency);
+        }
+        EXPECT_LT(*std::min_element(latencies.begin(), latencies.end()), 240ms)
+            << "capped below the measured 250 ms";
+        EXPECT_EQ(daemon.services.stats.snapshot().server_hello_auto_delay_total.at("le_100ms"),
+                  3U);
+
+        // A client that resets during the automatic delay: closed at once,
+        // counted as a failed handshake, and the dropped deadline fires for
+        // nothing. The probing clients above are closed (and counted) first.
+        ASSERT_TRUE(wait_for([&] {
+            return daemon.services.stats.snapshot().connections_active == 0;
+        }, 2s));
+        const auto failures = stat_counter(daemon.services.stats, "handshakes", "failure");
+        const int fd = connect_loopback(daemon.port());
+        ASSERT_GE(fd, 0);
+        const auto ts = static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        ASSERT_TRUE(send_all(fd, make_client_hello(secret_bytes(), ts, kDomain, 250)));
+        const auto held_until = AutoClock::now() + 2s;
+        bool held = false;
+        while (!held && AutoClock::now() < held_until) {
+            const auto snapshot = daemon.services.stats.snapshot();
+            const auto user = snapshot.users.find("alice");
+            held = user != snapshot.users.end() && user->second.active_connections == 1U;
+            if (!held) std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_TRUE(held) << "authenticated";
+        int pending = 0;
+        ASSERT_EQ(::ioctl(fd, FIONREAD, &pending), 0);
+        EXPECT_EQ(pending, 0) << "the hello is still held";
+        linger option{1, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
+        ::close(fd);
+        ASSERT_TRUE(wait_for([&] {
+            return daemon.services.stats.snapshot().connections_active == 0;
+        }, 2s));
+        EXPECT_TRUE(wait_for([&] {
+            return stat_counter(daemon.services.stats, "handshakes", "failure") == failures + 1;
+        }, 1s));
+        std::this_thread::sleep_for(150ms);  // past the dropped deadline
+        const auto after = auto_hello_latency(daemon.port());
+        ASSERT_TRUE(after.has_value()) << "the reactor still serves normally";
+        EXPECT_GE(*after, 100ms);
+
+        // Shutdown during the automatic delay closes the held client too.
+        const int held_fd = connect_loopback(daemon.port());
+        ASSERT_GE(held_fd, 0);
+        ASSERT_TRUE(send_all(held_fd, make_client_hello(secret_bytes(), ts, kDomain, 251)));
+        ASSERT_TRUE(wait_for([&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            const auto user = snapshot.users.find("alice");
+            return user != snapshot.users.end() && user->second.active_connections == 1U;
+        }, 2s));
+        daemon.stop();
+        EXPECT_TRUE(wait_closed(held_fd, 1000));
+        ::close(held_fd);
+    }
+    const std::string log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find(" server_hello delay_us=100000 auto=1"), std::string::npos) << log;
 }

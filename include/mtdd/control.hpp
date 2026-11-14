@@ -348,6 +348,10 @@ enum class HandshakeResult { success, failure, timeout, replay };
 // "gt_1200s"). Such a hello is still rejected and also counted as a handshake
 // failure; this only shows how far off the clocks were.
 inline constexpr std::size_t kClockSkewBuckets = 4;
+// ServerHellos held for the processing time measured on the real server
+// (server_hello_delay_auto), by the delay applied. Fixed labels: "le_1ms",
+// "le_5ms", "le_10ms", "le_25ms", "le_50ms", "le_100ms" (the auto cap).
+inline constexpr std::size_t kAutoDelayBuckets = 6;
 // Why an authenticated relay session ended. First recorded reason wins.
 enum class RelayCloseReason : uint8_t {
   other,
@@ -590,6 +594,10 @@ struct StatisticsSnapshot {
   std::map<std::string, uint64_t> budget_refusals;  // by BudgetRefusal label
   // [client_clock][skew bucket], every label present (see kClockSkewBuckets).
   std::map<std::string, std::map<std::string, uint64_t>> hello_clock_skew_total;
+  // [delay bucket], every label present (see kAutoDelayBuckets), and the sum
+  // of the applied automatic delays in microseconds.
+  std::map<std::string, uint64_t> server_hello_auto_delay_total;
+  uint64_t server_hello_auto_delay_us_total{0};
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
   std::array<uint64_t, kSuspectSignals> suspect_events_total{};
   uint64_t suspect_shadow_bans_total{0};
@@ -753,6 +761,18 @@ class Statistics {
     bool real_client{false};    // also had real sessions (a non-zero auth key)
   };
   using SuspectLister = std::function<std::vector<SuspectInfo>()>;
+  // Processing time measured on the real server of each masked tls_domain
+  // (the masking probe), provided by the runtime; metrics only.
+  struct ServerTimingInfo {
+    std::string domain;
+    uint64_t low_us{0};     // p25
+    uint64_t median_us{0};  // p50
+    uint64_t high_us{0};    // p75
+    uint64_t samples{0};
+  };
+  using ServerTimingLister = std::function<std::vector<ServerTimingInfo>()>;
+  void set_server_timing_lister(ServerTimingLister lister);
+  std::vector<ServerTimingInfo> server_timings() const;
   void set_suspect_lister(SuspectLister lister);
   std::vector<SuspectInfo> suspects() const;
   void suspect_event(SuspectSignal signal) noexcept;
@@ -766,6 +786,8 @@ class Statistics {
   // A valid-secret ClientHello outside the timestamp window. `skew_seconds` is
   // server clock - client timestamp: positive when the client clock is behind.
   void hello_clock_skew(int64_t skew_seconds) noexcept;
+  // A ServerHello held for an automatic (measured) delay; 0 included.
+  void server_hello_auto_delay(std::chrono::microseconds delay) noexcept;
   // A ClientHello from a throttled address (see hello_throttled_total).
   void hello_throttled() noexcept;
   // `count` HMACs were computed to authenticate one ClientHello.

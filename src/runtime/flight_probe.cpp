@@ -131,12 +131,14 @@ public:
         return true;
     }
 
-    // Reads one batch into `in` (nullptr: discard). 1 bytes, 0 EOF, -1 failure.
-    int fill(BIO* in, Clock::time_point until) const {
+    // Reads one batch into `in` (nullptr: discard). 1 bytes (or a retryable
+    // nothing), 0 EOF, -1 failure. `received` is set when bytes arrived.
+    int fill(BIO* in, Clock::time_point until, Clock::time_point* received = nullptr) const {
         if (!wait(POLLIN, until)) return -1;
         std::array<char, 16384> buffer{};
         const ssize_t got = ::recv(fd_, buffer.data(), buffer.size(), 0);
         if (got > 0) {
+            if (received != nullptr) *received = Clock::now();
             if (in != nullptr && BIO_write(in, buffer.data(), static_cast<int>(got)) != got) {
                 return -1;
             }
@@ -202,12 +204,26 @@ std::optional<ServerProbe> handshake(int fd, const std::string& server_name,
     SSL_set_msg_callback(ssl.get(), &on_message);
     SSL_set_msg_callback_arg(ssl.get(), &observed);
 
+    // ClientHello fully written -> first byte of the answer: each write
+    // (a ClientHello, a second one after HelloRetryRequest) restarts the
+    // wait, and the first bytes read after it end it. The client's Finished
+    // is the last write and is answered by nothing read here, so the last
+    // completed pair is the latency of the final ServerHello.
+    std::optional<Clock::time_point> written;
+    std::optional<Clock::duration> latency;
     while (true) {
         const int status = SSL_connect(ssl.get());
+        const bool sending = BIO_ctrl_pending(out) > 0;
         if (!probe.flush(out)) return std::nullopt;
+        if (sending) written = Clock::now();
         if (status == 1) break;
         if (SSL_get_error(ssl.get(), status) != SSL_ERROR_WANT_READ) return std::nullopt;
-        if (probe.fill(in, deadline) != 1) return std::nullopt;
+        Clock::time_point received{};  // stays epoch when nothing arrived
+        if (probe.fill(in, deadline, &received) != 1) return std::nullopt;
+        if (written && received != Clock::time_point{}) {
+            latency = received - *written;
+            written.reset();
+        }
     }
     std::optional<ServerProbe> result;
     const auto& counter = observed.counter;
@@ -215,6 +231,10 @@ std::optional<ServerProbe> handshake(int fd, const std::string& server_name,
         result.emplace();
         result->flight = counter.bodies + 5 * (counter.records - 1);
         result->retried = observed.hello.retried;
+        if (latency) {
+            result->hello_latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(*latency);
+        }
         if (const auto& hello = observed.hello.hello) {
             result->cipher = hello->cipher;
             result->group = hello->group;
@@ -306,13 +326,23 @@ std::optional<ServerProbe> probe_server(const std::string& address, std::uint16_
                                         std::chrono::milliseconds timeout,
                                         const std::function<bool()>& cancelled, bool offer_pq) {
     if (cancelled && cancelled()) return std::nullopt;
-    const auto deadline = Clock::now() + timeout;
+    const auto started = Clock::now();
+    const auto deadline = started + timeout;
     auto connection = io::connect_tcp(address, port);
     if (!connection.ok()) return std::nullopt;
     std::optional<ServerProbe> result;
     if (!connection.in_progress ||
         Probe(connection.fd.get(), deadline, cancelled).connected()) {
+        // One TCP round trip (SYN -> SYN-ACK); an immediate connect is ~0.
+        const auto connect_rtt =
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started);
         result = handshake(connection.fd.get(), server_name, deadline, cancelled, offer_pq);
+        if (result) {
+            result->connect_rtt = connect_rtt;
+            if (result->hello_latency) {
+                result->processing = server_processing_time(connect_rtt, *result->hello_latency);
+            }
+        }
     }
     // OpenSSL's error queue is per thread; leave nothing behind on this one.
     ERR_clear_error();
@@ -321,6 +351,59 @@ std::optional<ServerProbe> probe_server(const std::string& address, std::uint16_
     if (result && result->flight < protocol::kServerFlightMin) return std::nullopt;
     if (result) result->flight = std::min(result->flight, protocol::kServerFlightMax);
     return result;
+}
+
+std::chrono::microseconds server_processing_time(std::chrono::microseconds connect_rtt,
+                                                 std::chrono::microseconds hello_latency) {
+    return std::max(hello_latency - connect_rtt, std::chrono::microseconds{0});
+}
+
+void ServerTimingHistory::add(std::chrono::microseconds sample) noexcept {
+    samples_[next_] = std::max(sample, std::chrono::microseconds{0});
+    next_ = (next_ + 1) % kCapacity;
+    size_ = std::min(size_ + 1, kCapacity);
+}
+
+std::optional<ServerTiming> ServerTimingHistory::summary() const {
+    if (size_ == 0) return std::nullopt;
+    std::array<std::chrono::microseconds, kCapacity> sorted{};
+    std::copy_n(samples_.begin(), size_, sorted.begin());
+    std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(size_));
+    // Quantile num/4 with linear interpolation between neighbours.
+    const auto quantile = [&](std::size_t num) {
+        const std::size_t scaled = num * (size_ - 1);
+        const std::size_t index = scaled / 4;
+        const std::size_t rest = scaled % 4;
+        auto value = sorted[index];
+        if (rest != 0) {
+            value += (sorted[index + 1] - sorted[index]) * static_cast<std::int64_t>(rest) / 4;
+        }
+        return value;
+    };
+    return ServerTiming{quantile(1), quantile(2), quantile(3), size_};
+}
+
+ServerHelloDelayChoice pick_server_hello_delay(const Config& config,
+                                               const std::optional<ServerTiming>& timing,
+                                               std::uint32_t draw) noexcept {
+    using std::chrono::microseconds;
+    ServerHelloDelayChoice choice;
+    const auto low = config.server_hello_delay_min;
+    const auto high = std::max(config.server_hello_delay_max, low);
+    if (high.count() > 0) {
+        // Manual bounds win; a whole-millisecond draw as before.
+        const auto span = static_cast<std::uint64_t>((high - low).count()) + 1U;
+        choice.delay = low + std::chrono::milliseconds(static_cast<std::int64_t>(draw % span));
+        return choice;
+    }
+    if (!config.server_hello_delay_auto || !timing) return choice;
+    const microseconds cap = Config::kMaxAutoServerHelloDelay;
+    const auto from = std::clamp(timing->low, microseconds{0}, cap);
+    const auto to = std::clamp(std::max(timing->high, timing->low), microseconds{0}, cap);
+    const auto span = static_cast<std::uint64_t>((to - from).count()) + 1U;
+    choice.delay = from + microseconds(static_cast<std::int64_t>(draw % span));
+    choice.automatic = true;
+    return choice;
 }
 
 std::optional<std::size_t> measure_server_flight(const std::string& address, std::uint16_t port,

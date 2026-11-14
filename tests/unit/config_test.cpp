@@ -380,6 +380,30 @@ TEST(Config, ServerHelloDelayIsOffByDefaultAndBounded) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, ServerHelloDelayAutoIsOnByDefaultAndBoolean) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_TRUE(defaults.server_hello_delay_auto);
+    EXPECT_TRUE(defaults.public_view()["server_hello_delay_auto"].get<bool>());
+
+    auto value = minimal_config();
+    value["server_hello_delay_auto"] = false;
+    const auto off = mtdd::Config::parse(value, "/work");
+    EXPECT_FALSE(off.server_hello_delay_auto);
+    EXPECT_FALSE(off.public_view()["server_hello_delay_auto"].get<bool>());
+
+    // Manual bounds may be set alongside it (they win at runtime).
+    value["server_hello_delay_auto"] = true;
+    value["server_hello_delay_min_ms"] = 5;
+    value["server_hello_delay_max_ms"] = 10;
+    EXPECT_TRUE(mtdd::Config::parse(value, "/work").server_hello_delay_auto);
+
+    for (const auto& bad : {nlohmann::json(1), nlohmann::json("true"), nlohmann::json(nullptr)}) {
+        value["server_hello_delay_auto"] = bad;
+        EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument) << bad.dump();
+    }
+    EXPECT_EQ(mtdd::Config::kMaxAutoServerHelloDelay, std::chrono::milliseconds(100));
+}
+
 TEST(Config, RequiresEnoughGlobalMemoryForOneMaximumFrameAndQueues) {
     auto value = minimal_config();
     value["global_buffer_bytes"] = 262144;

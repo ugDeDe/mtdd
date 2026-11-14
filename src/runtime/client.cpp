@@ -969,8 +969,10 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     // The real server of the user's domain sized this flight and chose this
     // suite, extension order and group (measured off the reactor); unmeasured,
     // the protocol layer draws a fallback length and echoes the client.
+    std::optional<detail::ServerTiming> server_timing;
     if (tls_config.expected_server_name && masking_dns_) {
         if (const auto profile = masking_dns_->server_profile(*tls_config.expected_server_name)) {
+            server_timing = profile->timing;
             auto& options = tls_config.server_hello;
             options.app_data_min = profile->min - detail::kServerFlightJitter;
             options.app_data_max = profile->max + detail::kServerFlightJitter;
@@ -994,9 +996,11 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
         return;
     }
     // A real server answers after its own key exchange and signature; with
-    // server_hello_delay_* the flight is held (and the client not read) until
-    // the per-client server_hello_delay deadline releases it.
-    const auto delay = server_hello_delay();
+    // server_hello_delay_* (or the processing time measured on the real
+    // server, server_hello_delay_auto) the flight is held (and the client not
+    // read) until the per-client server_hello_delay deadline releases it.
+    const auto choice = server_hello_delay(server_timing);
+    const auto delay = choice.delay;
     if (delay.count() > 0) {
         client.held_server_hello.assign(wire_buffer_.begin(), wire_buffer_.end());
     } else if (!push_client_wire(client, wire_buffer_)) {
@@ -1017,11 +1021,19 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     stats_.observe_ip_history(client.ip_key);
     note_ip_payload(client, 0);  // unique_ip_min_bytes == 0: active at handshake
     client.phase = Client::Phase::tls_handshake;
+    // Counted once the hello is certain to go out (held or already queued).
+    if (choice.automatic) stats_.server_hello_auto_delay(delay);
     if (!client.held_server_hello.empty()) {
         client.deadline_kind = Client::DeadlineKind::server_hello_delay;
         deadlines_.set(client.token, now + delay);
         if (client.watched) {
-            watch_log(client, "server_hello", "delay_ms=" + std::to_string(delay.count()));
+            watch_log(client, "server_hello",
+                      choice.automatic
+                          ? "delay_us=" + std::to_string(delay.count()) + " auto=1"
+                          : "delay_ms=" +
+                                std::to_string(
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(delay)
+                                        .count()));
         }
     } else {
         client.deadline_kind = Client::DeadlineKind::handshake;
@@ -1033,18 +1045,22 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     reaccount(client);
 }
 
-std::chrono::milliseconds Runtime::Impl::server_hello_delay() {
-    const auto low = config_.server_hello_delay_min;
-    const auto high = std::max(config_.server_hello_delay_max, low);
-    if (high.count() <= 0) return std::chrono::milliseconds{0};
-    if (low == high) return low;
-    std::array<std::uint8_t, 4> draw{};
-    random_(draw);
-    const std::uint32_t value = (static_cast<std::uint32_t>(draw[0]) << 24) |
-                                (static_cast<std::uint32_t>(draw[1]) << 16) |
-                                (static_cast<std::uint32_t>(draw[2]) << 8) | draw[3];
-    const auto span = static_cast<std::uint64_t>((high - low).count()) + 1U;
-    return low + std::chrono::milliseconds(static_cast<std::int64_t>(value % span));
+detail::ServerHelloDelayChoice Runtime::Impl::server_hello_delay(
+    const std::optional<detail::ServerTiming>& timing) {
+    const bool manual = config_.server_hello_delay_max.count() > 0 ||
+                        config_.server_hello_delay_min.count() > 0;
+    const bool varies = manual ? config_.server_hello_delay_min != config_.server_hello_delay_max
+                               : config_.server_hello_delay_auto && timing &&
+                                     timing->high > timing->low;
+    std::uint32_t value = 0;
+    if (varies) {
+        std::array<std::uint8_t, 4> draw{};
+        random_(draw);
+        value = (static_cast<std::uint32_t>(draw[0]) << 24) |
+                (static_cast<std::uint32_t>(draw[1]) << 16) |
+                (static_cast<std::uint32_t>(draw[2]) << 8) | draw[3];
+    }
+    return detail::pick_server_hello_delay(config_, timing, value);
 }
 
 void Runtime::Impl::release_server_hello(Client& client, Time now) {
