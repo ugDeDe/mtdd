@@ -3,7 +3,7 @@
 // `client.watched`, so other connections pay one branch.
 //
 //   mtdd watch: conn=17 peer=1.2.3.4:5555 +0ms accept syn=ttl:55,win:64240,...
-//   mtdd watch: conn=17 peer=1.2.3.4:5555 +80ms hello len=1785 sni=... tls=chrome
+//   mtdd watch: conn=17 peer=1.2.3.4:5555 +80ms hello len=1785 sni=... tls=chrome ja4=t13d...
 //   mtdd watch: conn=17 peer=1.2.3.4:5555 +81ms auth user=dd
 //   mtdd watch: conn=17 peer=1.2.3.4:5555 +160ms tls_ready dc=2 route=me platform=Android
 //   mtdd watch: conn=17 peer=1.2.3.4:5555 +240ms frame len=40 auth_key_id=0 msg=req_pq_multi
@@ -190,7 +190,7 @@ void Runtime::Impl::watch_accept(Client& client, Time now) {
     watch_log(client, "accept", detail);
 }
 
-void Runtime::Impl::watch_hello(const Client& client, std::span<const std::uint8_t> record) {
+void Runtime::Impl::watch_hello(Client& client, std::span<const std::uint8_t> record) {
     const bool tls = record.size() >= 3 && record[0] == 0x16 && record[1] == 0x03;
     std::string detail = "bytes=" + std::to_string(record.size());
     if (!tls) {
@@ -215,6 +215,8 @@ void Runtime::Impl::watch_hello(const Client& client, std::span<const std::uint8
     const auto sni = protocol::client_hello_sni(record);
     detail += std::string(" sni=") + (sni ? *sni : "-") +
               " tls=" + tls_name(detail::classify_client_hello(record));
+    const std::string& ja4 = client_ja4(client, record);
+    detail += " ja4=" + (ja4.empty() ? std::string("-") : ja4);
     watch_log(client, "hello", detail);
 }
 

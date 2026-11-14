@@ -271,6 +271,7 @@ SuspectTable::Recorded SuspectTable::record(const Context& context, Signal signa
     if (context.tls != TlsTemplate::other) entry.tls = context.tls;
     if (!context.user.empty()) entry.user = std::string(context.user);
     if (!context.sni.empty()) entry.sni = std::string(context.sni.substr(0, 255));
+    if (!context.ja4.empty()) entry.ja4 = std::string(context.ja4.substr(0, 64));
     if (signal == Signal::raw_obfuscated2) entry.last_raw = now;
     out.score = score_of(entry.hits, 0.0, entry.real);
     out.matches = matches_of(entry.hits);
@@ -344,6 +345,7 @@ std::vector<control::Statistics::SuspectInfo> SuspectTable::list(Clock::time_poi
             info.visits = entry.visits;
             info.user = entry.user;
             info.sni = entry.sni;
+            info.ja4 = entry.ja4;
             info.platform = platform_name(entry.platform);
             info.tls = tls_text(entry.tls);
             info.ttl = entry.syn.ttl;
@@ -400,6 +402,7 @@ void Runtime::Impl::suspect(Client& client, control::SuspectSignal signal, std::
     context.platform = client.platform;
     context.user = client.user_name;
     context.sni = sni;
+    context.ja4 = client.ja4;
     const auto recorded = shared_->suspects.record(context, signal, Clock::now(), suspect_unix_now(),
                                                    static_cast<double>(config_.suspect_watch_score));
     if (client.watched) {

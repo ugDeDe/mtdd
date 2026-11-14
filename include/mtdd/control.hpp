@@ -423,6 +423,7 @@ enum class ApiRoute {
   user_devices,
   suspects,
   ad_tag,
+  ja4,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -693,6 +694,68 @@ class UserMetrics {
   std::atomic<uint64_t> active_generation_{0};
 };
 
+// What became of a ClientHello whose JA4 fingerprint was recorded.
+enum class Ja4Outcome : uint8_t {
+  authenticated,    // valid secret, not a replay: handshake proceeds
+  unauthenticated,  // no key matched / foreign SNI / shadow ban: masking or close
+  throttled,        // unauthenticated from an address over the failed-probe threshold
+  replay,           // valid secret, already seen (in-window or stale)
+  clock_skew,       // valid secret, timestamp outside the skew window
+};
+inline constexpr std::size_t kJa4Outcomes = 5;
+const char* to_string(Ja4Outcome outcome) noexcept;
+
+// Process-wide bounded JA4 -> outcome counters (GET /v1/ja4). At most
+// `capacity` fingerprints are kept: a new one on a full table evicts the entry
+// with the lowest total, the least recently seen among ties, so a scanner's
+// stream of one-off values churns among themselves while the fingerprints of
+// real clients (high totals) stay. One mutex; touched once per recorded
+// handshake, never per packet.
+//
+// Failed hellos can be produced at any rate by a scanner, at no HMAC cost to
+// the proxy, so their fingerprinting is sampled: at most kFailedPerSecond
+// failed outcomes (unauthenticated/throttled) per wall-clock second are
+// fingerprinted process-wide; the rest are only counted (unsampled).
+// Authenticated, replay and clock_skew hellos already paid an HMAC and are
+// always recorded.
+class Ja4Table {
+ public:
+  static constexpr std::size_t kDefaultCapacity = 256;
+  static constexpr uint32_t kFailedPerSecond = 200;
+
+  struct Entry {
+    std::string ja4;
+    std::array<uint64_t, kJa4Outcomes> counts{};
+    uint64_t total{0};
+    int64_t first_seen{0};  // Unix seconds
+    int64_t last_seen{0};
+  };
+  struct Snapshot {
+    std::size_t capacity{0};
+    uint64_t evictions{0};
+    uint64_t unsampled{0};
+    std::vector<Entry> entries;  // total descending, then last_seen descending
+  };
+
+  explicit Ja4Table(std::size_t capacity = kDefaultCapacity);
+  ~Ja4Table();
+  Ja4Table(const Ja4Table&) = delete;
+  Ja4Table& operator=(const Ja4Table&) = delete;
+
+  // Sampling gate for failed outcomes: true while this second's budget lasts.
+  // A false return is counted as unsampled; the caller then skips the JA4.
+  bool sample_failed(int64_t unix_now) noexcept;
+  void record(std::string_view ja4, Ja4Outcome outcome, int64_t unix_now);
+  Snapshot snapshot() const;
+  std::size_t size() const;
+  uint64_t evictions() const noexcept;
+  uint64_t unsampled() const noexcept;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 // Thread-safe. Label sets are bounded by construction (enums and fixed label
 // normalization); there is no unbounded "reason"/path/IP map.
 class Statistics {
@@ -741,6 +804,7 @@ class Statistics {
     uint32_t visits{0};
     std::string user;         // last authenticated user, if any
     std::string sni;          // last ClientHello SNI, if any
+    std::string ja4;          // last recorded ClientHello JA4, if any
     std::string platform{"Undefined"};
     std::string tls{"other"};
     uint8_t ttl{0};
@@ -757,6 +821,10 @@ class Statistics {
   std::vector<SuspectInfo> suspects() const;
   void suspect_event(SuspectSignal signal) noexcept;
   void suspect_shadow_banned() noexcept;
+
+  // Process-wide JA4 fingerprint table (GET /v1/ja4, mtdd_ja4_* metrics).
+  Ja4Table& ja4() noexcept;
+  const Ja4Table& ja4() const noexcept;
 
   // Global connection counters.
   void connection_accepted() noexcept;

@@ -102,6 +102,7 @@
 | `GET /v1/stats/me` | read | Пулы Middle-End по DC |
 | `GET /v1/stats/users` | read | Пользователи, отсортированные по нагрузке |
 | `GET /v1/events` | read | Журнал изменений |
+| `GET /v1/ja4` | read | Отпечатки JA4 клиентских ClientHello по исходам (см. ниже) |
 | `GET /v1/users` | read | Список пользователей |
 | `POST /v1/users` | admin | Создать пользователя |
 | `GET /v1/users/{name}` | read | Пользователь со статистикой |
@@ -143,7 +144,8 @@ allowlist, включены ли маскировка и FakeTLS, глобаль
 Ответ: `total`, `filtered`, `by_matches` (сколько адресов с 1, 2, … совпадениями),
 `watched`, `shadow_banned` и `suspects[]`: `ip`, `matches`, `score`,
 `signals` (`{"probe_session": 2, ...}`), `hits`, `first_seen`, `last_seen`,
-`visits`, `user`, `sni`, `platform`, `tls`, `syn` (`ttl`, `window`, `mss`,
+`visits`, `user`, `sni`, `ja4` (JA4 последнего записанного ClientHello с
+адреса или `null`), `platform`, `tls`, `syn` (`ttl`, `window`, `mss`,
 `wscale`, `layout`), `watched`, `shadow_banned`, `real_client` (с адреса были и
 настоящие сессии: неоднозначные признаки A, E, F, G, H не дают очков). Признаки и веса описаны в
 README («Подозрительные адреса и fraud score»).
@@ -155,6 +157,40 @@ README («Подозрительные адреса и fraud score»).
 Признак `probe_session` рассчитан на аудиторию, которая авторизуется только на
 DC2: он срабатывает лишь на незавершённый обмен ключами с DC1. Для аудитории с
 другим домашним DC его вес стоит снизить.
+
+## Отпечатки JA4
+
+`GET /v1/ja4` (доступен read-токену, как и остальные GET) — какие
+TLS-клиенты (отпечаток [JA4](https://github.com/FoxIO-LLC/ja4), вариант TCP)
+проходят проверку секрета, а какие нет. Таблица общая на процесс и
+ограничена 256 отпечатками; сортировка — по `total`, затем по `last_seen`.
+Параметр: `limit` 1..100000 (по умолчанию 256).
+
+```json
+{"ok": true, "data": {
+  "capacity": 256, "total": 2, "evictions": 0, "unsampled": 0,
+  "sample_failed_per_second": 200,
+  "fingerprints": [
+    {"ja4": "t13d1516h2_8daaf6152771_e5627efa2ab1", "total": 4,
+     "authenticated": 3, "unauthenticated": 0, "throttled": 0,
+     "replay": 1, "clock_skew": 0,
+     "first_seen": "2030-01-01T00:00:00Z", "last_seen": "2030-01-01T00:00:01Z"}]}}
+```
+
+Исходы: `authenticated` — верный секрет, не повтор; `unauthenticated` —
+ни один ключ не подошёл, чужой или пустой SNI, теневой бан (уходит в
+маскировку или закрывается); `throttled` — то же с адреса, превысившего порог
+неудачных проб; `replay` — верный секрет, но ClientHello уже был; `clock_skew`
+— верный секрет, часы клиента вне окна.
+
+Ограничения: при заполнении новый отпечаток вытесняет запись с наименьшим
+`total`, среди равных — давнее всех виденную (`evictions`). Неудачные исходы
+(`unauthenticated`, `throttled`) сканер может слать с любой скоростью, поэтому
+отпечаток снимается не более чем у 200 таких ClientHello в секунду на весь
+процесс; остальные только считаются в `unsampled`. Успешные, `replay` и
+`clock_skew` (уже стоили HMAC) записываются всегда. Prometheus получает только
+агрегаты без меток JA4: `mtdd_ja4_fingerprints`, `mtdd_ja4_evictions_total`,
+`mtdd_ja4_unsampled_total`.
 
 ## Пользователи и политика
 

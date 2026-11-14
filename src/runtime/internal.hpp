@@ -859,6 +859,7 @@ public:
         TlsTemplate tls{TlsTemplate::other};
         std::string_view user;
         std::string_view sni;
+        std::string_view ja4;
     };
     struct Recorded {
         double score{0};
@@ -920,6 +921,7 @@ private:
         TlsTemplate tls{TlsTemplate::other};
         std::string user;
         std::string sni;
+        std::string ja4;
     };
     struct Shard {
         std::mutex mutex;
@@ -1299,6 +1301,10 @@ struct Runtime::Impl {
         std::deque<protocol::TransportDecoder::Message> c2s;
         std::size_t c2s_capacity{0}; // allocated bytes of c2s message vectors
         std::string user_name;
+        // JA4 of the ClientHello (empty: not computed or unparseable). Filled
+        // lazily by client_ja4(), only for hellos that are recorded.
+        std::string ja4;
+        bool ja4_done{false};
         std::uint64_t generation{0};
         std::shared_ptr<control::UserMetrics> metrics;
         // Payload not yet added to `metrics` (see detail::PayloadBatch).
@@ -1784,11 +1790,18 @@ struct Runtime::Impl {
     // client.watched first; nothing here runs for other connections.
     void watch_accept(Client& client, Time now);
     void watch_log(const Client& client, std::string_view event, std::string_view detail);
-    void watch_hello(const Client& client, std::span<const std::uint8_t> record);
+    void watch_hello(Client& client, std::span<const std::uint8_t> record);
     void watch_frame(Client& client, std::span<const std::uint8_t> payload, std::size_t length);
     void watch_close(const Client& client);
     // Records a suspect signal for this connection's address (suspects.cpp).
     void suspect(Client& client, control::SuspectSignal signal, std::string_view sni = {});
+    // JA4 fingerprint of the client's ClientHello (ja4.cpp), computed at most
+    // once per connection. record_ja4() adds it to the process-wide table;
+    // failed outcomes are sampled (Ja4Table::sample_failed) unless the JA4 is
+    // already known, so the HMAC-free reject path pays nothing past budget.
+    const std::string& client_ja4(Client& client, std::span<const std::uint8_t> record);
+    void record_ja4(Client& client, std::span<const std::uint8_t> record,
+                    control::Ja4Outcome outcome);
     void suspect_first_bytes(Client& client);
     void suspect_close(Client& client, Time now);
     bool suspect_shadow_ban(Client& client, Time now);
@@ -2056,6 +2069,8 @@ struct Runtime::Impl {
     std::vector<std::uint32_t> hello_key_mark_;
     std::uint32_t hello_mark_generation_{0};
     std::string hello_sni_;
+    // The last authenticate_hello() ran for a throttled address.
+    bool hello_last_throttled_{false};
     // Admission hints and failed-probe throttle (see kHelloHintEntries).
     detail::BoundedIpMap<detail::HelloHint> hello_ip_hints_{detail::kHelloHintEntries};
     detail::BoundedIpMap<detail::HelloHint> hello_prefix_hints_{detail::kHelloHintEntries};

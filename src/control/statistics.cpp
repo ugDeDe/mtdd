@@ -20,7 +20,7 @@ namespace {
 constexpr size_t kRejectReasonCount = 13;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 21;
+constexpr size_t kApiRouteCount = 22;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
@@ -54,7 +54,7 @@ constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
     "/v1/users/{name}/enable", "/v1/users/{name}/disable",
     "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects",
-    "/v1/ad-tag"};
+    "/v1/ad-tag", "/v1/ja4"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -131,6 +131,7 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::user_devices: return 18;
     case ApiRoute::suspects: return 19;
     case ApiRoute::ad_tag: return 20;
+    case ApiRoute::ja4: return 21;
   }
   return 7;
 }
@@ -516,6 +517,7 @@ struct Statistics::Impl {
   mutable std::mutex device_mutex;
   Statistics::DeviceLister device_lister;
   Statistics::SuspectLister suspect_lister;
+  Ja4Table ja4;
   std::array<std::atomic<uint64_t>, kSuspectSignals> suspect_events{};
   std::atomic<uint64_t> suspect_shadow_bans{0};
   std::string build_version;
@@ -610,6 +612,9 @@ std::vector<Statistics::SuspectInfo> Statistics::suspects() const {
   if (!impl_->suspect_lister) return {};
   return impl_->suspect_lister();
 }
+
+Ja4Table& Statistics::ja4() noexcept { return impl_->ja4; }
+const Ja4Table& Statistics::ja4() const noexcept { return impl_->ja4; }
 
 void Statistics::suspect_event(SuspectSignal signal) noexcept {
   const auto index = static_cast<size_t>(signal);
@@ -1543,6 +1548,11 @@ std::string Statistics::prometheus_text() const {
                   snapshot.suspect_events_total[index]);
   }
   append_metric(out, "mtdd_suspect_shadow_bans_total", "", snapshot.suspect_shadow_bans_total);
+  // JA4 fingerprints stay in GET /v1/ja4: only aggregates here, never a
+  // fingerprint label (a scanner can mint unlimited distinct values).
+  append_metric(out, "mtdd_ja4_fingerprints", "", impl_->ja4.size());
+  append_metric(out, "mtdd_ja4_evictions_total", "", impl_->ja4.evictions());
+  append_metric(out, "mtdd_ja4_unsampled_total", "", impl_->ja4.unsampled());
   {
     // Current suspects grouped by how many distinct signals they matched.
     std::array<uint64_t, kSuspectSignals + 1> by_matches{};

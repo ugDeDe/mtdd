@@ -293,6 +293,36 @@ HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out, std::size_t& matched);
 
+// ---------------------------------------------------------------------------
+// JA4 TLS client fingerprint (FoxIO JA4, TCP variant "t"), for diagnostics
+// only. Never computed by validate_client_hello(): the runtime calls
+// client_hello_ja4() lazily, only for hellos it records.
+// ---------------------------------------------------------------------------
+
+// The ClientHello fields JA4 needs, as sent (wire order, GREASE included).
+struct ClientHelloFields {
+  std::uint16_t legacy_version{0};                   // ClientHello.legacy_version
+  std::vector<std::uint16_t> supported_versions;     // extension 0x002b
+  std::vector<std::uint16_t> ciphers;
+  std::vector<std::uint16_t> extensions;             // extension types
+  std::vector<std::uint16_t> signature_algorithms;   // extension 0x000d
+  bool has_alpn{false};                              // extension 0x0010 present
+  std::string alpn_first;                            // first protocol, raw bytes
+};
+
+// Parses exactly one TLS handshake record holding one ClientHello (the
+// reassembly for a split hello). nullopt for anything truncated or malformed;
+// never throws on hostile input.
+[[nodiscard]] std::optional<ClientHelloFields> parse_client_hello_fields(
+    std::span<const std::uint8_t> record);
+
+// JA4 string, always 36 characters: "t13d1516h2_8daaf6152771_e5627efa2ab1".
+// GREASE (0x?a?a) is ignored in every list; empty lists hash to 000000000000.
+[[nodiscard]] std::string ja4(const ClientHelloFields& hello);
+
+// parse_client_hello_fields() + ja4(); nullopt for an unparseable record.
+[[nodiscard]] std::optional<std::string> client_hello_ja4(std::span<const std::uint8_t> record);
+
 // A ClientHello handshake message may arrive split over several consecutive
 // TLS handshake records (DPI-circumvention tools such as ByeDPI --tlsrec or
 // zapret); the first may carry a single body byte. The client's HMAC covers

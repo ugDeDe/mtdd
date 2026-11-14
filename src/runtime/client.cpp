@@ -605,12 +605,19 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
             // The same signed random again, outside the window: a stale replay
             // (older than the replay cache), refused like an in-window one.
             if (client.watched) watch_log(client, "auth", "result=replay");
+            record_ja4(client, record, control::Ja4Outcome::replay);
             suspect(client, control::SuspectSignal::junk);
             shared_->replay_rejected_per_worker[worker_index_].fetch_add(
                 1, std::memory_order_relaxed);
             refuse_replay(control::RejectReason::auth_failed);
             return;
         }
+        // JA4 after the HMAC outcome is known, never before: a failed hello
+        // is fingerprinted only within the sampling budget (record_ja4).
+        record_ja4(client, record,
+                   clock_skew              ? control::Ja4Outcome::clock_skew
+                   : hello_last_throttled_ ? control::Ja4Outcome::throttled
+                                           : control::Ja4Outcome::unauthenticated);
         if (clock_skew) {
             // The secret matched, only the client clock is off: a mis-clocked
             // user, not a guess. Counted by skew, never scored as suspect.
@@ -643,6 +650,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     // Shadow ban: a known checker gets what any unauthenticated visitor gets
     // (the real site), so its list marks this proxy dead. No RST, no refusal.
     if (suspect_shadow_ban(client, now)) {
+        record_ja4(client, record, control::Ja4Outcome::unauthenticated);
         if (masking_enabled()) {
             start_fallback(client, original, now, record);
             return;
@@ -662,6 +670,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
     if (outcome == detail::ReplayCache::Outcome::evicted) stats_.replay_cache_evicted();
     if (outcome == detail::ReplayCache::Outcome::duplicate) {
         if (client.watched) watch_log(client, "auth", "result=replay");
+        record_ja4(client, record, control::Ja4Outcome::replay);
         suspect(client, control::SuspectSignal::junk);
         shared_->replay_rejected_per_worker[worker_index_].fetch_add(
             1, std::memory_order_relaxed);
@@ -669,6 +678,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         return;
     }
     note_hello_success(client, *user);
+    record_ja4(client, record, control::Ja4Outcome::authenticated);
 
     if (client.phase != Client::Phase::tls_hello) return;
     if (config_.fingerprint) {
@@ -843,6 +853,7 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
                                        Time now, protocol::ClientHelloInfo& info,
                                        const control::UserRecord*& user,
                                        std::optional<std::int64_t>& clock_skew) {
+    hello_last_throttled_ = false;
     const auto snapshot = users_snapshot_ ? users_snapshot_ : users_.snapshot();
     if (!snapshot) return false;
     if (hello_keys_snapshot_ != snapshot) rebuild_hello_keys(snapshot);
@@ -857,6 +868,7 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
         bool throttled;
         bool selected;
     } selection{client, hello_throttled(client, now), false};
+    hello_last_throttled_ = selection.throttled;
     const auto allowed = [this](std::uint32_t index) {
         return hello_key_domain_[index].empty() || hello_key_domain_[index] == hello_sni_;
     };

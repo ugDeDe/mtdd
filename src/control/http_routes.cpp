@@ -97,7 +97,8 @@ RouteInfo classify_route(evhttp_request* request) {
       {"/v1/stats/users", ApiRoute::stats_users},
       {"/v1/events", ApiRoute::events},
       {"/v1/suspects", ApiRoute::suspects},
-      {"/v1/ad-tag", ApiRoute::ad_tag}};
+      {"/v1/ad-tag", ApiRoute::ad_tag},
+      {"/v1/ja4", ApiRoute::ja4}};
   for (const auto& [fixed, route] : kFixed) {
     if (path == fixed) {
       info.route = route;
@@ -149,6 +150,7 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
     case ApiRoute::stats_users:
     case ApiRoute::events:
     case ApiRoute::suspects:
+    case ApiRoute::ja4:
       return method == ApiMethod::get;
     case ApiRoute::users:
       return method == ApiMethod::get || method == ApiMethod::post;

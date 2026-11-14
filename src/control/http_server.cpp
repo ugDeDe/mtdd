@@ -290,6 +290,7 @@ struct ControlServer::Impl {
       case ApiRoute::user_links: handle_links(request, route.name, status); break;
       case ApiRoute::user_devices: handle_devices(request, route.name, status); break;
       case ApiRoute::suspects: handle_suspects(request, status); break;
+      case ApiRoute::ja4: handle_ja4(request, status); break;
       case ApiRoute::ad_tag: handle_ad_tag(request, method, status); break;
       case ApiRoute::rotate_secret:
         handle_rotate(request, route.name, status);
@@ -782,6 +783,7 @@ struct ControlServer::Impl {
            {"visits", row.visits},
            {"user", row.user.empty() ? json(nullptr) : json(row.user)},
            {"sni", row.sni.empty() ? json(nullptr) : json(row.sni)},
+           {"ja4", row.ja4.empty() ? json(nullptr) : json(row.ja4)},
            {"platform", row.platform},
            {"tls", row.tls},
            {"syn", {{"ttl", row.ttl}, {"window", row.window}, {"mss", row.mss},
@@ -805,6 +807,37 @@ struct ControlServer::Impl {
                              {"watched", watched},
                              {"shadow_banned", banned},
                              {"suspects", std::move(array)}}}});
+  }
+
+  // GET /v1/ja4: the bounded JA4 fingerprint table, most frequent first.
+  void handle_ja4(evhttp_request* request, int& status) {
+    Query query;
+    if (reply_query_error(request, parse_query(request, {"limit"}, query), status)) return;
+    uint64_t limit = Ja4Table::kDefaultCapacity;
+    if (reply_query_error(request, query_uint(query, "limit", 1, 100000, limit), status)) {
+      return;
+    }
+    const auto table = stats.ja4().snapshot();
+    json array = json::array();
+    for (const auto& entry : table.entries) {
+      if (array.size() >= limit) break;
+      json row{{"ja4", entry.ja4},
+               {"total", entry.total},
+               {"first_seen", format_rfc3339(entry.first_seen)},
+               {"last_seen", format_rfc3339(entry.last_seen)}};
+      for (size_t i = 0; i < kJa4Outcomes; ++i) {
+        row[to_string(static_cast<Ja4Outcome>(i))] = entry.counts[i];
+      }
+      array.push_back(std::move(row));
+    }
+    status = 200;
+    send_json(request, status,
+              json{{"data", {{"capacity", table.capacity},
+                             {"total", table.entries.size()},
+                             {"evictions", table.evictions},
+                             {"unsampled", table.unsampled},
+                             {"sample_failed_per_second", Ja4Table::kFailedPerSecond},
+                             {"fingerprints", std::move(array)}}}});
   }
 
   void handle_events(evhttp_request* request, int& status) {
