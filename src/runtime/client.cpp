@@ -780,6 +780,18 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     } else if (!config_.tls_domain.empty()) {
         tls_config.expected_server_name = config_.tls_domain;
     }
+    // The real server of the user's domain sized this flight (measured off
+    // the reactor); unmeasured, the protocol layer draws a fallback length.
+    if (tls_config.expected_server_name && masking_dns_) {
+        if (const auto flight = masking_dns_->server_flight(*tls_config.expected_server_name)) {
+            tls_config.server_hello.app_data_min = flight->min - detail::kServerFlightJitter;
+            tls_config.server_hello.app_data_max = flight->max + detail::kServerFlightJitter;
+        }
+    }
+    if (!x25519_pool_.empty()) {
+        tls_config.server_hello.x25519_public = x25519_pool_.back();
+        x25519_pool_.pop_back();
+    }
     client.tls.emplace(std::move(tls_config));
 
     wire_buffer_.clear();

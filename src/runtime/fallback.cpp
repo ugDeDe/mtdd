@@ -88,6 +88,19 @@ std::string dns_key(std::string_view name) {
     if (!key.empty() && key.back() == '.') key.pop_back();
     return key;
 }
+
+// Uniform in [0, span): spreads probes so restarts and refreshes do not form
+// a fixed schedule towards the real server.
+std::chrono::milliseconds random_below(std::chrono::milliseconds span) {
+    if (span.count() <= 0) return {};
+    std::array<std::uint8_t, 4> draw{};
+    protocol::system_random()(draw);
+    const std::uint32_t value = (static_cast<std::uint32_t>(draw[0]) << 24) |
+                                (static_cast<std::uint32_t>(draw[1]) << 16) |
+                                (static_cast<std::uint32_t>(draw[2]) << 8) | draw[3];
+    return std::chrono::milliseconds(static_cast<std::int64_t>(
+        value % static_cast<std::uint64_t>(span.count())));
+}
 }  // namespace
 
 MaskingResolver::MaskingResolver(const Config& config, control::UserStore& users)
@@ -97,6 +110,8 @@ MaskingResolver::MaskingResolver(const Config& config, control::UserStore& users
       fallback_port_(config.fallback_port),
       masking_(config.masking) {
     const auto hooks = masking_hooks();
+    if (hooks && hooks->port != 0) probe_port_ = hooks->port;
+    if (hooks) probe_delay_ = hooks->probe_delay;
     if (hooks && hooks->resolve) {
         resolve_ = hooks->resolve;
         refresh_ = hooks->refresh;
@@ -123,6 +138,7 @@ void MaskingResolver::stop() noexcept {
         const std::lock_guard lock{mutex_};
         stop_ = true;
     }
+    cancel_.store(true);
     wake_.notify_all();
     // Bounded by the one lookup the thread may be inside.
     if (thread_.joinable()) {
@@ -150,30 +166,95 @@ std::string MaskingResolver::address(std::string_view host) {
     return {};
 }
 
-std::optional<std::vector<std::string>> MaskingResolver::configured_names() {
+std::optional<MaskingResolver::ServerFlight> MaskingResolver::server_flight(
+    std::string_view domain) {
+    const auto key = dns_key(domain);
+    const std::lock_guard lock{mutex_};
+    const auto found = probes_.find(key);
+    if (found == probes_.end()) return std::nullopt;
+    return found->second.flight;
+}
+
+std::optional<MaskingResolver::ServerFlight> MaskingResolver::probe_flight(
+    const std::string& address, std::uint16_t port, const std::string& name) {
+    ServerFlight flight{protocol::kServerFlightMax, 0};
+    for (std::size_t i = 0; i < kServerFlightSamples; ++i) {
+        const auto sample = measure_server_flight(address, port, name, kServerFlightProbeTimeout,
+                                                  [this] { return cancel_.load(); });
+        if (!sample) return std::nullopt;
+        flight.min = std::min(flight.min, *sample);
+        flight.max = std::max(flight.max, *sample);
+    }
+    return flight;
+}
+
+void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::string& name) {
+    // The address the masking relay dials for this name: the test override,
+    // else the cached DNS answer. Never resolved here.
+    std::string address;
+    std::uint16_t port = probe_port_;
+    if (const auto override_target = masking_override()) {
+        address = override_target->host;
+        port = override_target->port;
+    } else if (const auto entry = entries_.find(name); entry != entries_.end()) {
+        address = entry->second.address;
+    }
+    if (address.empty()) {
+        // Unresolved yet: the DNS entry goes first; look again shortly.
+        probes_.at(name).next_attempt = Clock::now() + kMaskingResolvePoll;
+        return;
+    }
+    lock.unlock();
+    std::optional<ServerFlight> flight;
+    try {
+        flight = probe_flight(address, port, name);
+    } catch (...) {
+    }
+    lock.lock();
+    const auto found = probes_.find(name);
+    if (found == probes_.end()) return;  // evicted meanwhile
+    auto& probe = found->second;
+    const auto now = Clock::now();
+    if (flight) {
+        probe.flight = flight;
+        probe.backoff = {};
+        probe.next_attempt = now + kServerFlightRefresh + random_below(kServerFlightProbeJitter);
+    } else {
+        // The last good measurement (if any) stays in use meanwhile.
+        probe.backoff = probe.backoff.count() == 0
+                            ? std::chrono::milliseconds(kServerFlightRetryMin)
+                            : std::min<std::chrono::milliseconds>(probe.backoff * 2,
+                                                                  kServerFlightRetryMax);
+        probe.next_attempt = now + probe.backoff;
+    }
+}
+
+std::optional<MaskingResolver::Names> MaskingResolver::configured_names() {
     const bool overridden = masking_override().has_value();
     std::shared_ptr<const control::UserSnapshot> snapshot;
-    if (fallback_port_ == 0 && masking_ && !overridden) snapshot = users_.snapshot();
+    if (fallback_port_ == 0 && masking_) snapshot = users_.snapshot();
     if (names_valid_ && snapshot == names_snapshot_ && overridden == names_overridden_) {
         return std::nullopt;
     }
-    std::vector<std::string> names;
-    const auto add = [&names](std::string_view name) {
+    Names names;
+    const auto add = [](std::vector<std::string>& list, std::string_view name) {
         if (name.empty() || io::is_numeric_address(name)) return;
         auto key = dns_key(name);
-        if (std::find(names.begin(), names.end(), key) == names.end()) {
-            names.push_back(std::move(key));
+        if (std::find(list.begin(), list.end(), key) == list.end()) {
+            list.push_back(std::move(key));
         }
     };
     if (fallback_port_ != 0) {
-        add(fallback_host_);
-    } else if (masking_ && !tls_domain_.empty() && !overridden) {
+        add(names.resolve, fallback_host_);
+    } else if (masking_ && !tls_domain_.empty()) {
+        // Every automatically masked domain is also probed for its flight.
+        add(names.probe, tls_domain_);
+        if (snapshot) {
+            for (const auto& user : snapshot->users) add(names.probe, user.policy.tls_domain);
+        }
         // The test endpoint override replaces every automatic target, so
         // nothing needs resolving while it is installed.
-        add(tls_domain_);
-        if (snapshot) {
-            for (const auto& user : snapshot->users) add(user.policy.tls_domain);
-        }
+        if (!overridden) names.resolve = names.probe;
     }
     names_snapshot_ = std::move(snapshot);
     names_overridden_ = overridden;
@@ -186,7 +267,7 @@ void MaskingResolver::run() {
     while (!stop_) {
         kicked_ = false;
         lock.unlock();
-        std::optional<std::vector<std::string>> names;
+        std::optional<Names> names;
         try {
             names = configured_names();
         } catch (...) {
@@ -197,10 +278,23 @@ void MaskingResolver::run() {
         auto now = Clock::now();
         if (names) {
             // Evict names no longer configured; new names are due at once.
-            std::erase_if(entries_, [&names](const auto& item) {
-                return std::find(names->begin(), names->end(), item.first) == names->end();
+            const auto& resolve = names->resolve;
+            std::erase_if(entries_, [&resolve](const auto& item) {
+                return std::find(resolve.begin(), resolve.end(), item.first) == resolve.end();
             });
-            for (const auto& name : *names) entries_.try_emplace(name, Entry{{}, now, {}});
+            for (const auto& name : resolve) entries_.try_emplace(name, Entry{{}, now, {}});
+            // New domains are probed after the startup delay, not at once.
+            const auto& probe = names->probe;
+            std::erase_if(probes_, [&probe](const auto& item) {
+                return std::find(probe.begin(), probe.end(), item.first) == probe.end();
+            });
+            for (const auto& name : probe) {
+                if (probes_.contains(name)) continue;
+                const auto delay = probe_delay_ ? *probe_delay_
+                                                : kServerFlightProbeDelayMin +
+                                                      random_below(kServerFlightProbeJitter);
+                probes_.emplace(name, Probe{now + delay, {}, {}});
+            }
         }
         std::string due;
         Clock::time_point next = now + kMaskingResolvePoll;
@@ -212,6 +306,19 @@ void MaskingResolver::run() {
             next = std::min(next, entry.next_attempt);
         }
         if (due.empty()) {
+            // DNS first; then at most one due server-flight probe.
+            std::string probe_due;
+            for (const auto& [name, probe] : probes_) {
+                if (probe.next_attempt <= now) {
+                    probe_due = name;
+                    break;
+                }
+                next = std::min(next, probe.next_attempt);
+            }
+            if (!probe_due.empty()) {
+                run_probe(lock, probe_due);
+                continue;
+            }
             wake_.wait_until(lock, next, [this] { return stop_ || kicked_; });
             continue;
         }

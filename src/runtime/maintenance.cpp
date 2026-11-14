@@ -91,6 +91,21 @@ void Runtime::Impl::housekeeping(Time now) {
     }
     shared_->replay.evict(now);
     refresh_ip_history();
+    // ServerHello key shares are generated here, a few per tick, instead of
+    // inside the handshake that needs one.
+    try {
+        x25519_pool_.reserve(detail::kX25519PoolSize);
+        for (std::size_t i = 0;
+             i < detail::kX25519PoolRefill && x25519_pool_.size() < detail::kX25519PoolSize; ++i) {
+            std::array<std::uint8_t, 32> private_key{};
+            random_(private_key);
+            const auto public_key = protocol::crypto::x25519_public_key(private_key);
+            protocol::crypto::secure_zero(private_key);
+            x25519_pool_.push_back(public_key);
+        }
+    } catch (...) {
+        // Allocation or OpenSSL failure: handshakes derive their own key.
+    }
     if (worker_index_ == 0 && config_.suspects && now >= next_suspect_prune_) {
         next_suspect_prune_ = now + std::chrono::seconds(60);
         try {

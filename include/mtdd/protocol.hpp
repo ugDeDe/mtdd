@@ -131,6 +131,9 @@ std::uint32_t crc32c(std::span<const std::uint8_t> data);
 // should call crc32c().
 std::uint32_t crc32c_portable(std::span<const std::uint8_t> data);
 bool constant_time_equal(std::span<const std::uint8_t> a, std::span<const std::uint8_t> b);
+// RFC 7748 X25519 public key of `private_key` (OpenSSL clamps the scalar).
+// Costs one scalar multiplication (~25 us); hot paths use pre-generated keys.
+std::array<std::uint8_t, 32> x25519_public_key(std::span<const std::uint8_t, 32> private_key);
 void secure_zero(std::span<std::uint8_t> data);
 void secure_zero(void* data, std::size_t size);
 
@@ -379,9 +382,33 @@ class Socks5Client {
   std::string error_;
 };
 
-// Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
-// x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
-std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random);
+// The ApplicationData record after ServerHello + CCS stands in for the real
+// server's encrypted EncryptedExtensions..Finished flight. The client accepts
+// exactly one such record (tdlib TlsInit::wait_hello_response), so its body is
+// at most one TLSCiphertext (2^14 + 256). Without a measurement of the real
+// server, the body length is drawn from the reference MTProxy fallback range.
+inline constexpr std::size_t kServerFlightMin = 256;
+inline constexpr std::size_t kServerFlightMax = kFakeTlsMaxRecordBody;
+inline constexpr std::size_t kServerFlightFallbackMin = 2500;
+inline constexpr std::size_t kServerFlightFallbackMax = 3619;
+
+struct ServerHelloOptions {
+  // Inclusive range of the ApplicationData body length, drawn uniformly per
+  // hello (min == max: exactly that length). 0/0 means unmeasured: the
+  // fallback range. Clamped into [kServerFlightMin, kServerFlightMax].
+  std::size_t app_data_min{0};
+  std::size_t app_data_max{0};
+  // A pre-generated X25519 public key. When absent, a private key is drawn
+  // from the random source and its public key derived in place.
+  std::optional<std::array<std::uint8_t, 32>> x25519_public;
+};
+
+// Builds ServerHello + CCS + fake encrypted flight. Uses the classical
+// x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set. The
+// X25519 share (the whole classical share, the last 32 bytes of the PQ one) is
+// always a real X25519 public key; the ML-KEM ciphertext part is random.
+std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random,
+                                             const ServerHelloOptions& options = {});
 
 // ---------------------------------------------------------------------------
 // MTProto obfuscation (obfuscated2)
@@ -439,6 +466,7 @@ class FakeTlsConnection {
     std::size_t max_client_hello{kFakeTlsMaxClientHello};
     std::size_t max_record_body{kFakeTlsMaxRecordBody};
     std::size_t max_pending_plaintext{1u << 20};
+    ServerHelloOptions server_hello;
   };
 
   enum class State { ClientHello, Obfuscation, Ready, Closed, Failed };

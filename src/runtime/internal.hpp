@@ -69,6 +69,32 @@ inline constexpr std::chrono::seconds kFallbackResolveTtl{300};
 inline constexpr std::chrono::seconds kMaskingResolveRetryMin{5};
 inline constexpr std::chrono::seconds kMaskingResolveRetryMax{60};
 inline constexpr std::chrono::seconds kMaskingResolvePoll{1};
+// Server-flight probes of every masked tls_domain (see measure_server_flight),
+// run by the same background thread. The first probe of a domain waits
+// kServerFlightProbeDelayMin plus up to kServerFlightProbeJitter; success is
+// refreshed after kServerFlightRefresh plus up to kServerFlightProbeJitter;
+// failure retries after kServerFlightRetryMin, doubling up to
+// kServerFlightRetryMax, while the last good measurement stays in use. Each
+// probe is kServerFlightSamples sequential handshakes, each bounded by
+// kServerFlightProbeTimeout.
+inline constexpr std::chrono::seconds kServerFlightProbeDelayMin{30};
+inline constexpr std::chrono::seconds kServerFlightProbeJitter{60};
+inline constexpr std::chrono::hours kServerFlightRefresh{6};
+inline constexpr std::chrono::seconds kServerFlightRetryMin{60};
+inline constexpr std::chrono::hours kServerFlightRetryMax{1};
+inline constexpr std::size_t kServerFlightSamples = 5;
+inline constexpr std::chrono::seconds kServerFlightProbeTimeout{5};
+// Each FakeTLS hello widens the measured range by this many bytes either way
+// (uniform per hello): a stable server otherwise yields one exact length per
+// domain, and real flights already vary by a byte or two (ECDSA signature
+// DER encoding; MTProxy jitters its measurement by -1..+1 likewise).
+inline constexpr std::size_t kServerFlightJitter = 2;
+// Per-reactor pool of pre-generated X25519 ServerHello key shares. One key
+// costs one X25519 scalar multiplication (~25 us); housekeeping tops the pool
+// up by at most kX25519PoolRefill keys per tick, so a handshake burst is
+// served from the pool and an empty pool falls back to generating inline.
+inline constexpr std::size_t kX25519PoolSize = 32;
+inline constexpr std::size_t kX25519PoolRefill = 8;
 inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
 // A client's coalesced ME answers are handed to its queue once they reach this
 // size even before the ME read ends, bounding the per-read staging copy.
@@ -238,16 +264,36 @@ struct MaskingResolveHooks {
     std::function<std::optional<std::string>(const std::string&)> resolve;
     std::chrono::milliseconds refresh{kFallbackResolveTtl};
     std::uint16_t port{0};
+    // Replaces the startup delay before the first server-flight probe of each
+    // domain (kServerFlightProbeDelayMin plus jitter).
+    std::optional<std::chrono::milliseconds> probe_delay;
 };
 void set_masking_resolve_hooks_for_test(std::optional<MaskingResolveHooks> hooks);
+
+// One bounded TLS handshake (OpenSSL defaults plus the browser ALPN list,
+// SNI `server_name`) with address:port that measures the server's encrypted
+// first flight: the ApplicationData records it sends between ServerHello and
+// its Finished, expressed as the body length of the one record that would
+// carry the same bytes (sum of the bodies plus the headers of all records but
+// one), capped at kServerFlightMax. nullopt on any failure, a non-TLS-1.3
+// answer, a flight below kServerFlightMin, after `timeout`, or as soon as
+// `cancelled` returns true. Sends close_notify and nothing else after the
+// handshake. Blocking: resolver thread (and tests) only, never a reactor.
+std::optional<std::size_t> measure_server_flight(const std::string& address, std::uint16_t port,
+                                                 const std::string& server_name,
+                                                 std::chrono::milliseconds timeout,
+                                                 const std::function<bool()>& cancelled = {});
 
 // Masking-target DNS: one helper thread per runtime, shared by all reactors.
 // It keeps the configured names (fallback_host when it is a hostname,
 // otherwise tls_domain and every personal tls_domain of the current user
 // snapshot) resolved in a keyed cache and refreshes them in the background.
 // Reactors only call address(), a short locked map lookup; the lock is never
-// held across a lookup. Owned by Runtime::RuntimeState, which starts it before
-// the reactors run and stops it when they finish.
+// held across a lookup. The same thread probes the real server of every
+// automatically masked domain (tls_domain and personal ones, at its cached
+// address or the test endpoint override) for server_flight(). Owned by
+// Runtime::RuntimeState, which starts it before the reactors run and stops it
+// when they finish.
 class MaskingResolver {
 public:
     MaskingResolver(const Config& config, control::UserStore& users);
@@ -257,11 +303,21 @@ public:
 
     // No thread when no configured target is a hostname.
     void start();
-    // Waits for at most the one lookup in flight. Idempotent.
+    // Waits for at most the one lookup in flight (a probe in flight is
+    // cancelled within a poll slice). Idempotent.
     void stop() noexcept;
     // Cached address of `host`, or empty (then the thread is woken to pick up
     // a newly configured name). Never blocks on DNS.
     std::string address(std::string_view host);
+
+    // Inclusive range of the real server's encrypted first-flight size over
+    // the samples of the last successful probe of `domain`, or nullopt while
+    // unmeasured. A short locked lookup; never blocks on I/O.
+    struct ServerFlight {
+        std::size_t min{0};
+        std::size_t max{0};
+    };
+    std::optional<ServerFlight> server_flight(std::string_view domain);
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -270,10 +326,25 @@ private:
         Clock::time_point next_attempt;
         std::chrono::milliseconds backoff;
     };
+    struct Probe {
+        Clock::time_point next_attempt;
+        std::chrono::milliseconds backoff;
+        std::optional<ServerFlight> flight;  // last good measurement
+    };
+    struct Names {
+        std::vector<std::string> resolve;
+        std::vector<std::string> probe;
+    };
     bool needed() const;
     void run();
     // Thread only: the configured names, or nullopt when unchanged.
-    std::optional<std::vector<std::string>> configured_names();
+    std::optional<Names> configured_names();
+    // Thread only: kServerFlightSamples handshakes; nullopt if any fails.
+    std::optional<ServerFlight> probe_flight(const std::string& address, std::uint16_t port,
+                                             const std::string& name);
+    // Thread only, `lock` held on entry and on return (released while the
+    // due probe of `name` runs); reschedules it.
+    void run_probe(std::unique_lock<std::mutex>& lock, const std::string& name);
 
     control::UserStore& users_;
     const std::string tls_domain_;
@@ -283,6 +354,8 @@ private:
     std::function<std::optional<std::string>(const std::string&)> resolve_;
     std::chrono::milliseconds refresh_{kFallbackResolveTtl};
     std::chrono::milliseconds retry_min_{kMaskingResolveRetryMin};
+    std::optional<std::chrono::milliseconds> probe_delay_;
+    std::uint16_t probe_port_{443};
     // configured_names() state (thread only).
     std::shared_ptr<const control::UserSnapshot> names_snapshot_;
     bool names_overridden_{false};
@@ -291,8 +364,10 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_;
     std::unordered_map<std::string, Entry> entries_;  // guarded by mutex_
+    std::unordered_map<std::string, Probe> probes_;   // guarded by mutex_
     bool kicked_{false};                              // guarded by mutex_
     bool stop_{false};                                // guarded by mutex_
+    std::atomic<bool> cancel_{false};                 // stop_ for a probe in flight
     std::thread thread_;
 };
 
@@ -1542,6 +1617,9 @@ struct Runtime::Impl {
     bool reuse_port_{false};
     bool signal_owner_{true};
     protocol::RandomFn random_;
+    // Pre-generated ServerHello X25519 public keys (kX25519PoolSize), topped
+    // up by housekeeping; each is used for exactly one handshake.
+    std::vector<std::array<std::uint8_t, 32>> x25519_pool_;
 
     io::UniqueFd epoll_;
     io::UniqueFd wake_;

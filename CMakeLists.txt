@@ -62,7 +62,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.cpp")
   file(GLOB runtime_sources CONFIGURE_DEPENDS "src/runtime/*.cpp")
   add_library(mtdd_runtime src/runtime.cpp ${runtime_sources})
   target_include_directories(mtdd_runtime PUBLIC include)
-  target_link_libraries(mtdd_runtime PUBLIC mtdd_config mtdd_protocol mtdd_control mtdd_io)
+  # libssl: the server-flight probe performs real TLS 1.3 handshakes.
+  target_link_libraries(mtdd_runtime PUBLIC mtdd_config mtdd_protocol mtdd_control mtdd_io
+                        OpenSSL::SSL)
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp" AND TARGET mtdd_runtime)

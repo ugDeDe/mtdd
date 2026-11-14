@@ -12,7 +12,6 @@
 namespace mtdd::protocol {
 namespace {
 
-constexpr std::size_t kFakeCertSize = 2878;
 constexpr std::uint16_t kPqGroup = 0x11ec;
 
 std::uint16_t be16(std::span<const std::uint8_t> b, std::size_t off) {
@@ -372,11 +371,46 @@ std::optional<std::string> client_hello_sni(std::span<const std::uint8_t> record
   return std::nullopt;
 }
 
-std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random) {
+namespace {
+
+// Uniform in the configured (or fallback) inclusive range, clamped to one
+// legal record. The modulo bias over 2^32 is below 2^-17 for any range here.
+std::size_t server_flight_length(const ServerHelloOptions& options, const RandomFn& random) {
+  std::size_t lo = options.app_data_min;
+  std::size_t hi = options.app_data_max;
+  if (lo == 0 && hi == 0) {
+    lo = kServerFlightFallbackMin;
+    hi = kServerFlightFallbackMax;
+  }
+  lo = std::clamp(lo, kServerFlightMin, kServerFlightMax);
+  hi = std::clamp(std::max(hi, lo), kServerFlightMin, kServerFlightMax);
+  if (lo == hi) return lo;
+  std::array<std::uint8_t, 4> draw{};
+  random(draw);
+  const std::uint32_t value = (static_cast<std::uint32_t>(draw[0]) << 24) |
+                              (static_cast<std::uint32_t>(draw[1]) << 16) |
+                              (static_cast<std::uint32_t>(draw[2]) << 8) | draw[3];
+  return lo + value % (hi - lo + 1);
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const RandomFn& random,
+                                             const ServerHelloOptions& options) {
   if (!random) throw std::invalid_argument("build_server_hello requires a random source");
+  std::array<std::uint8_t, 32> x25519{};
+  if (options.x25519_public) {
+    x25519 = *options.x25519_public;
+  } else {
+    std::array<std::uint8_t, 32> private_key{};
+    random(private_key);
+    x25519 = crypto::x25519_public_key(private_key);
+    crypto::secure_zero(private_key);
+  }
+  const std::size_t flight = server_flight_length(options, random);
   const bool pq = info.offers_pq;
   const std::size_t sh_record = pq ? 95 + kPqServerKeyShare : 127;
-  const std::size_t out_len = sh_record + 6 + 5 + kFakeCertSize;
+  const std::size_t out_len = sh_record + 6 + 5 + flight;
   Bytes out(out_len, 0);
 
   out[0] = 0x16;
@@ -399,8 +433,7 @@ std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const 
     std::copy_n(supported_versions, 6, out.begin() + 81);
     const std::uint8_t key_share[8] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
     std::copy_n(key_share, 8, out.begin() + 87);
-    std::span<std::uint8_t> key(out.data() + 95, 32);
-    random(key);
+    std::copy(x25519.begin(), x25519.end(), out.begin() + 95);
   } else {
     wr16(out, 79, static_cast<std::uint16_t>(6 + 4 + 4 + kPqServerKeyShare));
     const std::uint8_t supported_versions[6] = {0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
@@ -410,8 +443,10 @@ std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const 
     wr16(out, 89, static_cast<std::uint16_t>(4 + kPqServerKeyShare));
     wr16(out, 91, kPqGroup);
     wr16(out, 93, static_cast<std::uint16_t>(kPqServerKeyShare));
-    std::span<std::uint8_t> key(out.data() + 95, kPqServerKeyShare);
-    random(key);
+    // ML-KEM-768 ciphertext (random), then the X25519 share.
+    std::span<std::uint8_t> ciphertext(out.data() + 95, kPqServerKeyShare - 32);
+    random(ciphertext);
+    std::copy(x25519.begin(), x25519.end(), out.begin() + 95 + kPqServerKeyShare - 32);
   }
 
   const std::size_t ccs = sh_record;
@@ -421,8 +456,8 @@ std::vector<std::uint8_t> build_server_hello(const ClientHelloInfo& info, const 
   out[ad] = 0x17;
   out[ad + 1] = 0x03;
   out[ad + 2] = 0x03;
-  wr16(out, ad + 3, static_cast<std::uint16_t>(kFakeCertSize));
-  std::span<std::uint8_t> cert(out.data() + ad + 5, kFakeCertSize);
+  wr16(out, ad + 3, static_cast<std::uint16_t>(flight));
+  std::span<std::uint8_t> cert(out.data() + ad + 5, flight);
   random(cert);
 
   Bytes hmac_input;
@@ -636,7 +671,7 @@ struct FakeTlsConnection::Impl {
             !ascii_iequals(hello.server_name, *cfg.expected_server_name)) {
           return fail("ClientHello SNI mismatch");
         }
-        auto server_hello = build_server_hello(hello, cfg.random);
+        auto server_hello = build_server_hello(hello, cfg.random, cfg.server_hello);
         append(to_client, server_hello);
         state = State::Obfuscation;
         progress = true;

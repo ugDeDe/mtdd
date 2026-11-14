@@ -446,17 +446,20 @@ TEST(FakeTls, ServerHelloNonPqGolden) {
   ASSERT_EQ(validate_client_hello(rec, kSecret, kNow, 120, info), HelloStatus::Ok);
   CountingRng rng;
   auto sh = build_server_hello(info, rng.fn());
-  ASSERT_EQ(sh.size(), 3016u);
+  // Golden recomputed independently (pure-Python RFC 7748 X25519 + hashlib/
+  // hmac): the key share is X25519(first 32 random bytes), the AppData body
+  // length is 2500 + (next 4 bytes, big-endian) % 1120 = 2935.
+  ASSERT_EQ(sh.size(), 3073u);
   EXPECT_EQ(crypto::sha256(sh),
-            arr<32>(from_hex("36409ca31d0e7cdc7da0f2570151fe82ff29fc56b50eb477497d34c9b3d88c77")));
+            arr<32>(from_hex("6760781f0ed89ed8fb9a1a7283077480b4be78844a6467dab60ab5b69231d69f")));
   auto prefix = from_hex(
-      "160303007a0200007603031dd1e689041d5d338af0012d3b4ba92b0961d54a22f809853eb00d2921124d0620"
+      "160303007a0200007603038d78c33f9f1c589f4aeb793070de77034f89bd8836c01621fee4db7205002a8b20"
       "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f130100002e002b00020304"
-      "00330024001d0020303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f14030300"
-      "01011703030b3e101112131415161718191a1b1c1d1e1f202122232425");
+      "00330024001d002034e42d4af5ef94a07a3a84201b889d4cd1a743cb27b11b6a10438a8feb8e584714030300"
+      "01011703030b772c2d2e2f303132333435363738393a3b");
   EXPECT_TRUE(std::equal(prefix.begin(), prefix.end(), sh.begin()));
   expect_bytes(std::span<const std::uint8_t>(sh).subspan(11, 32),
-               from_hex("1dd1e689041d5d338af0012d3b4ba92b0961d54a22f809853eb00d2921124d06"));
+               from_hex("8d78c33f9f1c589f4aeb793070de77034f89bd8836c01621fee4db7205002a8b"));
 
   // Client-side verification described by the reference: HMAC over
   // digest || response-with-zeroed-server-random.
@@ -475,12 +478,12 @@ TEST(FakeTls, ServerHelloPqStructure) {
   EXPECT_TRUE(info.offers_pq);
   CountingRng rng;
   auto sh = build_server_hello(info, rng.fn());
-  ASSERT_EQ(sh.size(), 4104u);
+  ASSERT_EQ(sh.size(), 4161u);  // AppData body 2935, drawn from CountingRng
   EXPECT_EQ(rd16be(sh, 3), 1210);   // ServerHello record payload
   EXPECT_EQ(rd16be(sh, 91), 0x11ec);
   EXPECT_EQ(rd16be(sh, 93), 1120);  // server share = ML-KEM ciphertext 1088 + X25519 32
   EXPECT_EQ(sh[1215], 0x14);        // CCS
-  EXPECT_EQ(rd16be(sh, 1224), 2878);  // AppData body length
+  EXPECT_EQ(rd16be(sh, 1224), 2935);  // AppData body length
   Bytes zeroed = sh;
   std::fill(zeroed.begin() + 11, zeroed.begin() + 43, 0);
   auto expect = crypto::hmac_sha256(info.secret, cat({Bytes(info.digest.begin(), info.digest.end()), zeroed}));

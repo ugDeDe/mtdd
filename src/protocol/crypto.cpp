@@ -221,6 +221,20 @@ void secure_zero(void* data, std::size_t size) {
   if (size) OPENSSL_cleanse(data, size);
 }
 
+std::array<std::uint8_t, 32> x25519_public_key(std::span<const std::uint8_t, 32> private_key) {
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(
+      EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, private_key.data(),
+                                   private_key.size()),
+      &EVP_PKEY_free);
+  std::array<std::uint8_t, 32> out{};
+  std::size_t length = out.size();
+  if (!key || EVP_PKEY_get_raw_public_key(key.get(), out.data(), &length) != 1 ||
+      length != out.size()) {
+    throw std::runtime_error("openssl: X25519 public key derivation failed");
+  }
+  return out;
+}
+
 namespace {
 
 // Reflected Castagnoli polynomial, as used by CRC-32C.
