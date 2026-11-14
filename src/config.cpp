@@ -5,7 +5,9 @@
 #include <cctype>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <set>
+#include <string>
 #include <stdexcept>
 
 namespace mtdd {
@@ -110,6 +112,127 @@ std::vector<std::string> networks(const nlohmann::json& value, const char* key,
     return result;
 }
 
+bool scope_name(const std::string& scope) {
+    return !scope.empty() && scope.size() <= 32 && std::all_of(scope.begin(), scope.end(), [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '.' || c == '-';
+    });
+}
+
+// "IPv4:port" or "[IPv6]:port", numeric only: an upstream never resolves names.
+bool split_address(const std::string& text, std::string& host, std::uint16_t& port) {
+    std::string port_text;
+    if (!text.empty() && text.front() == '[') {
+        const auto close = text.find("]:");
+        if (close == std::string::npos) return false;
+        host = text.substr(1, close - 1);
+        port_text = text.substr(close + 2);
+        if (host.find(':') == std::string::npos) return false;
+    } else {
+        const auto colon = text.rfind(':');
+        if (colon == std::string::npos) return false;
+        host = text.substr(0, colon);
+        port_text = text.substr(colon + 1);
+        if (host.find(':') != std::string::npos) return false;  // IPv6 needs brackets
+    }
+    if (!numeric_ip(host) || port_text.empty() || port_text.size() > 5 ||
+        !std::all_of(port_text.begin(), port_text.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    const auto value = std::stoul(port_text);
+    if (value == 0 || value > 65535) return false;
+    port = static_cast<std::uint16_t>(value);
+    return true;
+}
+
+std::vector<UpstreamConfig> parse_upstreams(const nlohmann::json& value) {
+    std::vector<UpstreamConfig> result;
+    if (!value.contains("upstreams")) return result;
+    const auto& list = value.at("upstreams");
+    if (!list.is_array() || list.size() > 32)
+        throw std::invalid_argument("upstreams must be an array of at most 32 objects");
+    const std::set<std::string> allowed{"name",     "type",     "interface", "bind_address", "address",
+                                        "username", "password", "weight",    "scopes",       "enabled"};
+    for (const auto& entry : list) {
+        if (!entry.is_object()) throw std::invalid_argument("upstreams entries must be objects");
+        for (const auto& [key, ignored] : entry.items()) {
+            (void)ignored;
+            if (!allowed.contains(key)) throw std::invalid_argument("unknown upstreams option: " + key);
+        }
+        if (!boolean(entry, "enabled", true)) continue;
+        UpstreamConfig upstream;
+        upstream.name = text(entry, "name", "");
+        if (upstream.name.size() > 64) throw std::invalid_argument("upstreams name is too long");
+        const auto type = text(entry, "type", "direct");
+        if (type == "direct") {
+            upstream.type = UpstreamConfig::Type::direct;
+        } else if (type == "socks5") {
+            upstream.type = UpstreamConfig::Type::socks5;
+        } else {
+            throw std::invalid_argument("upstreams type must be direct or socks5");
+        }
+        upstream.interface = text(entry, "interface", "");
+        if (!upstream.interface.empty() &&
+            (upstream.interface.size() > 15 ||
+             !std::all_of(upstream.interface.begin(), upstream.interface.end(), [](char c) {
+                 return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '.' || c == '-' || c == '@';
+             })))
+            throw std::invalid_argument("upstreams interface must be a network interface name");
+        upstream.bind_address = text(entry, "bind_address", "");
+        if (!upstream.bind_address.empty() && !numeric_ip(upstream.bind_address))
+            throw std::invalid_argument("upstreams bind_address must be a numeric IP address");
+        if (upstream.type == UpstreamConfig::Type::socks5) {
+            if (!split_address(text(entry, "address", ""), upstream.host, upstream.port))
+                throw std::invalid_argument("socks5 upstreams need address IP:port or [IPv6]:port");
+            for (const auto& [key, target] : {std::pair{"username", &upstream.username},
+                                              std::pair{"password", &upstream.password}}) {
+                if (!entry.contains(key)) continue;
+                if (!entry.at(key).is_string())
+                    throw std::invalid_argument(std::string("socks5 ") + key + " must be a string");
+                *target = entry.at(key).get<std::string>();
+            }
+            if (upstream.username.size() > 255 || upstream.password.size() > 255 ||
+                upstream.username.empty() != upstream.password.empty())
+                throw std::invalid_argument(
+                    "socks5 username and password are set together, at most 255 bytes each");
+        } else if (entry.contains("address") || entry.contains("username") || entry.contains("password")) {
+            throw std::invalid_argument("address, username and password apply to socks5 upstreams only");
+        }
+        upstream.weight = static_cast<std::uint32_t>(number(entry, "weight", 1, 1, 65535));
+        if (entry.contains("scopes")) {
+            const auto& scopes = entry.at("scopes");
+            std::vector<std::string> names;
+            if (scopes.is_string()) {
+                // telemt spelling: "a,b"
+                std::string all = scopes.get<std::string>();
+                std::size_t start = 0;
+                while (start <= all.size()) {
+                    const auto comma = all.find(',', start);
+                    names.push_back(all.substr(start, comma == std::string::npos ? std::string::npos
+                                                                                   : comma - start));
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                if (all.empty()) names.clear();
+            } else if (scopes.is_array()) {
+                for (const auto& scope : scopes) {
+                    if (!scope.is_string()) throw std::invalid_argument("upstreams scopes must be strings");
+                    names.push_back(scope.get<std::string>());
+                }
+            } else {
+                throw std::invalid_argument("upstreams scopes must be an array or a comma-separated string");
+            }
+            for (const auto& scope : names) {
+                if (!scope_name(scope))
+                    throw std::invalid_argument("upstreams scope names are 1..32 characters [A-Za-z0-9_.-]");
+            }
+            upstream.scopes = std::move(names);
+        }
+        result.push_back(std::move(upstream));
+    }
+    return result;
+}
+
 bool wildcard(const std::string& host) { return host == "0.0.0.0" || host == "::"; }
 
 bool overlaps(const std::string& a_host, std::uint16_t a_port, const std::string& b_host, std::uint16_t b_port) {
@@ -127,7 +250,92 @@ std::filesystem::path resolve(const std::filesystem::path& base, const std::stri
     const std::filesystem::path result{path};
     return (result.is_absolute() ? result : base / result).lexically_normal();
 }
+
+// First unsigned integer in a small sysfs/procfs file; nullopt for "max",
+// missing or malformed content.
+std::optional<std::uint64_t> read_number(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    std::string token;
+    if (!(file >> token) || token.empty() ||
+        !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return std::nullopt;
+    try {
+        return std::stoull(token);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+// Smallest `file` limit on the cgroup at `relative` (below `top`) and on
+// each of its ancestors up to `top`. systemd's MemoryMax= sits on the unit's
+// own cgroup, a container limit on an ancestor.
+std::optional<std::uint64_t> cgroup_limit(const std::filesystem::path& top,
+                                          const std::string& relative,
+                                          const char* file) {
+    const auto stop = top.lexically_normal();
+    std::filesystem::path current = stop;
+    for (const auto& part : std::filesystem::path(relative).lexically_normal()) {
+        const auto name = part.string();
+        if (name == "/" || name.empty() || name == ".") continue;
+        // Inside a cgroup namespace the path can point outside the mounted
+        // hierarchy ("/../x"): only the visible root is then trustworthy.
+        if (name == "..") {
+            current = stop;
+            break;
+        }
+        current /= part;
+    }
+    std::optional<std::uint64_t> result;
+    for (int depth = 0; depth < 64; ++depth) {
+        if (const auto value = read_number(current / file); value && *value != 0)
+            result = result ? std::min(*result, *value) : *value;
+        if (current == stop) break;
+        current = current.parent_path();
+    }
+    return result;
+}
 } // namespace
+
+std::uint64_t detect_memory_limit_bytes(const std::filesystem::path& root) {
+    std::uint64_t total = 0;
+    {
+        std::ifstream meminfo(root / "proc/meminfo");
+        std::string key;
+        std::uint64_t kib = 0;
+        std::string unit;
+        while (meminfo >> key >> kib) {
+            std::getline(meminfo, unit);
+            if (key == "MemTotal:") {
+                total = kib * 1024U;
+                break;
+            }
+        }
+    }
+    if (total == 0) return 0;
+    std::ifstream groups(root / "proc/self/cgroup");
+    std::string line;
+    while (std::getline(groups, line)) {
+        // "hierarchy:controllers:path"; v2 is "0::path".
+        const auto first = line.find(':');
+        const auto second = first == std::string::npos ? first : line.find(':', first + 1);
+        if (second == std::string::npos) continue;
+        const std::string controllers = line.substr(first + 1, second - first - 1);
+        const std::string path = line.substr(second + 1);
+        std::optional<std::uint64_t> limit;
+        if (controllers.empty()) {
+            limit = cgroup_limit(root / "sys/fs/cgroup", path, "memory.max");
+        } else if (("," + controllers + ",").find(",memory,") != std::string::npos) {
+            limit = cgroup_limit(root / "sys/fs/cgroup/memory", path, "memory.limit_in_bytes");
+        }
+        if (limit) total = std::min(total, *limit);
+    }
+    return total;
+}
+
+std::uint64_t default_global_buffer_bytes(std::uint64_t memory_bytes) {
+    if (memory_bytes == 0) return 256ULL << 20;
+    return std::clamp<std::uint64_t>(memory_bytes / 4, 64ULL << 20, kMaxGlobalBufferBytes);
+}
 
 Config Config::parse(const nlohmann::json& value, const std::filesystem::path& base) {
     if (!value.is_object()) throw std::invalid_argument("configuration must be a JSON object");
@@ -142,7 +350,8 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "media_user_rate_kbps", "media_total_rate_kbps", "device_window_seconds", "watch_ips",
         "suspects", "fingerprint", "cpu_affinity", "suspect_watch_score", "suspect_ban_score", "suspect_ttl_hours",
         "api_read_token_env", "control_allow",
-        "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
+        "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes",
+        "proxy_protocol", "proxy_protocol_allow", "upstreams", "masking_scope", "me_nat_ip"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -192,6 +401,10 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         throw std::invalid_argument("token variables must be distinct environment variable names");
     config.control_allow = networks(value, "control_allow", {});
     config.watch_ips = networks(value, "watch_ips", {});
+    config.proxy_protocol = boolean(value, "proxy_protocol", false);
+    config.proxy_protocol_allow = networks(value, "proxy_protocol_allow", config.proxy_protocol_allow);
+    if (config.proxy_protocol && config.proxy_protocol_allow.empty())
+        throw std::invalid_argument("proxy_protocol requires a non-empty proxy_protocol_allow");
     config.suspects = boolean(value, "suspects", false);
     config.fingerprint = boolean(value, "fingerprint", false);
     config.cpu_affinity = boolean(value, "cpu_affinity", true);
@@ -212,14 +425,38 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
             config.metrics_port == config.fallback_port)
             throw std::invalid_argument("metrics listener endpoint overlaps another listener");
     }
+    config.upstreams = parse_upstreams(value);
+    if (!config.upstreams.empty() &&
+        std::none_of(config.upstreams.begin(), config.upstreams.end(),
+                     [](const UpstreamConfig& upstream) { return upstream.scopes.empty(); }))
+        throw std::invalid_argument("upstreams need at least one enabled entry without scopes");
+    config.masking_scope = text(value, "masking_scope", "");
+    if (!config.masking_scope.empty()) {
+        if (!scope_name(config.masking_scope))
+            throw std::invalid_argument("masking_scope must be 1..32 characters [A-Za-z0-9_.-]");
+        if (std::none_of(config.upstreams.begin(), config.upstreams.end(), [&](const UpstreamConfig& upstream) {
+                return std::find(upstream.scopes.begin(), upstream.scopes.end(), config.masking_scope) !=
+                       upstream.scopes.end();
+            }))
+            throw std::invalid_argument("masking_scope names a scope no enabled upstream has");
+    }
+    config.me_nat_ip = text(value, "me_nat_ip", "");
+    if (!config.me_nat_ip.empty() && (!numeric_ip(config.me_nat_ip) || wildcard(config.me_nat_ip)))
+        throw std::invalid_argument("me_nat_ip must be a specific numeric IP address");
     config.tls_domain = text(value, "tls_domain", "");
     if (!valid_domain(config.tls_domain)) throw std::invalid_argument("tls_domain must be a DNS hostname");
-    const auto tag = text(value, "ad_tag", "");
-    if (tag.size() != 32) throw std::invalid_argument("ad_tag is required and must have 32 hexadecimal characters");
-    for (std::size_t i{}; i < config.ad_tag.size(); ++i)
-        config.ad_tag[i] = static_cast<std::uint8_t>((hex_digit(tag[i * 2]) << 4) | hex_digit(tag[i * 2 + 1]));
-    if (std::all_of(config.ad_tag.begin(), config.ad_tag.end(), [](auto byte) { return byte == 0; }))
-        throw std::invalid_argument("ad_tag must not be all zero");
+    // ad_tag is optional: absent (or an all-zero value) means the proxy runs
+    // without a sponsored channel, and RPC_PROXY_REQ omits the tag block. When
+    // present it must be 32 hexadecimal characters and not all zero.
+    config.ad_tag.fill(0);
+    if (value.contains("ad_tag")) {
+        const auto tag = text(value, "ad_tag", "");
+        if (tag.size() != 32) throw std::invalid_argument("ad_tag must have 32 hexadecimal characters");
+        for (std::size_t i{}; i < config.ad_tag.size(); ++i)
+            config.ad_tag[i] = static_cast<std::uint8_t>((hex_digit(tag[i * 2]) << 4) | hex_digit(tag[i * 2 + 1]));
+        if (std::all_of(config.ad_tag.begin(), config.ad_tag.end(), [](auto byte) { return byte == 0; }))
+            throw std::invalid_argument("ad_tag must not be all zero when set");
+    }
     config.users_path = resolve(base, text(value, "users_path", "users.json"));
     if (value.contains("me_config_path")) config.me_config_path = resolve(base, text(value, "me_config_path", ""));
     if (value.contains("me_secret_path")) config.me_secret_path = resolve(base, text(value, "me_secret_path", ""));
@@ -256,8 +493,21 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     }
     config.max_frame_bytes = static_cast<std::size_t>(number(value, "max_frame_bytes", config.max_frame_bytes, 4096, 16 * 1024 * 1024));
     config.connection_queue_bytes = static_cast<std::size_t>(number(value, "connection_queue_bytes", config.connection_queue_bytes, 4096, 16 * 1024 * 1024));
-    config.global_buffer_bytes = static_cast<std::size_t>(number(value, "global_buffer_bytes", config.global_buffer_bytes, config.connection_queue_bytes, 1024ULL * 1024 * 1024));
     const auto minimum_buffer_budget = 2 * config.max_frame_bytes + 2 * config.connection_queue_bytes + 65536;
+    if (value.contains("global_buffer_bytes")) {
+        config.global_buffer_bytes = static_cast<std::size_t>(number(
+            value, "global_buffer_bytes", 0, config.connection_queue_bytes, kMaxGlobalBufferBytes));
+        config.global_buffer_auto = false;
+    } else {
+        // A quarter of the memory this process may use. An explicit worker
+        // count still gets its per-reactor minimum: auto-sizing must never turn
+        // a valid config into a startup failure on a small host.
+        auto derived = default_global_buffer_bytes(detect_memory_limit_bytes());
+        derived = std::max<std::uint64_t>(
+            derived, std::uint64_t{std::max(config.workers, 1U)} * minimum_buffer_budget);
+        config.global_buffer_bytes = static_cast<std::size_t>(derived);
+        config.global_buffer_auto = true;
+    }
     if (config.global_buffer_bytes < minimum_buffer_budget)
         throw std::invalid_argument("global_buffer_bytes must cover two maximum frames, two queues and 64 KiB overhead");
     if (config.workers != 0 &&
@@ -321,6 +571,22 @@ Config Config::load(const std::filesystem::path& path) {
 nlohmann::json Config::public_view() const {
     nlohmann::json dcs = nlohmann::json::array();
     for (const auto dc : direct_fallback_dcs) dcs.push_back(dc);
+    nlohmann::json upstream_views = nlohmann::json::array();
+    for (const auto& upstream : upstreams) {
+        nlohmann::json view{{"name", upstream.name},
+                            {"type", upstream.type == UpstreamConfig::Type::socks5 ? "socks5" : "direct"},
+                            {"interface", upstream.interface},
+                            {"bind_address", upstream.bind_address},
+                            {"weight", upstream.weight},
+                            {"scopes", upstream.scopes}};
+        if (upstream.type == UpstreamConfig::Type::socks5) {
+            view["address"] = upstream.host.find(':') == std::string::npos
+                                  ? upstream.host + ":" + std::to_string(upstream.port)
+                                  : "[" + upstream.host + "]:" + std::to_string(upstream.port);
+            view["auth"] = !upstream.username.empty();  // credentials are never shown
+        }
+        upstream_views.push_back(std::move(view));
+    }
     return {
         {"proxy_host", proxy_host},
         {"proxy_port", proxy_port},
@@ -330,6 +596,8 @@ nlohmann::json Config::public_view() const {
         {"control_port", control_port},
         {"allow_remote_control", allow_remote_control},
         {"control_allow", control_allow},
+        {"proxy_protocol", proxy_protocol},
+        {"proxy_protocol_allow", proxy_protocol_allow},
         {"metrics_host", metrics_host},
         {"metrics_port", metrics_port},
         {"metrics_allow", metrics_allow},
@@ -360,7 +628,10 @@ nlohmann::json Config::public_view() const {
         {"shutdown_timeout_seconds", shutdown_timeout.count()},
         {"metadata_refresh_seconds", metadata_refresh.count()},
         {"direct_fallback_enabled", direct_fallback_enabled},
-        {"direct_fallback_dcs", std::move(dcs)}};
+        {"direct_fallback_dcs", std::move(dcs)},
+        {"upstreams", std::move(upstream_views)},
+        {"masking_scope", masking_scope},
+        {"me_nat_ip", me_nat_ip}};
 }
 
 nlohmann::json Config::security_posture() const {
@@ -376,6 +647,8 @@ nlohmann::json Config::security_posture() const {
                      {"token", metrics_on && !metrics_token_env.empty()},
                      {"allowlist_entries", metrics_allow.size()}}},
         {"masking", masking},
+        {"proxy_protocol", {{"enabled", proxy_protocol},
+                            {"allowlist_entries", proxy_protocol ? proxy_protocol_allow.size() : 0}}},
         {"tls_domain_set", !tls_domain.empty()},
         {"global_connection_cap", max_connections != 0},
         {"handshake_cap", max_handshakes != 0}};

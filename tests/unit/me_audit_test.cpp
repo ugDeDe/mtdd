@@ -1187,3 +1187,139 @@ TEST(MeAudit, ReloadedPoolTunablesReachTheReactorAndClampTargets) {
     reactor.apply_shared_tunables();
     EXPECT_EQ(reactor.config_.me_clients_per_writer, 7U);
 }
+
+namespace {
+
+// A handshaking client on a live socket, registered like accept_clients() does.
+mtdd::Runtime::Impl::Client& add_handshaking_client(AuditReactor& test, mtdd::io::UniqueFd& peer) {
+    using Impl = mtdd::Runtime::Impl;
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) != 0) {
+        throw std::runtime_error("socketpair");
+    }
+    peer.reset(sockets[1]);
+    auto owned = std::make_unique<Impl::Client>();
+    auto& client = *owned;
+    client.fd.reset(sockets[0]);
+    client.token = test.reactor->add_target(Impl::Target{Impl::Kind::client, &client});
+    client.deadline_kind = Impl::Client::DeadlineKind::handshake;
+    test.reactor->clients_.emplace(client.token, std::move(owned));
+    return client;
+}
+
+std::uint64_t rejected(const mtdd::control::StatisticsSnapshot& snapshot, const char* reason) {
+    const auto found = snapshot.rejected_by_reason.find(reason);
+    return found == snapshot.rejected_by_reason.end() ? 0 : found->second;
+}
+
+} // namespace
+
+TEST(MeAudit, HandshakeTimeoutAfterBudgetPauseIsReportedAsBudgetStall) {
+    AuditReactor test("handshake-budget-stall");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    mtdd::io::UniqueFd peer;
+    auto& client = add_handshaking_client(test, peer);
+    // The client is waiting for the proxy, not silent: its reads are paused.
+    test.reactor->budget_used_ = test.config.global_buffer_bytes;
+    test.reactor->read_client(client, now);
+    ASSERT_TRUE(client.budget_paused);
+    EXPECT_TRUE(client.handshake_budget_stalled);
+    test.reactor->on_client_deadline(client, now + test.config.handshake_timeout);
+
+    const auto snapshot = test.stats.snapshot();
+    EXPECT_EQ(rejected(snapshot, "handshake_budget_stall"), 1U);
+    EXPECT_EQ(rejected(snapshot, "handshake_timeout"), 0U);
+    EXPECT_EQ(snapshot.budget_refusals.at("client_read"), 1U);
+    EXPECT_EQ(test.reactor->budget_handshake_stalls_, 1U);
+    test.reactor->budget_used_ = 0;
+}
+
+TEST(MeAudit, SilentHandshakeTimeoutStaysAClientTimeout) {
+    AuditReactor test("handshake-silent");
+    const auto now = mtdd::Runtime::Impl::Clock::now();
+    mtdd::io::UniqueFd peer;
+    auto& client = add_handshaking_client(test, peer);
+    test.reactor->read_client(client, now);  // nothing to read, budget free
+    EXPECT_FALSE(client.handshake_budget_stalled);
+    test.reactor->on_client_deadline(client, now + test.config.handshake_timeout);
+
+    const auto snapshot = test.stats.snapshot();
+    EXPECT_EQ(rejected(snapshot, "handshake_timeout"), 1U);
+    EXPECT_EQ(rejected(snapshot, "handshake_budget_stall"), 0U);
+    EXPECT_EQ(snapshot.budget_refusals.at("client_read"), 0U);
+}
+
+TEST(MeAudit, WaitForMeTimeoutIsReportedAsMeUnavailable) {
+    AuditReactor test("wait-me");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    mtdd::io::UniqueFd peer;
+    auto& client = add_handshaking_client(test, peer);
+    client.phase = Impl::Client::Phase::relay;
+    client.deadline_kind = Impl::Client::DeadlineKind::wait_me;
+    test.reactor->on_client_deadline(client, now + test.config.handshake_timeout);
+    EXPECT_EQ(rejected(test.stats.snapshot(), "me_unavailable"), 1U);
+    EXPECT_EQ(rejected(test.stats.snapshot(), "other"), 0U);
+}
+
+TEST(MeAudit, MeScaleUpBlockedByBudgetIsCountedAndLogged) {
+    AuditReactor test("me-dial-budget");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->config_.me_connections_per_dc = 4;
+    test.reactor->config_.me_clients_per_writer = 10;
+    test.reactor->metadata_snapshot_ = me_metadata(1);
+    auto& pool = test.reactor->me_pool_[2];
+    pool.desired_generation = pool.serving_generation = 1;
+    auto owned = std::make_unique<Impl::MeConn>();
+    owned->dc = 2;
+    owned->generation = 1;
+    owned->state = Impl::MeConn::State::ready;
+    owned->clients = 35;  // demand for four writers
+    owned->out.emplace(test.config.connection_queue_bytes);
+    pool.conns.push_back(std::move(owned));
+
+    test.reactor->budget_used_ = test.reactor->config_.global_buffer_bytes;
+    test.reactor->scale_me_pool(2, now);
+    EXPECT_EQ(pool.conns.size(), 1U) << "no ME socket may be opened past the budget";
+    EXPECT_GE(test.stats.snapshot().budget_refusals.at("me_dial"), 1U);
+
+    testing::internal::CaptureStderr();
+    test.reactor->log_budget_pressure(now);
+    const std::string first = testing::internal::GetCapturedStderr();
+    EXPECT_NE(first.find("relay buffer budget exhausted"), std::string::npos) << first;
+    EXPECT_NE(first.find("me_connections_not_opened="), std::string::npos) << first;
+    EXPECT_NE(first.find("global_buffer_bytes"), std::string::npos) << first;
+
+    // Rate limited: new refusals inside the interval do not print again...
+    test.reactor->scale_me_pool(2, now + std::chrono::seconds(1));
+    testing::internal::CaptureStderr();
+    test.reactor->log_budget_pressure(now + std::chrono::seconds(1));
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    // ...but are reported once the interval has passed.
+    testing::internal::CaptureStderr();
+    test.reactor->log_budget_pressure(now + mtdd::detail::kBudgetLogInterval);
+    EXPECT_FALSE(testing::internal::GetCapturedStderr().empty());
+    // Nothing new: silence.
+    testing::internal::CaptureStderr();
+    test.reactor->log_budget_pressure(now + 3 * mtdd::detail::kBudgetLogInterval);
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    test.reactor->budget_used_ = 0;
+}
+
+TEST(MeAudit, AcceptBudgetPauseCountsTransitionsNotReevaluations) {
+    AuditReactor test("accept-budget");
+    auto refusals = [&] { return test.stats.snapshot().budget_refusals.at("accept"); };
+    ASSERT_TRUE(test.reactor->listener_.valid());
+    test.reactor->budget_used_ = test.config.global_buffer_bytes;
+    test.reactor->update_listener_interest();
+    test.reactor->update_listener_interest();
+    EXPECT_EQ(refusals(), 1U);
+    test.reactor->budget_used_ = 0;
+    test.reactor->update_listener_interest();
+    test.reactor->budget_used_ = test.config.global_buffer_bytes;
+    test.reactor->update_listener_interest();
+    EXPECT_EQ(refusals(), 2U);
+    test.reactor->budget_used_ = 0;
+}

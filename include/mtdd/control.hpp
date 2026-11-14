@@ -149,11 +149,16 @@ struct UserPolicy {
   // equals it authenticates this user. Masking relays probes for any
   // configured domain (global or personal) to that domain's real site.
   std::string tls_domain;
+  // Personal ad tag (32 lowercase hex characters, not all zero; empty = the
+  // global ad_tag). Sent to Telegram in place of the global tag for this
+  // user's ME requests, so the sponsored channel shown to the user is the
+  // one registered for this tag. The Direct DC route carries no ad tag.
+  std::string ad_tag;
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           note.empty() && !canary && tls_domain.empty();
+           note.empty() && !canary && tls_domain.empty() && ad_tag.empty();
   }
   bool operator==(const UserPolicy&) const = default;
 };
@@ -172,11 +177,12 @@ struct UserPolicyPatch {
   std::optional<std::string> note;  // "" clears
   std::optional<bool> canary;
   std::optional<std::string> tls_domain;  // "" clears (back to the global domain)
+  std::optional<std::string> ad_tag;      // "" clears (back to the global ad tag)
 
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
-           !note && !canary && !tls_domain;
+           !note && !canary && !tls_domain && !ad_tag;
   }
 };
 
@@ -316,9 +322,32 @@ enum class RejectReason {
   user_expired,
   user_quota_exceeded,
   user_ip_limit,
+  // The reactor's relay-buffer budget could not admit a new client.
+  buffer_budget,
+  // Handshake deadline expired while the client's reads were paused by the
+  // buffer budget: the proxy, not the client, stalled the handshake.
+  handshake_budget_stall,
+  // Authenticated, but no ready ME connection to the target DC in time.
+  me_unavailable,
 };
 
+// Points where the relay-buffer budget (`global_buffer_bytes`) refused work.
+// Each counts one refusal event, not one byte; the kinds tell which path stalled.
+enum class BudgetRefusal : uint8_t {
+  client_read,  // a client read was paused (also counted as c2s backpressure)
+  accept,       // the listener stopped accepting new connections
+  me_dial,      // a new ME connection to Telegram was not opened
+};
+inline constexpr std::size_t kBudgetRefusalKinds = 3;
+
 enum class HandshakeResult { success, failure, timeout, replay };
+
+// ClientHellos whose HMAC matched a user's secret but whose timestamp was
+// outside the accepted window. Fixed labels: the client clock relative to the
+// server ("behind", "ahead") x |skew| ("le_300s", "le_600s", "le_1200s",
+// "gt_1200s"). Such a hello is still rejected and also counted as a handshake
+// failure; this only shows how far off the clocks were.
+inline constexpr std::size_t kClockSkewBuckets = 4;
 // Why an authenticated relay session ended. First recorded reason wins.
 enum class RelayCloseReason : uint8_t {
   other,
@@ -399,6 +428,7 @@ enum class ApiMethod { get, post, patch, delete_, other };
 
 const char* to_string(RejectReason reason) noexcept;
 const char* to_string(HandshakeResult result) noexcept;
+const char* to_string(BudgetRefusal kind) noexcept;
 const char* to_string(Direction direction) noexcept;
 const char* to_string(BufferState state) noexcept;
 const char* to_string(MeResult result) noexcept;
@@ -549,6 +579,9 @@ struct StatisticsSnapshot {
   uint64_t client_reuses_total{0};         // Client objects taken from freelist
   uint64_t backpressure_c2s_total{0};
   uint64_t backpressure_s2c_total{0};
+  std::map<std::string, uint64_t> budget_refusals;  // by BudgetRefusal label
+  // [client_clock][skew bucket], every label present (see kClockSkewBuckets).
+  std::map<std::string, std::map<std::string, uint64_t>> hello_clock_skew_total;
   std::array<uint64_t, kRelayCloseReasons> relay_closes_total{};
   std::array<uint64_t, kSuspectSignals> suspect_events_total{};
   uint64_t suspect_shadow_bans_total{0};
@@ -711,6 +744,9 @@ class Statistics {
   void connection_closed() noexcept;
   void connection_rejected(RejectReason reason) noexcept;
   void handshake(HandshakeResult result) noexcept;
+  // A valid-secret ClientHello outside the timestamp window. `skew_seconds` is
+  // server clock - client timestamp: positive when the client clock is behind.
+  void hello_clock_skew(int64_t skew_seconds) noexcept;
 
   // Returns nullptr for names outside the store's [A-Za-z0-9_.-]{1,64}
   // contract or once max_tracked_users is reached. Callers keep the shared
@@ -744,6 +780,7 @@ class Statistics {
   void set_client_pool(std::size_t worker, uint64_t pooled, uint64_t allocations,
                        uint64_t reuses) noexcept;
   void add_backpressure(Direction direction) noexcept;
+  void budget_refusal(BudgetRefusal kind) noexcept;
   void relay_closed(RelayCloseReason reason) noexcept;
   // Media shaping held a client (one count per throttle episode).
   void media_throttled() noexcept;

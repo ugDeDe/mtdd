@@ -129,6 +129,50 @@ TEST(HttpStatusTest, StatusReportsActualRuntimeStatistics) {
   EXPECT_EQ(user_data["stats"]["payload_bytes_s2c"], 22);
 }
 
+TEST(HttpStatusTest, StatusExposesBufferBudgetAndRefusals) {
+  Harness h;
+  h.stats().configure_workers(2);
+  h.stats().set_buffer_budget_used(0, 30U << 20);
+  h.stats().set_buffer_budget_used(1, 10U << 20);
+  h.stats().set_worker_diagnostics(0, 30U << 20, 32U << 20, 100, 3);
+  h.stats().set_worker_diagnostics(1, 10U << 20, 32U << 20, 50, 1);
+  h.stats().budget_refusal(BudgetRefusal::client_read);
+  h.stats().budget_refusal(BudgetRefusal::client_read);
+  h.stats().budget_refusal(BudgetRefusal::me_dial);
+  h.stats().connection_rejected(RejectReason::handshake_budget_stall);
+
+  auto response = h.req("GET", "/v1/status");
+  ASSERT_EQ(response.status, 200);
+  auto data = parse_json(response)["data"];
+  const auto& budget = data["buffer_budget"];
+  EXPECT_EQ(budget["used_bytes"], 40U << 20);
+  EXPECT_EQ(budget["limit_bytes"], 64U << 20);
+  // 30 of 32 MiB: the fullest reactor, not the 62% aggregate.
+  EXPECT_EQ(budget["fullest_worker_percent"], 93);
+  EXPECT_EQ(budget["refusals_total"]["client_read"], 2);
+  EXPECT_EQ(budget["refusals_total"]["me_dial"], 1);
+  EXPECT_EQ(budget["refusals_total"]["accept"], 0);
+  EXPECT_EQ(data["connections_rejected_by_reason"]["handshake_budget_stall"], 1);
+
+  auto summary = h.req("GET", "/v1/stats/summary");
+  ASSERT_EQ(summary.status, 200);
+  auto summary_data = parse_json(summary)["data"];
+  EXPECT_EQ(summary_data["buffer_budget"]["refusals_total"]["client_read"], 2);
+  EXPECT_EQ(summary_data["connections"]["rejected_by_reason"]["handshake_budget_stall"], 1);
+
+  auto metrics = h.req("GET", "/metrics");
+  ASSERT_EQ(metrics.status, 200);
+  EXPECT_NE(metrics.body.find(
+                "mtdd_buffer_budget_refusals_total{kind=\"client_read\"} 2"),
+            std::string::npos);
+  EXPECT_NE(metrics.body.find(
+                "mtdd_buffer_budget_refusals_total{kind=\"accept\"} 0"),
+            std::string::npos);
+  EXPECT_NE(metrics.body.find(
+                "mtdd_connections_rejected_total{reason=\"handshake_budget_stall\"} 1"),
+            std::string::npos);
+}
+
 TEST(HttpHistoryTest, StatusExposesCalendarEstimateContract) {
   Harness h(StoreOptions{}, HttpOptions{}, true);
   ASSERT_TRUE(h.stats().rotate_ip_history(kHistoryTue1030));

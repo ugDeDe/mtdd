@@ -546,10 +546,9 @@ MiddleEndSession::MiddleEndSession(MiddleEndConfig config, std::unique_ptr<Sink>
     throw std::invalid_argument("ME endpoints must use the same address family");
   }
   if (config.max_frame < 64) throw std::invalid_argument("ME max_frame is too small");
-  if (std::all_of(config.ad_tag.bytes.begin(), config.ad_tag.bytes.end(),
-                  [](std::uint8_t b) { return b == 0; })) {
-    throw std::invalid_argument("ME ad tag is required (16 non-zero bytes)");
-  }
+  // An all-zero ad tag means "no ad tag": the proxy runs without a sponsored
+  // channel and RPC_PROXY_REQ omits the TL_PROXY_TAG block entirely (matches
+  // telemt and the reference MTProxy no-tag frame).
   if (!config.clock) config.clock = &system_now;
 
   impl_ = std::make_unique<Impl>();
@@ -682,7 +681,8 @@ Status MiddleEndSession::encode_client_message(std::span<const std::uint8_t> pay
 Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
                                                std::span<const std::uint8_t> payload,
                                                const Endpoint& peer, ProtoTag tag, bool quick_ack,
-                                               std::vector<std::uint8_t>& to_me) {
+                                               std::vector<std::uint8_t>& to_me,
+                                               const AdTag* ad_tag) {
   auto& s = *impl_;
   if (s.state != State::Ready) return Status::ProtocolError;
   if (payload.empty() || payload.size() % 4 != 0) {
@@ -696,7 +696,19 @@ Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
   Bytes alias_copy;
   payload = detach_aliased(payload, to_me, alias_copy);
 
-  std::uint32_t flags = kFlagMagic | kFlagExtMode2 | kFlagHasAdTag;
+  // A non-null, non-zero per-request tag (per-user) overrides the session tag;
+  // otherwise the session tag is used. An all-zero result means "no ad tag":
+  // the TL_PROXY_TAG block and its extra_size field are omitted and the
+  // HAS_AD_TAG flag is cleared.
+  const bool own_tag =
+      ad_tag != nullptr && std::any_of(ad_tag->bytes.begin(), ad_tag->bytes.end(),
+                                       [](std::uint8_t b) { return b != 0; });
+  const AdTag& request_tag = own_tag ? *ad_tag : s.cfg.ad_tag;
+  const bool has_tag = std::any_of(request_tag.bytes.begin(), request_tag.bytes.end(),
+                                   [](std::uint8_t b) { return b != 0; });
+
+  std::uint32_t flags = kFlagMagic | kFlagExtMode2;
+  if (has_tag) flags |= kFlagHasAdTag;
   flags |= (tag == ProtoTag::Secure) ? (kFlagIntermediate | kFlagPad) : kFlagIntermediate;
   if (quick_ack) flags |= kFlagQuickAck;
   if (payload.size() >= 8 &&
@@ -704,7 +716,10 @@ Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
     flags |= kFlagNotEncrypted;
   }
 
-  const std::size_t rpc_len = 84 + payload.size();  // 56-byte header + 28-byte ad-tag block
+  // 56-byte header; with a tag, a 28-byte block (extra_size + TL_PROXY_TAG +
+  // 16-byte tag + padding) follows. Without a tag the whole block, including
+  // its extra_size field, is omitted.
+  const std::size_t rpc_len = (has_tag ? 84 : 56) + payload.size();
   if (rpc_len + 12 > s.cfg.max_frame) {
     return s.local_error("client payload exceeds ME frame limit");
   }
@@ -726,11 +741,13 @@ Status MiddleEndSession::encode_client_message(const ConnId& conn_id,
   append(to_me, peer_wire);
   const auto advertised_wire = s.cfg.advertised.wire20();
   append(to_me, advertised_wire);
-  put32(to_me, 24);  // extra_size: TL_PROXY_TAG block
-  put32(to_me, kTlProxyTag);
-  to_me.push_back(16);  // TL string length
-  to_me.insert(to_me.end(), s.cfg.ad_tag.bytes.begin(), s.cfg.ad_tag.bytes.end());
-  to_me.insert(to_me.end(), {0, 0, 0});  // 4-byte alignment
+  if (has_tag) {
+    put32(to_me, 24);  // extra_size: TL_PROXY_TAG block
+    put32(to_me, kTlProxyTag);
+    to_me.push_back(16);  // TL string length
+    to_me.insert(to_me.end(), request_tag.bytes.begin(), request_tag.bytes.end());
+    to_me.insert(to_me.end(), {0, 0, 0});  // 4-byte alignment
+  }
   append(to_me, payload);
   put32(to_me, rpc_crc(s.crc_mode, std::span<const std::uint8_t>(to_me).subspan(start)));
   while (to_me.size() - start < padded) put32(to_me, 4);
@@ -771,9 +788,8 @@ Status MiddleEndSession::encode_ping(std::int64_t ping_id, std::vector<std::uint
 }
 
 void MiddleEndSession::set_ad_tag(const AdTag& tag) {
-  if (std::all_of(tag.bytes.begin(), tag.bytes.end(), [](std::uint8_t b) { return b == 0; })) {
-    throw std::invalid_argument("ME ad tag is required (16 non-zero bytes)");
-  }
+  // An all-zero tag switches the session to no-tag; later RPC_PROXY_REQ frames
+  // omit the TL_PROXY_TAG block.
   impl_->cfg.ad_tag = tag;
 }
 

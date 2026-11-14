@@ -16,6 +16,8 @@ std::string lower_ascii(std::string value);
 // Lowercase DNS hostname (labels 1..63 of [a-z0-9-], not starting or ending
 // with "-", total <= kMaxTlsDomainBytes). Personal tls_domain values must pass.
 bool valid_tls_domain(std::string_view domain);
+// 32 lowercase hexadecimal characters, not all zero.
+bool valid_ad_tag(std::string_view tag);
 bool is_hex_digit(char c);
 std::string hex_encode(const unsigned char* data, size_t size);
 

@@ -425,7 +425,6 @@ TEST(Runtime, LiveAdTagOverrideReachesOpenMiddleEndSession) {
     std::array<std::uint8_t, 16> pool_tag{};
     for (std::size_t i = 0; i < pool_tag.size(); ++i) pool_tag[i] = static_cast<std::uint8_t>(0xc0 + i);
     ASSERT_NE(pool_tag, daemon.services.config.ad_tag);
-    EXPECT_THROW(daemon.set_ad_tag(std::array<std::uint8_t, 16>{}), std::invalid_argument);
     daemon.set_ad_tag(pool_tag);
     // The reactor picks the override up on its housekeeping tick.
     std::this_thread::sleep_for(1500ms);

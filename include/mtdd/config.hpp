@@ -9,6 +9,30 @@
 #include <vector>
 
 namespace mtdd {
+// One way out of the host for outbound connections (Telegram ME and Direct
+// DCs, masking, metadata downloads), as telemt's [[upstreams]]:
+//   direct  connect from here, optionally through `interface`
+//           (SO_BINDTODEVICE) or from `bind_address`;
+//   socks5  connect through a SOCKS5 proxy at host:port (numeric), with
+//           optional username/password; interface/bind_address then apply
+//           to the connection to the proxy.
+// A connection picks among the upstreams of its scope by weight: Telegram
+// connections and metadata use the upstreams without scopes, masking uses
+// Config::masking_scope.
+struct UpstreamConfig {
+    enum class Type { direct, socks5 };
+    std::string name;
+    Type type{Type::direct};
+    std::string interface;
+    std::string bind_address;
+    std::string host;  // socks5 server address
+    std::uint16_t port{0};
+    std::string username;
+    std::string password;
+    std::uint32_t weight{1};
+    std::vector<std::string> scopes;  // empty: the default scope
+};
+
 struct Config {
     std::string proxy_host{"127.0.0.1"};
     std::uint16_t proxy_port{14443};
@@ -17,6 +41,14 @@ struct Config {
     std::string control_host{"127.0.0.1"};
     std::uint16_t control_port{9090};
     bool allow_remote_control{false};
+    // PROXY protocol (HAProxy v1/v2) on the proxy listener, for a trusted
+    // front (SNI router, load balancer) that forwards client connections.
+    // When on, every connection must start with a PROXY header, sent by a peer
+    // in proxy_protocol_allow; others are closed. The header's source address
+    // then stands for the client everywhere (limits, statistics, suspects,
+    // watch_ips, the address reported to Telegram).
+    bool proxy_protocol{false};
+    std::vector<std::string> proxy_protocol_allow{"127.0.0.0/8", "::1"};
     std::string fallback_host{"127.0.0.1"};
     std::uint16_t fallback_port{0}; // Nonzero pins the masking relay to this target.
     // Probe masking on by default: unrecognised ClientHellos are relayed to the
@@ -36,6 +68,19 @@ struct Config {
     std::vector<std::string> metrics_allow{"127.0.0.0/8", "::1"};
     std::string tls_domain;
     std::array<std::uint8_t, 16> ad_tag{};
+    // Outbound upstreams; empty means one plain direct upstream.
+    std::vector<UpstreamConfig> upstreams;
+    // Scope of the masking connections (telemt's tls_fetch_scope); empty is
+    // the default scope. E.g. "local" with a direct upstream scoped "local"
+    // keeps a local mask site off a tunnel the Telegram traffic takes.
+    std::string masking_scope;
+    // The address Telegram's middle-end sees this host connect from, when it
+    // is not the socket's own: behind NAT or through a tunnel/upstream whose
+    // exit address is fixed (telemt's middle_proxy_nat_ip). It replaces the
+    // local IP in the ME key derivation and in RPC_PROXY_REQ; the port is
+    // kept, so the NAT must preserve source ports. Empty: the socket address
+    // (or, through SOCKS5, the address the proxy reports).
+    std::string me_nat_ip;
     std::filesystem::path users_path;
     std::filesystem::path unique_ip_stats_path; // optional private HLL checkpoints
     std::filesystem::path usage_state_path;     // optional private per-user quota counters
@@ -59,7 +104,11 @@ struct Config {
     std::uint32_t max_handshakes{0};
     std::size_t max_frame_bytes{2 * 1024 * 1024};
     std::size_t connection_queue_bytes{256 * 1024};
+    // Relay-buffer budget shared by all reactors. When the config omits it,
+    // Config::parse sizes it from memory (default_global_buffer_bytes) and
+    // sets global_buffer_auto.
     std::size_t global_buffer_bytes{256 * 1024 * 1024};
+    bool global_buffer_auto{false};
     std::chrono::seconds handshake_timeout{15};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
@@ -112,4 +161,18 @@ struct Config {
     // guard. Booleans and counts only.
     nlohmann::json security_posture() const;
 };
+
+// Upper bound of global_buffer_bytes, explicit or derived.
+inline constexpr std::uint64_t kMaxGlobalBufferBytes = 64ULL << 30;
+
+// Memory available to this process: the smaller of MemTotal and every cgroup
+// memory limit on the process's cgroup path (v2 memory.max, v1
+// memory.limit_in_bytes). `root` prefixes /proc and /sys for tests. 0 when
+// MemTotal cannot be read.
+std::uint64_t detect_memory_limit_bytes(const std::filesystem::path& root = "/");
+
+// Budget used when global_buffer_bytes is not configured: a quarter of
+// `memory_bytes`, clamped to 64 MiB..kMaxGlobalBufferBytes; 256 MiB when the
+// memory size is unknown (0).
+std::uint64_t default_global_buffer_bytes(std::uint64_t memory_bytes);
 } // namespace mtdd

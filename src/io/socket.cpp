@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 
@@ -167,6 +168,11 @@ std::optional<std::string> resolve_numeric_host(std::string_view host) {
 }
 
 FdResult connect_tcp(std::string_view address, std::uint16_t port) {
+    return connect_tcp(address, port, ConnectOptions{});
+}
+
+FdResult connect_tcp(std::string_view address, std::uint16_t port,
+                     const ConnectOptions& options) {
     FdResult result;
 
     sockaddr_storage storage{};
@@ -182,6 +188,28 @@ FdResult connect_tcp(std::string_view address, std::uint16_t port) {
         return result;
     }
     UniqueFd owned(fd);
+
+    if (!options.device.empty()) {
+        if (options.device.size() >= IFNAMSIZ ||
+            ::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, options.device.c_str(),
+                         static_cast<socklen_t>(options.device.size() + 1)) != 0) {
+            result.error = options.device.size() >= IFNAMSIZ ? EINVAL : errno;
+            return result;
+        }
+    }
+    if (!options.bind_address.empty()) {
+        sockaddr_storage source{};
+        socklen_t source_length = 0;
+        if (!parse_endpoint(options.bind_address, 0, source, source_length) ||
+            source.ss_family != storage.ss_family) {
+            result.error = EAFNOSUPPORT;
+            return result;
+        }
+        if (::bind(fd, reinterpret_cast<const sockaddr*>(&source), source_length) != 0) {
+            result.error = errno;
+            return result;
+        }
+    }
 
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&storage), length) == 0) {
         result.fd = std::move(owned);

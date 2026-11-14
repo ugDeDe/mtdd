@@ -2,7 +2,11 @@
 #include "mtdd/metadata.hpp"
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <filesystem>
 #include <fstream>
+#include <stdexcept>
+#include <string>
 #include <nlohmann/json.hpp>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +29,92 @@ TEST(Config, MinimalConfigHasUnlimitedConnectionDefaults) {
     EXPECT_LT(config.connection_queue_bytes, config.global_buffer_bytes);
     EXPECT_EQ(config.ad_tag.front(), 0x00);
     EXPECT_EQ(config.ad_tag.back(), 0xff);
+}
+
+TEST(Config, ProxyProtocolIsOffByDefaultWithALoopbackAllowlist) {
+    const auto config = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_FALSE(config.proxy_protocol);
+    EXPECT_EQ(config.proxy_protocol_allow, (std::vector<std::string>{"127.0.0.0/8", "::1"}));
+    EXPECT_FALSE(config.public_view()["proxy_protocol"].get<bool>());
+
+    auto value = minimal_config();
+    value["proxy_protocol"] = true;
+    value["proxy_protocol_allow"] = {"10.0.0.0/8", "fd00::/8"};
+    const auto enabled = mtdd::Config::parse(value, "/work");
+    EXPECT_TRUE(enabled.proxy_protocol);
+    EXPECT_EQ(enabled.proxy_protocol_allow.size(), 2U);
+    EXPECT_EQ(enabled.security_posture()["proxy_protocol"]["allowlist_entries"], 2);
+
+    value["proxy_protocol_allow"] = nlohmann::json::array();
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["proxy_protocol_allow"] = {"not-an-address"};
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value.erase("proxy_protocol_allow");
+    value["proxy_protocol"] = "yes";
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
+TEST(Config, UpstreamsParseLikeTelemtAndHideCredentials) {
+    auto value = minimal_config();
+    value["upstreams"] = nlohmann::json::parse(R"([
+        {"name": "donor", "type": "socks5", "address": "10.200.0.1:1080",
+         "username": "u", "password": "p", "weight": 10},
+        {"type": "socks5", "address": "[2001:db8::1]:41080", "interface": "mtpawg"},
+        {"type": "direct", "scopes": "local,fetch", "weight": 1},
+        {"type": "direct", "bind_address": "10.8.0.2", "enabled": false}
+    ])");
+    value["masking_scope"] = "local";
+    value["me_nat_ip"] = "203.0.113.9";
+    const auto config = mtdd::Config::parse(value, "/work");
+    ASSERT_EQ(config.upstreams.size(), 3U);  // the disabled one is dropped
+    const auto& donor = config.upstreams[0];
+    EXPECT_EQ(donor.type, mtdd::UpstreamConfig::Type::socks5);
+    EXPECT_EQ(donor.host, "10.200.0.1");
+    EXPECT_EQ(donor.port, 1080);
+    EXPECT_EQ(donor.username, "u");
+    EXPECT_EQ(donor.weight, 10U);
+    EXPECT_EQ(config.upstreams[1].host, "2001:db8::1");
+    EXPECT_EQ(config.upstreams[1].interface, "mtpawg");
+    EXPECT_EQ(config.upstreams[2].scopes, (std::vector<std::string>{"local", "fetch"}));
+    EXPECT_EQ(config.masking_scope, "local");
+    EXPECT_EQ(config.me_nat_ip, "203.0.113.9");
+
+    const auto view = config.public_view();
+    EXPECT_EQ(view["upstreams"][0]["address"], "10.200.0.1:1080");
+    EXPECT_EQ(view["upstreams"][0]["auth"], true);
+    EXPECT_EQ(view["upstreams"][1]["address"], "[2001:db8::1]:41080");
+    EXPECT_EQ(view.dump().find("\"p\""), std::string::npos);  // the password never shows
+
+    EXPECT_TRUE(mtdd::Config::parse(minimal_config(), "/work").upstreams.empty());
+}
+
+TEST(Config, InvalidUpstreamsAreRefused) {
+    const std::vector<std::string> bad = {
+        R"({"upstreams": {}})",
+        R"({"upstreams": [{"type": "http"}]})",
+        R"({"upstreams": [{"type": "socks5"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "proxy.example:1080"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "2001:db8::1:1080"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:0"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:1080", "username": "u"}]})",
+        R"({"upstreams": [{"type": "socks5", "address": "127.0.0.1:1080", "username": 5, "password": "p"}]})",
+        R"({"upstreams": [{"type": "direct", "address": "127.0.0.1:1080"}]})",
+        R"({"upstreams": [{"type": "direct", "interface": "bad iface"}]})",
+        R"({"upstreams": [{"type": "direct", "bind_address": "host.example"}]})",
+        R"({"upstreams": [{"type": "direct", "weight": 0}]})",
+        R"({"upstreams": [{"type": "direct", "scopes": ["bad scope"]}]})",
+        R"({"upstreams": [{"type": "direct", "scopes": ["local"]}]})",  // no default scope
+        R"({"upstreams": [{"type": "direct", "colour": "red"}]})",
+        R"({"masking_scope": "local"})",                                // no such scope
+        R"({"me_nat_ip": "0.0.0.0"})",
+        R"({"me_nat_ip": "nat.example"})",
+    };
+    for (const auto& patch : bad) {
+        SCOPED_TRACE(patch);
+        auto value = minimal_config();
+        value.update(nlohmann::json::parse(patch));
+        EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    }
 }
 
 TEST(Config, SuspectsAndFingerprintAreOffByDefault) {
@@ -124,10 +214,15 @@ TEST(Config, RejectsUnknownOptionsInsteadOfSilentlyIgnoringThem) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
-TEST(Config, RequiresExplicitAdTagAndValidDomain) {
+TEST(Config, AdTagIsOptionalButValidatedWhenSet) {
+    // Absent ad_tag is allowed and means "no sponsored channel" (all-zero).
     auto value = minimal_config();
     value.erase("ad_tag");
-    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    const auto no_tag = mtdd::Config::parse(value, "/work");
+    EXPECT_TRUE(std::all_of(no_tag.ad_tag.begin(), no_tag.ad_tag.end(),
+                            [](auto b) { return b == 0; }));
+    EXPECT_FALSE(no_tag.public_view()["ad_tag_set"].get<bool>());
+    // When present it must be 32 hex characters and not all zero.
     value = minimal_config();
     value["ad_tag"] = "bad";
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
@@ -452,4 +547,120 @@ TEST(Config, PublicViewOmitsAdTagAndReportsPosture) {
     EXPECT_EQ(posture["metrics"]["token"], false);
     config.metrics_port = 0;
     EXPECT_TRUE(config.security_posture()["metrics"]["host"].is_null());
+}
+
+namespace {
+
+// Builds a fake /proc + /sys tree under a fresh temporary directory.
+class MemoryRoot {
+public:
+    MemoryRoot() {
+        std::string pattern =
+            (std::filesystem::temp_directory_path() / "mtdd-memory-XXXXXX").string();
+        const char* made = ::mkdtemp(pattern.data());
+        if (made == nullptr) throw std::runtime_error("mkdtemp failed");
+        root_ = made;
+    }
+    ~MemoryRoot() {
+        std::error_code ignored;
+        std::filesystem::remove_all(root_, ignored);
+    }
+    MemoryRoot(const MemoryRoot&) = delete;
+    MemoryRoot& operator=(const MemoryRoot&) = delete;
+
+    void write(const std::string& relative, const std::string& text) const {
+        const auto path = root_ / relative;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path) << text;
+    }
+    const std::filesystem::path& path() const { return root_; }
+
+private:
+    std::filesystem::path root_;
+};
+
+constexpr std::uint64_t kGiB = 1ULL << 30;
+
+} // namespace
+
+TEST(Config, DefaultBufferBudgetIsAQuarterOfMemoryWithinBounds) {
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(0), 256ULL << 20);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(128ULL << 20), 64ULL << 20);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(16 * kGiB), 4 * kGiB);
+    EXPECT_EQ(mtdd::default_global_buffer_bytes(1024 * kGiB), mtdd::kMaxGlobalBufferBytes);
+}
+
+TEST(Config, MemoryLimitIsMemTotalWithoutCgroupLimits) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemFree:  1000 kB\nMemTotal:  8388608 kB\n");
+    root.write("proc/self/cgroup", "0::/system.slice/mtdd.service\n");
+    root.write("sys/fs/cgroup/system.slice/mtdd.service/memory.max", "max\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 8 * kGiB);
+}
+
+TEST(Config, MemoryLimitHonoursTheTightestCgroupOnThePath) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    root.write("proc/self/cgroup", "0::/system.slice/mtdd.service\n");
+    // The unit's own MemoryMax= and a looser ancestor limit.
+    root.write("sys/fs/cgroup/system.slice/mtdd.service/memory.max", "2147483648\n");
+    root.write("sys/fs/cgroup/system.slice/memory.max", "4294967296\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 2 * kGiB);
+    // An ancestor tighter than the leaf wins as well (container limit).
+    root.write("sys/fs/cgroup/system.slice/memory.max", "1073741824\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 1 * kGiB);
+}
+
+TEST(Config, MemoryLimitReadsCgroupV1MemoryController) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    root.write("proc/self/cgroup", "4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc\n");
+    root.write("sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes", "3221225472\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 3 * kGiB);
+}
+
+TEST(Config, MemoryLimitStaysInsideTheMountedHierarchy) {
+    MemoryRoot root;
+    root.write("proc/meminfo", "MemTotal:  16777216 kB\n");
+    // A cgroup namespace can report a path above its root; nothing outside
+    // sys/fs/cgroup may be read.
+    root.write("proc/self/cgroup", "0::/../../outside\n");
+    root.write("sys/fs/outside/memory.max", "1048576\n");
+    root.write("sys/fs/cgroup/memory.max", "max\n");
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 16 * kGiB);
+}
+
+TEST(Config, MemoryLimitIsUnknownWithoutMeminfo) {
+    MemoryRoot root;
+    EXPECT_EQ(mtdd::detect_memory_limit_bytes(root.path()), 0U);
+}
+
+TEST(Config, OmittedBufferBudgetIsDerivedAndMarkedAuto) {
+    const auto derived = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_TRUE(derived.global_buffer_auto);
+    EXPECT_EQ(derived.global_buffer_bytes,
+              mtdd::default_global_buffer_bytes(mtdd::detect_memory_limit_bytes()));
+    auto value = minimal_config();
+    value["global_buffer_bytes"] = 64U << 20;
+    const auto explicit_value = mtdd::Config::parse(value, "/work");
+    EXPECT_FALSE(explicit_value.global_buffer_auto);
+    EXPECT_EQ(explicit_value.global_buffer_bytes, 64U << 20);
+}
+
+TEST(Config, AutoBufferBudgetCoversExplicitWorkers) {
+    // 256 reactors need far more than a quarter of a small host: the derived
+    // budget grows to the per-reactor minimum instead of failing the config.
+    auto value = minimal_config();
+    value["workers"] = 256;
+    const auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_GE(config.global_buffer_bytes / 256,
+              2 * config.max_frame_bytes + 2 * config.connection_queue_bytes + 65536);
+}
+
+TEST(Config, BufferBudgetAcceptsMoreThanOneGibibyte) {
+    auto value = minimal_config();
+    value["global_buffer_bytes"] = 8 * kGiB;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").global_buffer_bytes, 8 * kGiB);
+    value["global_buffer_bytes"] = mtdd::kMaxGlobalBufferBytes + 1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }

@@ -39,6 +39,16 @@ std::string lower_ascii(std::string value) {
   return value;
 }
 
+bool valid_ad_tag(std::string_view tag) {
+  if (tag.size() != 32) return false;
+  bool nonzero = false;
+  for (const char c : tag) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    nonzero = nonzero || c != '0';
+  }
+  return nonzero;
+}
+
 bool valid_tls_domain(std::string_view domain) {
   if (domain.empty() || domain.size() > kMaxTlsDomainBytes) return false;
   size_t start = 0;
@@ -229,6 +239,12 @@ std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
     }
     out.tls_domain = j["tls_domain"].get<std::string>();
   }
+  if (j.contains("ad_tag")) {
+    if (!j["ad_tag"].is_string()) {
+      return Error{ErrorCode::invalid_field, "user.ad_tag must be a string"};
+    }
+    out.ad_tag = j["ad_tag"].get<std::string>();
+  }
   if (auto reason = UserStore::validate_policy(out)) {
     return Error{ErrorCode::invalid_field, "user: " + *reason};
   }
@@ -249,7 +265,8 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
                  j, {"name", "secret", "enabled", "max_connections", "generation",
                      "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
                      "rate_limit_up_bytes_per_sec",
-                     "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain"})) {
+                     "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
+                     "ad_tag"})) {
     return error;
   }
   if (!j.contains("name") || !j["name"].is_string()) {
@@ -284,14 +301,17 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
       out.max_connections = parsed;
     }
   }
+  // A hand-written store may omit generation; parse_store_file() then assigns
+  // the file revision (0 marks "absent" until then).
   if (!j.contains("generation")) {
-    return Error{ErrorCode::invalid_field, "user.generation is required"};
+    out.generation = 0;
+  } else {
+    const auto generation = as_u64(j["generation"]);
+    if (!generation || *generation == 0) {
+      return Error{ErrorCode::invalid_field, "user.generation must be >= 1"};
+    }
+    out.generation = *generation;
   }
-  const auto generation = as_u64(j["generation"]);
-  if (!generation || *generation == 0) {
-    return Error{ErrorCode::invalid_field, "user.generation must be >= 1"};
-  }
-  out.generation = *generation;
   if (version >= 2) return validate_policy_json(j, out.policy);
   return std::nullopt;
 }
@@ -351,6 +371,15 @@ std::optional<Error> parse_store_file(const std::string& text, size_t max_users,
                    "duplicate user secret for '" + record.name + "'"};
     }
     users.push_back(std::move(record));
+  }
+  for (auto& user : users) {
+    // An omitted generation takes the current revision: every later mutation
+    // mints a larger one, so it can never be issued again. A file at revision
+    // 0 advances to 1, the first valid generation.
+    if (user.generation == 0) {
+      if (revision == 0) revision = 1;
+      user.generation = revision;
+    }
   }
   for (const auto& user : users) {
     // Generations are allocated from revisions; a hand-edited file must not be
@@ -418,6 +447,7 @@ std::string serialize_snapshot(uint64_t revision,
       entry["note"] = policy.note;
       if (policy.canary) entry["canary"] = true;
       if (!policy.tls_domain.empty()) entry["tls_domain"] = policy.tls_domain;
+      if (!policy.ad_tag.empty()) entry["ad_tag"] = policy.ad_tag;
     }
     array.push_back(std::move(entry));
   }

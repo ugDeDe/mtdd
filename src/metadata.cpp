@@ -63,7 +63,10 @@ int transfer_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off
     return static_cast<std::stop_token*>(opaque)->stop_requested() ? 1 : 0;
 }
 
-std::string download(const char* url, std::stop_token stop, std::chrono::seconds shutdown_budget) {
+// `upstream` (nullptr: plain) is how the request leaves the host, the same
+// way as the Telegram connections (Config::upstreams, default scope).
+std::string download(const char* url, std::stop_token stop, std::chrono::seconds shutdown_budget,
+                     const UpstreamConfig* upstream) {
     static const CurlGlobal curl_global;
     (void)curl_global;
     struct CurlDeleter { void operator()(CURL* curl) const noexcept { curl_easy_cleanup(curl); } };
@@ -87,6 +90,27 @@ std::string download(const char* url, std::stop_token stop, std::chrono::seconds
     option(CURLOPT_NOPROGRESS, 0L);
     option(CURLOPT_XFERINFOFUNCTION, transfer_progress);
     option(CURLOPT_XFERINFODATA, &stop);
+    std::string proxy;
+    std::string interface;
+    if (upstream != nullptr) {
+        if (!upstream->interface.empty()) {
+            interface = "if!" + upstream->interface;
+        } else if (!upstream->bind_address.empty()) {
+            interface = "host!" + upstream->bind_address;
+        }
+        if (!interface.empty()) option(CURLOPT_INTERFACE, interface.c_str());
+        if (upstream->type == UpstreamConfig::Type::socks5) {
+            // socks5h: the proxy resolves core.telegram.org.
+            proxy = upstream->host.find(':') == std::string::npos
+                        ? "socks5h://" + upstream->host + ":" + std::to_string(upstream->port)
+                        : "socks5h://[" + upstream->host + "]:" + std::to_string(upstream->port);
+            option(CURLOPT_PROXY, proxy.c_str());
+            if (!upstream->username.empty()) {
+                option(CURLOPT_PROXYUSERNAME, upstream->username.c_str());
+                option(CURLOPT_PROXYPASSWORD, upstream->password.c_str());
+            }
+        }
+    }
     if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
     if (curl_easy_perform(curl.get()) != CURLE_OK) throw std::runtime_error("ME metadata download failed");
     long status{};
@@ -160,11 +184,31 @@ std::vector<MeEndpoint> parse_me_config(std::string_view text) {
     return result;
 }
 
+// Tries the default-scope upstreams by descending weight until one answers;
+// plain when no upstreams are configured.
+static std::string fetch_metadata(const Config& config, const char* url, std::stop_token stop) {
+    std::vector<const UpstreamConfig*> order;
+    for (const auto& upstream : config.upstreams) {
+        if (upstream.scopes.empty()) order.push_back(&upstream);
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [](const UpstreamConfig* a, const UpstreamConfig* b) { return a->weight > b->weight; });
+    if (order.empty()) return download(url, stop, config.shutdown_timeout, nullptr);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        try {
+            return download(url, stop, config.shutdown_timeout, order[i]);
+        } catch (const std::runtime_error&) {
+            if (i + 1 == order.size() || stop.stop_requested()) throw;
+        }
+    }
+    throw std::runtime_error("ME metadata download failed");
+}
+
 MeMetadata load_me_metadata(const Config& config, std::stop_token stop) {
     if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
-    const auto config_text = config.me_config_path.empty() ? download("https://core.telegram.org/getProxyConfig", stop, config.shutdown_timeout) : read_file(config.me_config_path);
+    const auto config_text = config.me_config_path.empty() ? fetch_metadata(config, "https://core.telegram.org/getProxyConfig", stop) : read_file(config.me_config_path);
     if (stop.stop_requested()) throw std::runtime_error("metadata refresh stopped");
-    const auto secret_text = config.me_secret_path.empty() ? download("https://core.telegram.org/getProxySecret", stop, config.shutdown_timeout) : read_file(config.me_secret_path);
+    const auto secret_text = config.me_secret_path.empty() ? fetch_metadata(config, "https://core.telegram.org/getProxySecret", stop) : read_file(config.me_secret_path);
     if (secret_text.size() != 128) throw std::invalid_argument("ME secret must contain exactly 128 binary bytes");
     MeMetadata result;
     result.endpoints = parse_me_config(config_text);

@@ -85,11 +85,11 @@ Bytes cat(std::initializer_list<Bytes> parts) {
   return out;
 }
 
-void expect_bytes(std::span<const std::uint8_t> a, std::span<const std::uint8_t> b) {
+[[maybe_unused]] void expect_bytes(std::span<const std::uint8_t> a, std::span<const std::uint8_t> b) {
   EXPECT_EQ(Bytes(a.begin(), a.end()), Bytes(b.begin(), b.end()));
 }
 
-Bytes le32(std::uint32_t v) {
+[[maybe_unused]] Bytes le32(std::uint32_t v) {
   return {static_cast<std::uint8_t>(v), static_cast<std::uint8_t>(v >> 8),
           static_cast<std::uint8_t>(v >> 16), static_cast<std::uint8_t>(v >> 24)};
 }
@@ -97,7 +97,7 @@ Bytes be16(std::uint16_t v) {
   return {static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v)};
 }
 
-std::uint32_t rd32(std::span<const std::uint8_t> b, std::size_t off = 0) {
+[[maybe_unused]] std::uint32_t rd32(std::span<const std::uint8_t> b, std::size_t off = 0) {
   return static_cast<std::uint32_t>(b[off]) |
          (static_cast<std::uint32_t>(b[off + 1]) << 8) |
          (static_cast<std::uint32_t>(b[off + 2]) << 16) |

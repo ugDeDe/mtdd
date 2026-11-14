@@ -7,15 +7,13 @@
   "api_token_env": "MTDD_API_TOKEN",
   "tls_domain": "example.org",
   "masking": true,
-  "ad_tag": "REPLACE_WITH_YOUR_32_HEX_AD_TAG",
   "users_path": "runtime/users.json",
   "workers": 0,
   "max_frame_bytes": 2097152,
   "connection_queue_bytes": 262144,
-  "global_buffer_bytes": 67108864,
   "handshake_timeout_seconds": 15,
   "idle_timeout_seconds": 1800,
-  "me_connections_per_dc": 12,
+  "me_connections_per_dc": 16,
   "me_clients_per_writer": 400,
   "metadata_refresh_seconds": 3600
 }

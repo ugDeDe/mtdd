@@ -664,12 +664,71 @@ TEST(MiddleEnd, LiveAdTagOverrideAppliesToNextRequest) {
   auto p = std::span<const std::uint8_t>(out).subspan(8, rd32(out) - 12);
   expect_bytes(p.subspan(65, 16), other);
 
+  // Clearing to an all-zero tag switches the session to no-tag: the next frame
+  // drops the HAS_AD_TAG flag and the whole 28-byte TL_PROXY_TAG block.
   AdTag zero;
-  EXPECT_THROW(r.session->set_ad_tag(zero), std::invalid_argument);
+  r.session->set_ad_tag(zero);
   Bytes again;
   ASSERT_EQ(r.session->encode_client_message(payload, kPeer, ProtoTag::Secure, false, again), Status::Ok);
   r.write_dec->decrypt(again);
-  expect_bytes(std::span<const std::uint8_t>(again).subspan(8, rd32(again) - 12).subspan(65, 16), other);
+  const auto np = std::span<const std::uint8_t>(again).subspan(8, rd32(again) - 12);
+  EXPECT_EQ(rd32(np, 0), 0x36cef1eeu);          // RPC_PROXY_REQ
+  EXPECT_EQ(rd32(np, 4) & 0x8u, 0u);            // HAS_AD_TAG cleared
+  EXPECT_EQ(rd32(np, 4), 0x28021000u);          // MAGIC|EXTMODE2|INTERMEDIATE|PAD
+  ASSERT_EQ(np.size(), 56u + payload.size());   // no tag block
+  expect_bytes(np.subspan(56), payload);        // payload right after the 56-byte header
+}
+
+// A session with no ad tag (all-zero) emits RPC_PROXY_REQ without the
+// TL_PROXY_TAG block, matching telemt/MTProxy no-tag frames.
+TEST(MiddleEnd, NoAdTagOmitsTheProxyTagBlock) {
+  auto r = make_ready();
+  r.session->set_ad_tag(AdTag{});  // clear to no-tag
+  Bytes payload = from_hex("0102030405060708090a0b0c");
+  Bytes out;
+  ASSERT_EQ(r.session->encode_client_message(payload, kPeer, ProtoTag::Secure, false, out), Status::Ok);
+  r.write_dec->decrypt(out);
+  const std::uint32_t len = rd32(out);
+  EXPECT_EQ(len, 12u + 56u + payload.size());   // 56 header, no 28-byte block
+  const auto p = std::span<const std::uint8_t>(out).subspan(8, len - 12);
+  EXPECT_EQ(rd32(p, 0), 0x36cef1eeu);
+  EXPECT_EQ(rd32(p, 4) & 0x8u, 0u);             // HAS_AD_TAG cleared
+  expect_bytes(p.subspan(8, 8), r.session->conn_id());
+  expect_bytes(p.subspan(16, 20), kPeer.wire20());
+  expect_bytes(p.subspan(36, 20), kMeAdvertised.wire20());
+  expect_bytes(p.subspan(56), payload);         // no extra_size, no tag
+  EXPECT_EQ(rd32(out, len - 4), crypto::crc32(std::span<const std::uint8_t>(out).first(len - 4)));
+}
+
+// A per-request tag (per-user ad tag) goes into that request only; null or
+// all-zero falls back to the session's tag.
+TEST(MiddleEnd, PerRequestAdTagOverridesOnlyThatRequest) {
+  auto r = make_ready();
+  AdTag own;
+  own.bytes = {0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8,
+               0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0};
+  const Bytes payload = from_hex("0102030405060708090a0b0c");
+  const auto tag_of = [&](Bytes& out) {
+    r.write_dec->decrypt(out);
+    const auto p = std::span<const std::uint8_t>(out).subspan(8, rd32(out) - 12);
+    return Bytes(p.begin() + 65, p.begin() + 81);
+  };
+  Bytes first;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, first, &own),
+            Status::Ok);
+  EXPECT_EQ(tag_of(first), Bytes(own.bytes.begin(), own.bytes.end()));
+  Bytes second;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, second, nullptr),
+            Status::Ok);
+  EXPECT_EQ(tag_of(second), Bytes(kAdTag.begin(), kAdTag.end()));
+  const AdTag zero;
+  Bytes third;
+  ASSERT_EQ(r.session->encode_client_message(r.session->conn_id(), payload, kPeer,
+                                             ProtoTag::Secure, false, third, &zero),
+            Status::Ok);
+  EXPECT_EQ(tag_of(third), Bytes(kAdTag.begin(), kAdTag.end()));
 }
 
 // RPC_PROXY_REQ carries two distinct 20-byte endpoints: the client's address
@@ -1119,8 +1178,8 @@ TEST(MiddleEnd, ConfigValidation) {
   cfg.server = Endpoint::v6(std::array<std::uint8_t, 16>{}, 8888);
   EXPECT_THROW(MiddleEndSession(cfg, std::make_unique<TestSink>()), std::invalid_argument);
   cfg = me_config();
-  cfg.ad_tag.bytes.fill(0);
-  EXPECT_THROW(MiddleEndSession(cfg, std::make_unique<TestSink>()), std::invalid_argument);
+  cfg.ad_tag.bytes.fill(0);  // all-zero ad tag is valid: it means "no tag"
+  EXPECT_NO_THROW(MiddleEndSession(cfg, std::make_unique<TestSink>()));
   // The advertised listener endpoint is mandatory and must carry a real port;
   // silently falling back to the KDF socket port would reintroduce the defect.
   cfg = me_config();

@@ -71,6 +71,21 @@ bool fallback_target_valid(std::string_view host) {
 
 namespace detail {
 
+namespace {
+std::mutex g_replay_capacity_mutex;
+std::optional<std::size_t> g_replay_capacity;
+}  // namespace
+
+void set_replay_capacity_for_test(std::optional<std::size_t> value) {
+    const std::lock_guard lock{g_replay_capacity_mutex};
+    g_replay_capacity = value;
+}
+
+std::size_t replay_capacity() {
+    const std::lock_guard lock{g_replay_capacity_mutex};
+    return g_replay_capacity.value_or(kReplayCapacity);
+}
+
 ReplayCache::Outcome ReplayCache::insert(const std::array<std::uint8_t, 32>& key,
                                          std::chrono::steady_clock::time_point now) {
     const std::lock_guard lock{mutex_};
@@ -95,6 +110,23 @@ void ReplayCache::evict_locked(std::chrono::steady_clock::time_point now) {
         const auto found = entries_.find(key);
         if (found != entries_.end() && found->second == stamp) entries_.erase(found);
     }
+}
+
+bool SkewSeenCache::insert(const std::array<std::uint8_t, 32>& digest,
+                           std::chrono::steady_clock::time_point now) {
+    const std::lock_guard lock{mutex_};
+    while (!order_.empty() && (now - order_.front().second >= kSkewSeenRetention ||
+                               entries_.size() >= kSkewSeenCapacity)) {
+        const auto found = entries_.find(order_.front().first);
+        if (found != entries_.end() && found->second == order_.front().second) {
+            entries_.erase(found);
+        }
+        order_.pop_front();
+    }
+    if (entries_.find(digest) != entries_.end()) return false;
+    entries_.emplace(digest, now);
+    order_.emplace_back(digest, now);
+    return true;
 }
 
 std::size_t ReplayCache::size() const noexcept {
@@ -183,9 +215,15 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
         if (!net) throw std::invalid_argument("invalid watch_ips entry: " + entry);
         watch_.push_back(*net);
     }
-    if (std::all_of(config_.ad_tag.begin(), config_.ad_tag.end(),
-                    [](std::uint8_t byte) { return byte == 0; })) {
-        throw std::invalid_argument("runtime requires a non-zero 16-byte ad tag");
+    if (config_.proxy_protocol) {
+        for (const auto& entry : config_.proxy_protocol_allow) {
+            auto net = detail::parse_watch_net(entry);
+            if (!net) throw std::invalid_argument("invalid proxy_protocol_allow entry: " + entry);
+            proxy_allow_.push_back(*net);
+        }
+        if (proxy_allow_.empty()) {
+            throw std::invalid_argument("proxy_protocol requires a non-empty proxy_protocol_allow");
+        }
     }
     if (config_.handshake_timeout.count() <= 0 || config_.shutdown_timeout.count() <= 0) {
         throw std::invalid_argument("runtime timeouts must be positive");
@@ -496,6 +534,7 @@ void Runtime::Impl::run() {
                     lifecycle.allocations.load(std::memory_order_relaxed),
                     lifecycle.reuses.load(std::memory_order_relaxed));
                 next_gauge_ = now + std::chrono::seconds(1);
+                log_budget_pressure(now);
                 // Expiry and quota are time/traffic driven, not snapshot driven.
                 sweep_user_policy(now);
             }
@@ -623,12 +662,13 @@ void Runtime::Impl::update_client_interest(Client& client) {
     // it temporarily; the unpause path re-arms it so the tail is preserved.
     // A rate-limited direction stops reading its source. On the ME route the
     // shared ME socket cannot be paused per user, so a drained s2c bucket
-    // throttles the requests that drive downloads (c2s) instead.
+    // throttles the requests that drive downloads (c2s) instead. Upstream
+    // backpressure (c2s_backpressured) stops reading until the queue drains.
     const bool rate_paused =
         client.rate_pause_c2s ||
         (client.rate_pause_s2c && client.route != Client::Route::direct);
     if (!client.read_eof && !client.draining && !client.budget_paused &&
-        !client.close_requested && !rate_paused) {
+        !client.close_requested && !rate_paused && !client.c2s_backpressured) {
         desired |= EPOLLIN;
     }
     if (client_wants_write(client)) desired |= EPOLLOUT;
@@ -650,7 +690,8 @@ void Runtime::Impl::update_me_interest(MeConn& me) {
     }
     std::uint32_t desired = 0;
     if (me.state == MeConn::State::connecting) {
-        desired |= EPOLLRDHUP | EPOLLOUT;
+        // A SOCKS5 upstream answers the handshake once connected: read it.
+        desired |= EPOLLRDHUP | (me.socks && me.socks->started() ? EPOLLIN : EPOLLOUT);
     } else {
         // While the relay budget refused a read, neither unread data nor a
         // level-triggered FIN bit may keep the reactor spinning. The 150 ms
@@ -665,8 +706,13 @@ void Runtime::Impl::update_listener_interest() {
     // Keep EPOLLIN off while the buffer budget cannot admit a client; otherwise
     // the reactor accepts sockets only to close them. Housekeeping re-evaluates
     // this every tick, so acceptance resumes once the budget drains.
-    const bool accept = !stopping_ && listener_.valid() &&
-        budget_allows(detail::kBudgetHeadroom + 8192) &&
+    const bool budget_ok = budget_allows(detail::kBudgetHeadroom + 8192);
+    // Count each transition into the budget pause, not every re-evaluation.
+    if (!budget_ok && !accept_budget_paused_ && !stopping_ && listener_.valid()) {
+        note_budget_refusal(control::BudgetRefusal::accept);
+    }
+    accept_budget_paused_ = !budget_ok;
+    const bool accept = !stopping_ && listener_.valid() && budget_ok &&
         (config_.max_connections == 0 ||
          (clients_.size() < static_cast<std::size_t>(config_.max_connections) &&
           shared_->connections.load(std::memory_order_relaxed) <

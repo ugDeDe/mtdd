@@ -254,18 +254,130 @@ enum class HelloStatus { Ok, NeedMoreData, NotTls, Invalid, Unauthenticated, Clo
 // the 16-byte FakeTLS user secret. The timestamp is masked into digest[28..32].
 // A ClientHello that offers no TLS 1.3 cipher (1301/1302/1303) is Invalid: the
 // ServerHello never invents a cipher the client did not offer.
+// ClockSkew: the HMAC matched but the timestamp is outside +-skew_seconds;
+// `out` then holds only `timestamp` (the client's clock), every other field
+// stays wiped. Any other non-Ok status leaves `out` wiped.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const std::uint8_t, 16> secret,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out);
 
 // Same contract, tried against every key with the canonical HMAC input built
-// once. On Ok, @p matched is the index of the first authenticating key; any
-// other status leaves it unspecified. Unauthenticated means no key matched.
+// once. On Ok and ClockSkew, @p matched is the index of the first
+// authenticating key; any other status leaves it unspecified. Unauthenticated
+// means no key matched.
 HelloStatus validate_client_hello(std::span<const std::uint8_t> record,
                                   std::span<const crypto::HmacSha256Key* const> keys,
                                   std::int64_t now_unix, std::uint32_t skew_seconds,
                                   ClientHelloInfo& out, std::size_t& matched);
+
+// A ClientHello handshake message may arrive split over several consecutive
+// TLS handshake records (DPI-circumvention tools such as ByeDPI --tlsrec or
+// zapret); the first may carry a single body byte. The client's HMAC covers
+// the original single record, so a split hello is authenticated as its
+// reassembly: [0x16, version of the first record, u16 total body length] +
+// the concatenated bodies.
+inline constexpr std::size_t kFakeTlsMaxHelloRecords = 16;
+
+struct ClientHelloScan {
+  // NeedMoreData: a valid prefix of a ClientHello; NotTls: the first record
+  // header is not a TLS handshake record; Invalid: anything else that cannot
+  // become a ClientHello within the limits; Ok: the input is exactly one
+  // complete ClientHello (1..kFakeTlsMaxHelloRecords records, total body
+  // 100..kFakeTlsMaxClientHello bytes, nothing after it).
+  HelloStatus status{HelloStatus::NeedMoreData};
+  // NeedMoreData only: bytes that may still be read without passing the end
+  // of the ClientHello (the rest of the current record header or body), >= 1.
+  std::size_t want{0};
+  // Complete record headers seen.
+  std::size_t records{0};
+};
+
+// Classifies a received prefix as early as its bytes allow. The first record
+// is classified only from its complete 5-byte header, as before. Pure: the
+// result depends only on `wire`, so feeding byte by byte or at once agrees.
+[[nodiscard]] ClientHelloScan scan_client_hello(std::span<const std::uint8_t> wire);
+
+// The single canonical record for a scan_client_hello() Ok input (identical to
+// the input when it is one record). For any other input, the reassembly of the
+// leading well-formed handshake records (possibly empty), for SNI inspection
+// only; it is never a substitute for scan_client_hello().
+[[nodiscard]] Bytes reassemble_client_hello(std::span<const std::uint8_t> wire);
+
+// ---------------------------------------------------------------------------
+// PROXY protocol (HAProxy v1 text / v2 binary) in front of the client stream
+// ---------------------------------------------------------------------------
+
+// v1 is at most 107 bytes including CRLF (spec). v2 headers longer than
+// kProxyHeaderV2Max (16-byte prefix + addresses + TLVs) are refused.
+inline constexpr std::size_t kProxyHeaderV1Max = 107;
+inline constexpr std::size_t kProxyHeaderV2Max = 2048;
+
+struct ProxyHeaderScan {
+  enum class Status { NeedMoreData, Ok, Invalid };
+  Status status{Status::NeedMoreData};
+  // NeedMoreData: bytes that may be read next (>= 1). For v2 this never passes
+  // the end of the header. A v1 header's end is only known at its CRLF, so the
+  // read may pass it, but never past kProxyHeaderV1Max bytes in total.
+  std::size_t want{0};
+  // Ok: header length; the bytes after it belong to the proxied stream.
+  std::size_t length{0};
+  // Ok: the original client address. nullopt for v2 LOCAL, v1 UNKNOWN and v2
+  // address families other than TCP over IPv4/IPv6: use the socket peer.
+  std::optional<Endpoint> source;
+};
+
+// Pure function of the received prefix, like scan_client_hello(). Rejects as
+// early as the bytes allow: a wrong signature, a malformed v1 line, a v2
+// version other than 2 or a command other than LOCAL/PROXY, an oversized
+// header, a TCP source address with port 0.
+[[nodiscard]] ProxyHeaderScan scan_proxy_header(std::span<const std::uint8_t> wire);
+
+// ---------------------------------------------------------------------------
+// SOCKS5 CONNECT client (RFC 1928; RFC 1929 username/password) for outbound
+// upstreams. A byte state machine: the caller owns the socket, sends what
+// start()/feed() produce and reads exactly want() bytes at a time, so no byte
+// of the tunnelled stream is ever consumed by the handshake.
+// ---------------------------------------------------------------------------
+
+class Socks5Client {
+ public:
+  enum class Status { NeedMore, Done, Failed };
+
+  // Empty username and password: no authentication (method 0); otherwise
+  // only username/password (method 2) is offered. Each is at most 255 bytes.
+  Socks5Client(Endpoint target, std::string username = {}, std::string password = {});
+
+  // The greeting; call once, right after the TCP connect completed.
+  [[nodiscard]] Bytes start();
+  [[nodiscard]] bool started() const noexcept { return started_; }
+  // Bytes the next feed() may consume (>= 1 while NeedMore, else 0).
+  [[nodiscard]] std::size_t want() const noexcept;
+  // Consumes at most want() bytes; anything to send next is appended to `out`.
+  Status feed(std::span<const std::uint8_t> in, Bytes& out);
+  [[nodiscard]] Status status() const noexcept { return status_; }
+  // Done: the address and port the proxy connected from (BND.ADDR/BND.PORT);
+  // nullopt when the proxy answered with a domain name.
+  [[nodiscard]] const std::optional<Endpoint>& bound() const noexcept { return bound_; }
+  [[nodiscard]] std::string_view error() const noexcept { return error_; }
+
+ private:
+  enum class Stage { Method, Auth, Head, Address, Finished };
+  Status fail(std::string message);
+  void advance(Bytes& out);
+
+  Endpoint target_;
+  std::string username_;
+  std::string password_;
+  Stage stage_{Stage::Method};
+  Status status_{Status::NeedMore};
+  bool started_{false};
+  std::size_t need_{2};
+  Bytes have_;
+  std::uint8_t address_type_{0};
+  std::optional<Endpoint> bound_;
+  std::string error_;
+};
 
 // Builds ServerHello + CCS + fake encrypted certificate. Uses the classical
 // x25519 template, or the X25519MLKEM768 shape when info.offers_pq is set.
@@ -456,7 +568,7 @@ struct MiddleEndConfig {
   // source port. The address family may differ from the transport (the wire
   // form supports IPv4-mapped and native IPv6); the port must be non-zero.
   Endpoint advertised;
-  AdTag ad_tag;                      // mandatory; always emitted in RPC_PROXY_REQ
+  AdTag ad_tag;                      // all-zero = no tag (RPC_PROXY_REQ omits the tag block)
   RandomFn random;                   // required
   ClockFn clock;                     // defaults to system time
   // RPC_HANDSHAKE process_id material (12-byte process ids, same layout as
@@ -544,10 +656,14 @@ class MiddleEndSession {
   // AES-CBC encrypted.
   Status encode_client_message(std::span<const std::uint8_t> payload, const Endpoint& peer,
                                ProtoTag tag, bool quick_ack, std::vector<std::uint8_t>& to_me);
-  // Same, with an explicit per-logical-client connection id (shared ME multiplexing).
+  // Same, with an explicit per-logical-client connection id (shared ME
+  // multiplexing). A non-null, non-zero @p ad_tag replaces the session's tag
+  // for this request only (per-user ad tag); null or all-zero uses the
+  // session's.
   Status encode_client_message(const ConnId& conn_id, std::span<const std::uint8_t> payload,
                                const Endpoint& peer, ProtoTag tag, bool quick_ack,
-                               std::vector<std::uint8_t>& to_me);
+                               std::vector<std::uint8_t>& to_me,
+                               const AdTag* ad_tag = nullptr);
   // RPC_CLOSE_CONN (0x1fcf425d) for one logical connection; transport stays up.
   // This is the outgoing notification. Inbound RPC_CLOSE_CONN and RPC_CLOSE_EXT
   // are both delivered via Sink::on_remote_close and also do not close the
@@ -556,7 +672,8 @@ class MiddleEndSession {
   // RPC_PING (0x5730a2df) + ping_id for connection keepalive; transport stays up.
   Status encode_ping(std::int64_t ping_id, std::vector<std::uint8_t>& to_me);
   // Replaces the ad tag carried by every later RPC_PROXY_REQ (live ad-tag
-  // override). Throws std::invalid_argument for an all-zero tag.
+  // override). An all-zero tag switches the session to no-tag (later
+  // RPC_PROXY_REQ frames omit the TL_PROXY_TAG block).
   void set_ad_tag(const AdTag& tag);
 
   State state() const;

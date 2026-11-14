@@ -532,7 +532,10 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
            reactor_writers < reactor_limit &&
            pending < detail::kMePendingBatch &&
            dialed < detail::kMeDialBatch) {
-        if (me_generation_count(pool, generation) > 0 && !budget_allows(65536)) break;
+        if (me_generation_count(pool, generation) > 0 && !budget_allows(65536)) {
+            note_budget_refusal(control::BudgetRefusal::me_dial);
+            break;
+        }
         MeConn* connection = nullptr;
         try {
             auto owned = std::make_unique<MeConn>();
@@ -747,7 +750,10 @@ void Runtime::Impl::scale_me_pool(std::int16_t dc, Time now) {
                 return;
             }
         }
-        if (!budget_allows(65536)) return;
+        if (!budget_allows(65536)) {
+            note_budget_refusal(control::BudgetRefusal::me_dial);
+            return;
+        }
         ++pool.scale_target;
         ++pool.scale_up_total;
         (void)ensure_me(dc, now);

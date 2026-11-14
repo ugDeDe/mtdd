@@ -105,18 +105,21 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
         protocol::crypto::secure_zero(warm);
     }
 
+    masking_dns = std::make_unique<detail::MaskingResolver>(config, users);
     Config reactor_config = config;
     reactor_config.global_buffer_bytes = per_worker_budget;
     reactors.reserve(workers);
     reactors.push_back(std::make_unique<Impl>(
         reactor_config, users, statistics, metadata, barrier, shared, 0,
         workers > 1, true));
+    reactors.back()->masking_dns_ = masking_dns.get();
     const std::uint16_t bound = reactors.front()->port();
     if (config.proxy_port == 0) reactor_config.proxy_port = bound;
     for (std::size_t index = 1; index < workers; ++index) {
         reactors.push_back(std::make_unique<Impl>(
             reactor_config, users, statistics, metadata, barrier, shared, index,
             true, false));
+        reactors.back()->masking_dns_ = masking_dns.get();
     }
     // Only publish the worker layout once every reactor exists: a listener-bind
     // failure above must not leave Statistics/RevisionBarrier configured for
@@ -206,6 +209,7 @@ void Runtime::RuntimeState::run_impl() {
         if (!failure) failure = std::move(error);
     };
     if (usage_keeper) usage_keeper->start();
+    masking_dns->start();
     // Reactor i on the i-th allowed CPU, only with one reactor per CPU at
     // most. Every helper thread already exists, so pinning the calling thread
     // (reactor 0) below cannot leak into threads created later.
@@ -230,6 +234,7 @@ void Runtime::RuntimeState::run_impl() {
         }
     } catch (...) {
         shared->stop_all();
+        masking_dns->stop();
         for (auto& thread : threads) {
             if (thread.joinable()) thread.join();
         }
@@ -243,6 +248,10 @@ void Runtime::RuntimeState::run_impl() {
         record(std::current_exception());
         shared->stop_all();
     }
+    // Every reactor is stopping now. Stopping the resolver before joining the
+    // others overlaps its one in-flight lookup with their drain; reactors still
+    // running only read the cache, which stays valid.
+    masking_dns->stop();
     for (auto& thread : threads) {
         if (thread.joinable()) thread.join();
     }
@@ -306,9 +315,8 @@ void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
 }
 
 void Runtime::RuntimeState::set_ad_tag(const std::array<std::uint8_t, 16>& tag) {
-    if (std::all_of(tag.begin(), tag.end(), [](std::uint8_t byte) { return byte == 0; })) {
-        throw std::invalid_argument("ad_tag must not be all zero");
-    }
+    // All-zero clears the ad tag (no sponsored channel); the reactors stop
+    // emitting the TL_PROXY_TAG block on their next frames.
     {
         std::lock_guard lock(shared->ad_tag_mutex);
         shared->ad_tag = tag;

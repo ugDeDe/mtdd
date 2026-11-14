@@ -60,9 +60,15 @@ inline constexpr std::size_t kEpollBatch = 512;
 // Sockets accepted per listener readiness event. Bounded so a connection burst
 // cannot monopolise one reactor; the listen backlog holds the remainder.
 inline constexpr std::size_t kAcceptBatch = 128;
-// Masking-target DNS cache lifetime; probes are rare, so a blocking resolve
-// on the reactor at TTL expiry is an acceptable trade-off (documented).
+// Masking-target DNS refresh period. Names are resolved by MaskingResolver's
+// background thread, never on a reactor. A failed lookup is retried after
+// kMaskingResolveRetryMin, doubling up to kMaskingResolveRetryMax, while the
+// last good address keeps being served. kMaskingResolvePoll bounds how late
+// a personal tls_domain change is picked up.
 inline constexpr std::chrono::seconds kFallbackResolveTtl{300};
+inline constexpr std::chrono::seconds kMaskingResolveRetryMin{5};
+inline constexpr std::chrono::seconds kMaskingResolveRetryMax{60};
+inline constexpr std::chrono::seconds kMaskingResolvePoll{1};
 inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
 // A client's coalesced ME answers are handed to its queue once they reach this
 // size even before the ME read ends, bounding the per-read staging copy.
@@ -127,9 +133,16 @@ inline constexpr std::size_t kMaxWorkers = 256;
 // saturation).
 inline constexpr std::chrono::seconds kReplayRetention{240};
 inline constexpr std::size_t kReplayCapacity = 524288;
+// Test-only: replay-cache capacity for SharedState objects built afterwards.
+// Production never installs one, so kReplayCapacity is used unchanged; tests
+// must not send half a million hellos to reach saturation.
+void set_replay_capacity_for_test(std::optional<std::size_t> value);
+std::size_t replay_capacity();
 
 // Snapshot/metadata checks happen on this cadence, not per packet.
 inline constexpr std::chrono::milliseconds kPollInterval{150};
+// Minimum spacing of the per-reactor "buffer budget exhausted" log line.
+inline constexpr std::chrono::seconds kBudgetLogInterval{60};
 
 // Minimum interval between full FIN/read-EOF sweeps. The sweep is also forced
 // by the 150 ms housekeeping tick and by an earlier exact EOF deadline, so an
@@ -217,6 +230,71 @@ void set_direct_endpoint_override(std::optional<DirectEndpointOverride> value);
 // Test-only: every automatic masking target (SNI name or tls_domain) dials
 // this endpoint instead, so tests never resolve or reach the real domain.
 void set_masking_endpoint_override(std::optional<DirectEndpointOverride> value);
+// Test-only masking DNS seam, so tests never resolve real names. `resolve`
+// replaces io::resolve_numeric_host, `refresh` replaces kFallbackResolveTtl,
+// and a nonzero `port` replaces 443 for the automatic (SNI/tls_domain)
+// targets. Production never installs it.
+struct MaskingResolveHooks {
+    std::function<std::optional<std::string>(const std::string&)> resolve;
+    std::chrono::milliseconds refresh{kFallbackResolveTtl};
+    std::uint16_t port{0};
+};
+void set_masking_resolve_hooks_for_test(std::optional<MaskingResolveHooks> hooks);
+
+// Masking-target DNS: one helper thread per runtime, shared by all reactors.
+// It keeps the configured names (fallback_host when it is a hostname,
+// otherwise tls_domain and every personal tls_domain of the current user
+// snapshot) resolved in a keyed cache and refreshes them in the background.
+// Reactors only call address(), a short locked map lookup; the lock is never
+// held across a lookup. Owned by Runtime::RuntimeState, which starts it before
+// the reactors run and stops it when they finish.
+class MaskingResolver {
+public:
+    MaskingResolver(const Config& config, control::UserStore& users);
+    ~MaskingResolver();
+    MaskingResolver(const MaskingResolver&) = delete;
+    MaskingResolver& operator=(const MaskingResolver&) = delete;
+
+    // No thread when no configured target is a hostname.
+    void start();
+    // Waits for at most the one lookup in flight. Idempotent.
+    void stop() noexcept;
+    // Cached address of `host`, or empty (then the thread is woken to pick up
+    // a newly configured name). Never blocks on DNS.
+    std::string address(std::string_view host);
+
+private:
+    using Clock = std::chrono::steady_clock;
+    struct Entry {
+        std::string address;  // last good answer; empty until the first one
+        Clock::time_point next_attempt;
+        std::chrono::milliseconds backoff;
+    };
+    bool needed() const;
+    void run();
+    // Thread only: the configured names, or nullopt when unchanged.
+    std::optional<std::vector<std::string>> configured_names();
+
+    control::UserStore& users_;
+    const std::string tls_domain_;
+    const std::string fallback_host_;
+    const std::uint16_t fallback_port_;
+    const bool masking_;
+    std::function<std::optional<std::string>(const std::string&)> resolve_;
+    std::chrono::milliseconds refresh_{kFallbackResolveTtl};
+    std::chrono::milliseconds retry_min_{kMaskingResolveRetryMin};
+    // configured_names() state (thread only).
+    std::shared_ptr<const control::UserSnapshot> names_snapshot_;
+    bool names_overridden_{false};
+    bool names_valid_{false};
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::unordered_map<std::string, Entry> entries_;  // guarded by mutex_
+    bool kicked_{false};                              // guarded by mutex_
+    bool stop_{false};                                // guarded by mutex_
+    std::thread thread_;
+};
 
 // Test-only fault injection. Production never calls these; they let the local
 // tests prove failure paths without touching sockets or real crypto.
@@ -389,6 +467,28 @@ private:
 
     std::size_t capacity_;
     mutable std::mutex mutex_;
+    std::unordered_map<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point,
+                       ReplayHash>
+        entries_;
+    std::deque<std::pair<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point>>
+        order_;
+};
+
+// Public ClientHello digests (record bytes 11..43) of valid-secret hellos
+// rejected for clock skew. A mis-clocked client sends a fresh random on every
+// attempt; a repeat is a stale replay. At capacity the oldest entry is evicted,
+// so a full set only fails open toward counting, never refuses a connection.
+inline constexpr std::chrono::minutes kSkewSeenRetention{30};
+inline constexpr std::size_t kSkewSeenCapacity = 65536;
+
+class SkewSeenCache {
+public:
+    // True on the first sighting within the retention, false on a repeat.
+    bool insert(const std::array<std::uint8_t, 32>& digest,
+                std::chrono::steady_clock::time_point now);
+
+private:
+    std::mutex mutex_;
     std::unordered_map<std::array<std::uint8_t, 32>, std::chrono::steady_clock::time_point,
                        ReplayHash>
         entries_;
@@ -606,7 +706,8 @@ private:
 struct SharedState {
     SharedState(std::size_t worker_count, std::size_t budget_per_worker)
         : workers(worker_count == 0 ? 1 : worker_count),
-          worker_budget(budget_per_worker) {}
+          worker_budget(budget_per_worker),
+          replay(replay_capacity()) {}
 
     std::atomic<bool> stop{false};
     // Live-reloadable ME pool tunables (Runtime::set_tunables). Reactors pick
@@ -637,6 +738,7 @@ struct SharedState {
     const std::size_t workers;
     const std::size_t worker_budget;
     ReplayCache replay;
+    SkewSeenCache skew_seen;
 
     // Global admission counters. Reservations are CAS loops, so N reactors can
     // enforce one process-wide limit without a per-packet mutex.
@@ -759,7 +861,9 @@ struct Runtime::Impl {
     struct MeConn;
 
     struct Client {
-        enum class Phase : std::uint8_t { tls_hello, tls_handshake, relay, fallback };
+        // proxy_header: Config::proxy_protocol is on and the PROXY header has
+        // not been read yet; `peer` is still the front's socket address.
+        enum class Phase : std::uint8_t { proxy_header, tls_hello, tls_handshake, relay, fallback };
         enum class Route : std::uint8_t { me, direct };
         enum class DeadlineKind : std::uint8_t {
             handshake,
@@ -803,6 +907,10 @@ struct Runtime::Impl {
         bool handshake_pending{false};
         bool draining{false};
         bool budget_paused{false};
+        // Set when the budget paused this client's reads before its handshake
+        // finished; a handshake timeout is then the proxy's stall, not the
+        // client's silence.
+        bool handshake_budget_stalled{false};
         bool in_me_queue{false};
         bool conn_registered{false};
         bool deferred{false};
@@ -831,6 +939,11 @@ struct Runtime::Impl {
         bool rate_pause_c2s{false};
         bool rate_pause_s2c{false};
         bool rate_listed{false};
+        // Upstream (client->server) backpressure: direct_out (Direct) or the
+        // undelivered c2s backlog (ME) passed its high watermark, so client
+        // reads stop (EPOLLIN removed) until flush_direct()/pump_c2s() drains
+        // it to the low watermark. See update_c2s_backpressure().
+        bool c2s_backpressured{false};
         // Raw-TLS fallback pair state (phase == fallback). `out` is the
         // backend->client queue; c2b is client->backend.
         io::UniqueFd backend;
@@ -873,6 +986,10 @@ struct Runtime::Impl {
         detail::DirectFlushGate direct_flush;
         std::unique_ptr<protocol::crypto::AesCtr> direct_encrypt;
         std::unique_ptr<protocol::crypto::AesCtr> direct_decrypt;
+        // SOCKS5 upstream handshakes of the Direct DC and masking sockets;
+        // the socket counts as connecting until they are Done.
+        std::unique_ptr<protocol::Socks5Client> direct_socks;
+        std::unique_ptr<protocol::Socks5Client> backend_socks;
 
         bool ip_counted{false};
         detail::IpKey ip_key{};
@@ -902,6 +1019,13 @@ struct Runtime::Impl {
         detail::SynPrint syn;           // from TCP_SAVED_SYN at accept
         // Config::watch_ips: this connection is logged stage by stage.
         bool watched{false};
+        // PROXY protocol LOCAL/UNKNOWN: `peer` is the front itself, not a
+        // client, so it is never scored as a suspect.
+        bool front_peer{false};
+        // The user's own ad tag (UserPolicy::ad_tag) for RPC_PROXY_REQ; the
+        // global one when unset. Reloaded with the user snapshot.
+        bool has_ad_tag{false};
+        protocol::AdTag ad_tag{};
         // Suspect detection (suspects.cpp): connection timeline and what the
         // first MTProto frames looked like.
         Time accepted_at{};
@@ -941,6 +1065,11 @@ struct Runtime::Impl {
         std::uint64_t token{0};
         io::UniqueFd fd;
         State state{State::idle};
+        // SOCKS5 upstream of this attempt; while it is not Done the state stays
+        // connecting. `target` is the ME endpoint itself (the socket peer is
+        // the proxy), used as the server address of the key derivation.
+        std::unique_ptr<protocol::Socks5Client> socks;
+        protocol::Endpoint target{};
         std::size_t candidate{0};
         std::size_t attempt{0};
         Time next_attempt{};
@@ -1119,6 +1248,12 @@ struct Runtime::Impl {
     // Budget
     // ------------------------------------------------------------------
     bool budget_allows(std::size_t extra) const;
+    // Counts one budget refusal locally (for the periodic log line) and in the
+    // process-wide statistics.
+    void note_budget_refusal(control::BudgetRefusal kind);
+    // At most once per kBudgetLogInterval: one stderr line naming the stalled
+    // paths when this reactor's budget refused work since the previous line.
+    void log_budget_pressure(Time now);
     void reaccount(Client& client);
     void reaccount(MeConn& me);
     void reaccount_shared();
@@ -1134,6 +1269,8 @@ struct Runtime::Impl {
     void apply_user_snapshot(bool initial);
     // Per-user policy runtime (src/runtime/policy.cpp).
     void load_client_rates(Client& client, const control::UserRecord& user);
+    // Client::ad_tag from UserPolicy::ad_tag (live: called again on reload).
+    void load_client_ad_tag(Client& client, const control::UserRecord& user) noexcept;
     void charge_rate(Client& client, control::Direction direction, std::uint64_t bytes,
                      Time now);
     void process_rate_resumes(Time now);
@@ -1161,14 +1298,27 @@ struct Runtime::Impl {
     void handle_client(Client& client, std::uint32_t events, Time now);
     void read_client(Client& client, Time now);
     void consume_client_bytes(Client& client, std::span<const std::uint8_t> wire, Time now);
+    // Phase::proxy_header: parses client.hello as a PROXY header; once it is
+    // complete, adopts its source address and continues with the bytes after
+    // it as the start of the ClientHello.
+    void consume_proxy_header(Client& client, Time now);
+    // Classifies the buffered client.hello (Phase::tls_hello).
+    void classify_client_hello(Client& client, Time now);
+    // Peer-dependent admission work (watch_ips, suspects), run at accept or,
+    // with PROXY protocol, once the header named the client.
+    void admit_client_peer(Client& client, Time now);
     void process_client_hello(Client& client, Time now);
     void refresh_personal_domains();
     /// The configured domain (global first, then personal) that covers `sni`
     /// (equal or a subdomain); empty when the name is not ours.
     std::string domain_for_sni(std::string_view sni);
+    /// False with `clock_skew` set (server clock - client timestamp, seconds)
+    /// and `user` = the matched user when the secret matched but the
+    /// timestamp is outside the window; false with both untouched otherwise.
     bool authenticate_hello(Client& client, std::span<const std::uint8_t> record,
                             Time now, protocol::ClientHelloInfo& info,
-                            const control::UserRecord*& user);
+                            const control::UserRecord*& user,
+                            std::optional<std::int64_t>& clock_skew);
     void begin_client_tls(Client& client, const control::UserRecord& user,
                           protocol::ClientHelloInfo&& info, std::span<const std::uint8_t> record,
                           Time now);
@@ -1179,6 +1329,7 @@ struct Runtime::Impl {
                           bool rearm_interest = true);
     bool client_wants_write(const Client& client) const noexcept;
     void pump_c2s(Client& client, Time now);
+    void update_c2s_backpressure(Client& client);
     // Direct Telegram DC route (opt-in, authenticated clients only).
     bool direct_route_enabled(std::int16_t dc) const noexcept;
     bool start_direct(Client& client, std::int16_t dc, Time now);
@@ -1255,8 +1406,12 @@ struct Runtime::Impl {
     void defer_close_conn(const detail::ConnId& id);
     bool fallback_enabled() const noexcept;
     bool masking_enabled() const noexcept;  // automatic SNI masking for probes
-    std::string ensure_fallback_address(Time now, std::string_view host);
-    bool start_fallback(Client& client, std::span<const std::uint8_t> prefetched, Time now);
+    // Literal host, else its cached address or empty (never resolves).
+    std::string fallback_address(std::string_view host);
+    // `prefetched` is queued to the backend verbatim; `client_hello` (the
+    // reassembled ClientHello, when it differs) selects the SNI target.
+    bool start_fallback(Client& client, std::span<const std::uint8_t> prefetched, Time now,
+                        std::span<const std::uint8_t> client_hello = {});
     void handle_fallback_client(Client& client, std::uint32_t events, Time now);
     void handle_fallback_backend(Client& client, std::uint32_t events, Time now);
     void read_fallback_client(Client& client, Time now);
@@ -1353,6 +1508,26 @@ struct Runtime::Impl {
     static std::optional<protocol::Endpoint>
     to_protocol_endpoint(const io::Endpoint& endpoint);
 
+    // Outbound upstreams (Config::upstreams, src/runtime/upstream.cpp).
+    struct Dialed {
+        io::FdResult connected;
+        // Set for a SOCKS5 upstream: run socks_start()/socks_read() once the
+        // TCP connect to the proxy completed.
+        std::unique_ptr<protocol::Socks5Client> socks;
+        const UpstreamConfig* upstream{nullptr};  // nullptr: plain direct
+    };
+    // Weighted pick among the upstreams of `scope`; nullptr when none are
+    // configured.
+    const UpstreamConfig* pick_upstream(std::string_view scope);
+    // Starts a non-blocking connect to numeric host:port through an upstream
+    // of `scope`.
+    Dialed dial(std::string_view scope, const std::string& host, std::uint16_t port);
+    enum class SocksProgress : std::uint8_t { pending, done, failed };
+    // Sends the greeting on a connected socket; then wait for EPOLLIN.
+    SocksProgress socks_start(int fd, protocol::Socks5Client& socks);
+    // Reads exactly what the handshake needs and answers it.
+    SocksProgress socks_read(int fd, protocol::Socks5Client& socks);
+
     // ------------------------------------------------------------------
     // State
     // ------------------------------------------------------------------
@@ -1386,11 +1561,10 @@ struct Runtime::Impl {
     std::vector<Client*> free_clients_;
     std::size_t client_pool_limit_{0};
     std::map<std::int16_t, DcPool> me_pool_;
-    // Masking-target DNS cache keyed by hostname; refreshed on probe when
-    // older than kFallbackResolveTtl. Literal IPs bypass it entirely.
-    std::string fallback_cache_host_;
-    std::string fallback_address_;
-    Time fallback_resolved_at_{};
+    // Masking-target DNS cache, owned by RuntimeState (null for a reactor
+    // built without one: hostname targets then never resolve). Literal IPs
+    // bypass it entirely.
+    detail::MaskingResolver* masking_dns_{nullptr};
     // Stable identity for deferred failures and deadline/target lookups. Raw
     // pointers are valid while the owning DcPool holds the connection.
     std::unordered_map<std::uint64_t, MeConn*> me_by_token_;
@@ -1403,6 +1577,7 @@ struct Runtime::Impl {
     std::size_t accept_burst_{1};
     Time next_device_prune_{};
     std::vector<detail::WatchNet> watch_;
+    std::vector<detail::WatchNet> proxy_allow_;  // Config::proxy_protocol_allow
     // sweep_user_policy(): users with an expiry or quota, by name, valid for
     // policy_index_snapshot_ (held so the record pointers stay valid).
     std::shared_ptr<const control::UserSnapshot> policy_index_snapshot_;
@@ -1463,6 +1638,14 @@ struct Runtime::Impl {
 
     Time next_poll_{};
     Time next_gauge_{};
+    // Budget refusals of this reactor, and the values already reported by
+    // log_budget_pressure(). Indexed by control::BudgetRefusal.
+    std::array<std::uint64_t, control::kBudgetRefusalKinds> budget_refusals_{};
+    std::array<std::uint64_t, control::kBudgetRefusalKinds> budget_refusals_logged_{};
+    std::uint64_t budget_handshake_stalls_{0};
+    std::uint64_t budget_handshake_stalls_logged_{0};
+    Time next_budget_log_{};
+    bool accept_budget_paused_{false};
     // Housekeeping lateness vs. the scheduled next_poll_ deadline. Sampled on
     // the existing 150 ms tick; published with the 1 Hz worker diagnostics.
     std::uint64_t housekeeping_lateness_ms_{0};
@@ -1524,6 +1707,8 @@ public:
     // Config::cpu_affinity: reactors pin themselves at run() (run_impl).
     bool cpu_affinity{false};
     std::shared_ptr<detail::SharedState> shared;
+    // Declared before `reactors` so it outlives them (they hold raw pointers).
+    std::unique_ptr<detail::MaskingResolver> masking_dns;
     std::vector<std::unique_ptr<Impl>> reactors;
     std::vector<std::thread> threads;
     // Quota counter persistence (no-op without Config::usage_state_path).

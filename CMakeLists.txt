@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(mtdd VERSION 0.1.0 LANGUAGES CXX)
+# Base release version (MAJOR.MINOR.PATCH); CI may release a higher patch,
+# see tools/release-version.sh.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MTDD_BASE_VERSION LIMIT_COUNT 1)
+project(mtdd VERSION ${MTDD_BASE_VERSION} LANGUAGES CXX)
+# What `mtdd --version` and mtdd_build_info report. CI sets it to the release
+# version (X.Y.Z) or to dev-<short sha>; local builds say "<base>-local".
+set(MTDD_BUILD_VERSION "${PROJECT_VERSION}-local" CACHE STRING "Version string embedded in mtdd")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,7 +68,7 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp" AND TARGET mtdd_runtime)
   add_executable(mtdd src/main.cpp)
   target_link_libraries(mtdd PRIVATE mtdd_runtime)
-  target_compile_definitions(mtdd PRIVATE MTDD_VERSION="${PROJECT_VERSION}")
+  target_compile_definitions(mtdd PRIVATE MTDD_VERSION="${MTDD_BUILD_VERSION}")
   install(TARGETS mtdd RUNTIME DESTINATION bin)
 endif()
 

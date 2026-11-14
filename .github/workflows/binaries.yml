@@ -1,4 +1,11 @@
-name: Build channel binaries
+name: Build and release
+
+# Every push to main or dev that passes the tests is published:
+#   main -> a NEW immutable release vMAJOR.MINOR.PATCH, always higher than the
+#           last one, marked Latest; a published version is never replaced
+#   dev  -> the single prerelease channel-dev, re-uploaded on every build;
+#           the binary reports dev-<short sha>
+# Version rules: tools/release-version.sh.
 
 on:
   push:
@@ -9,7 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: binary-${{ github.ref }}
+  # One release at a time per branch: version numbers are assigned in order.
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -28,19 +36,45 @@ jobs:
           cmake --build build -j4
           ctest --test-dir build --output-on-failure
           MTDD_INSTALLER_INTEGRATION_BINARY=build/mtdd python3 -m unittest discover -s tests/unit -p 'installer_test.py'
-  binary:
+          python3 -m unittest discover -s tests/unit -p 'release_version_test.py'
+
+  release:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     needs: test
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # all tags and history: version and release notes
+      - name: Resolve version
+        id: release
+        run: |
+          info=$(tools/release-version.sh "$CHANNEL")
+          printf '%s\n' "$info" | tee -a "$GITHUB_OUTPUT"
+          [[ $CHANNEL == main ]] || exit 0
+          tag=$(printf '%s\n' "$info" | sed -n 's/^tag=//p')
+          state=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          case $state in
+            true)
+              # A draft is a publish that failed half-way; it was never visible.
+              gh release delete "$tag" --yes ;;
+            false)
+              echo "Release $tag is already published; nothing to do."
+              echo 'existing=1' >>"$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Install build dependencies
+        if: steps.release.outputs.existing != '1'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config curl xz-utils python3 file binutils ca-certificates nlohmann-json3-dev
       - name: Install pinned JSON header
+        if: steps.release.outputs.existing != '1'
         run: |
           curl -fsSL --retry 3 https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp -o "$RUNNER_TEMP/json.hpp"
           curl -fsSL --retry 3 https://github.com/nlohmann/json/releases/download/v3.12.0/json_fwd.hpp -o "$RUNNER_TEMP/json_fwd.hpp"
@@ -49,15 +83,18 @@ jobs:
           sudo install -m 0644 "$RUNNER_TEMP/json.hpp" /usr/include/nlohmann/json.hpp
           sudo install -m 0644 "$RUNNER_TEMP/json_fwd.hpp" /usr/include/nlohmann/json_fwd.hpp
       - name: Restore cached toolchain and dependencies
+        if: steps.release.outputs.existing != '1'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/mtdd-static
           key: static-musl-v1-${{ hashFiles('tools/build-static.sh') }}
           restore-keys: static-musl-v1-
       - name: Build and verify static binary
+        if: steps.release.outputs.existing != '1'
         env:
           MTDD_STATIC_ROOT: ${{ runner.temp }}/mtdd-static
           MTDD_STATIC_MIRROR: https://github.com/${{ github.repository }}/releases/download/static-tools
+          MTDD_BUILD_VERSION: ${{ steps.release.outputs.version }}
         run: |
           if ! tools/build-static.sh --jobs 4; then
             ls -la "$MTDD_STATIC_ROOT"/logs/ 2>/dev/null || true
@@ -70,31 +107,67 @@ jobs:
             exit 1
           fi
       - name: Prune static tree before cache save
+        if: steps.release.outputs.existing != '1'
         env:
           MTDD_STATIC_ROOT: ${{ runner.temp }}/mtdd-static
         run: rm -rf "$MTDD_STATIC_ROOT/src" "$MTDD_STATIC_ROOT/build"
       - name: Package binary and checksum
+        if: steps.release.outputs.existing != '1'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
           mkdir -p dist
           cp build-static/mtdd dist/mtdd-linux-x86_64
+          reported=$(dist/mtdd-linux-x86_64 --version)
+          [[ $reported == "mtdd $VERSION" ]] || { echo "binary reports '$reported', expected 'mtdd $VERSION'"; exit 1; }
           cd dist
           sha256sum mtdd-linux-x86_64 > SHA256SUMS
       - uses: actions/upload-artifact@v4
+        if: steps.release.outputs.existing != '1'
         with:
-          name: mtdd-${{ github.ref_name }}-linux-x86_64
+          name: mtdd-${{ steps.release.outputs.version }}-linux-x86_64
           path: dist/*
           if-no-files-found: error
-      - name: Publish channel release
+      - name: Publish dev channel
+        if: env.CHANNEL == 'dev'
         env:
-          GH_TOKEN: ${{ github.token }}
-          CHANNEL: ${{ github.ref_name }}
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          tag="channel-$CHANNEL"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            args=()
-            if [[ $CHANNEL == dev ]]; then args+=(--prerelease); fi
-            gh release create "$tag" --target "$GITHUB_SHA" --title "mtdd $CHANNEL" --notes "Automated $CHANNEL channel build." "${args[@]}"
+          if ! gh release view channel-dev >/dev/null 2>&1; then
+            gh release create channel-dev --target "$GITHUB_SHA" --title "mtdd dev" \
+              --notes "Newest dev build." --prerelease --latest=false
           fi
-          gh release upload "$tag" dist/mtdd-linux-x86_64 dist/SHA256SUMS --clobber
-          printf -v notes 'Channel: %s\nCommit: %s\n' "$CHANNEL" "$GITHUB_SHA"
-          gh release edit "$tag" --notes "$notes"
+          gh release upload channel-dev dist/mtdd-linux-x86_64 dist/SHA256SUMS --clobber
+          gh release edit channel-dev --prerelease --latest=false \
+            --notes "Newest dev build: $VERSION (commit $GITHUB_SHA)."
+      - name: Write release notes
+        if: env.CHANNEL == 'main' && steps.release.outputs.existing != '1'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          PREVIOUS: ${{ steps.release.outputs.previous }}
+        run: |
+          {
+            printf 'Commit `%s`\n\n' "$GITHUB_SHA"
+            printf 'Install or update to exactly this version:\n\n'
+            printf '```\nsudo bash install.sh update --version %s\n```\n\n' "$VERSION"
+            if [[ -n $PREVIOUS ]]; then
+              printf '### Changes since %s\n\n' "$PREVIOUS"
+              git log --no-merges --format='- %s (%h)' "$PREVIOUS..$GITHUB_SHA" | head -n 200
+            else
+              printf '### Changes\n\n'
+              git log --no-merges --format='- %s (%h)' -n 30 "$GITHUB_SHA"
+            fi
+          } > notes.md
+          cat notes.md
+      - name: Publish versioned release
+        if: env.CHANNEL == 'main' && steps.release.outputs.existing != '1'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          # Created as a draft with its assets, then published in one step, so
+          # a failed upload never leaves a public release without a binary.
+          gh release create "$TAG" dist/mtdd-linux-x86_64 dist/SHA256SUMS \
+            --draft --target "$GITHUB_SHA" --title "mtdd $VERSION" --notes-file notes.md
+          gh release edit "$TAG" --draft=false --latest
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

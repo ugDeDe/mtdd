@@ -193,22 +193,25 @@ bool Runtime::Impl::start_direct(Client& client, std::int16_t dc, Time now) {
 
     client.direct_token =
         add_target(Target{Kind::direct_backend, nullptr, client.token});
-    auto connected = io::connect_tcp(host, port);
+    auto dialed = dial({}, host, port);
+    auto connected = std::move(dialed.connected);
     if (!connected.ok()) {
         ++direct_connect_fail_[dc];
         close_client(client.token);
         return false;
     }
     client.direct_fd = std::move(connected.fd);
+    client.direct_socks = std::move(dialed.socks);
     // Small MTProto records: Nagle adds avoidable latency on the opt-in Direct
     // route too. Advisory only (errors are ignored, documented Linux target).
     (void)io::set_tcp_nodelay(client.direct_fd.get());
-    client.direct_connecting = connected.in_progress;
+    // A SOCKS5 handshake keeps the socket "connecting" after the TCP connect.
+    client.direct_connecting = connected.in_progress || client.direct_socks != nullptr;
     client.last_activity = now;
     deadlines_.set(client.direct_token, now + config_.handshake_timeout);
     reaccount(client);
     update_direct_interest(client);
-    if (client.direct_connecting) return true;
+    if (connected.in_progress) return true;
     on_direct_connected(client, now);
     return clients_.find(client.token) != clients_.end();
 }
@@ -217,7 +220,7 @@ void Runtime::Impl::update_direct_interest(Client& client) {
     if (client.direct_token == 0 || !client.direct_fd.valid()) return;
     std::uint32_t desired = 0;
     if (client.direct_connecting) {
-        desired |= EPOLLOUT;
+        desired |= client.direct_socks && client.direct_socks->started() ? EPOLLIN : EPOLLOUT;
     } else {
         const bool room = client.out && client.out->bytes() < client.out->max_bytes();
         if (!client.direct_eof && !client.direct_budget_paused && !client.rate_pause_s2c) {
@@ -246,6 +249,18 @@ void Runtime::Impl::on_direct_connected(Client& client, Time now) {
         close_client(client.token);
         return;
     }
+    if (client.direct_socks &&
+        client.direct_socks->status() != protocol::Socks5Client::Status::Done) {
+        // Connected to the SOCKS5 proxy; entered again once its handshake is Done.
+        if (client.direct_socks->started()) return;
+        if (socks_start(client.direct_fd.get(), *client.direct_socks) == SocksProgress::failed) {
+            ++direct_connect_fail_[client.route_dc];
+            close_client(client.token);
+            return;
+        }
+        update_direct_interest(client);
+        return;
+    }
     client.direct_connecting = false;
     deadlines_.erase(client.direct_token);
     client.last_activity = now;
@@ -263,6 +278,10 @@ void Runtime::Impl::on_direct_connected(Client& client, Time now) {
 void Runtime::Impl::flush_direct(Client& client) {
     (void)client.direct_flush.take();
     if (!client.direct_fd.valid() || !client.direct_out) return;
+    // Not before the connect (and a SOCKS5 handshake) completed: the queue is
+    // flushed by on_direct_connected(), and a byte written into a SOCKS5
+    // handshake would corrupt it.
+    if (client.direct_connecting) return;
     while (!client.direct_out->empty()) {
         const auto result = client.direct_out->flush_to(client.direct_fd.get(),
                                                         detail::kWriteBatch);
@@ -275,6 +294,8 @@ void Runtime::Impl::flush_direct(Client& client) {
         }
         if (result.status == io::FlushStatus::would_block) break;
     }
+    // The upstream drain path resumes client reads paused on direct_out.
+    if (client.c2s_backpressured) update_c2s_backpressure(client);
     update_direct_interest(client);
 }
 
@@ -390,6 +411,17 @@ void Runtime::Impl::handle_direct_backend(Client& client, std::uint32_t events, 
         return;
     }
     if (client.direct_connecting) {
+        if (client.direct_socks && client.direct_socks->started()) {
+            if ((events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) == 0) return;
+            const auto progress = socks_read(client.direct_fd.get(), *client.direct_socks);
+            if (progress == SocksProgress::failed) {
+                ++direct_connect_fail_[client.route_dc];
+                close_client(client.token);
+            } else if (progress == SocksProgress::done) {
+                on_direct_connected(client, now);
+            }
+            return;
+        }
         if ((events & (EPOLLOUT | EPOLLHUP)) != 0) on_direct_connected(client, now);
         return;
     }

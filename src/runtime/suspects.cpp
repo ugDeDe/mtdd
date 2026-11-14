@@ -390,6 +390,9 @@ std::int64_t suspect_unix_now() {
 
 void Runtime::Impl::suspect(Client& client, control::SuspectSignal signal, std::string_view sni) {
     if (!config_.suspects) return;
+    // Behind PROXY protocol: before the header, or for a LOCAL/UNKNOWN header,
+    // `peer` is the front itself, never a client to score.
+    if (client.phase == Client::Phase::proxy_header || client.front_peer) return;
     stats_.suspect_event(signal);
     detail::SuspectTable::Context context;
     context.peer = &client.peer;

@@ -974,7 +974,7 @@ TEST(Runtime, FallbackPreservesUnauthenticatedClientHelloAndTail) {
         [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
 }
 
-TEST(Runtime, FallbackReplayStaysClosedAndNeverConnectsBackend) {
+TEST(Runtime, FallbackReplayIsMaskedVerbatim) {
     EchoBackend echo;
     Daemon daemon(1, false, [&](mtdd::Config& config) { config.fallback_port = echo.port(); });
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
@@ -984,8 +984,12 @@ TEST(Runtime, FallbackReplayStaysClosedAndNeverConnectsBackend) {
     TestClient replay(daemon.port(), secret_bytes());
     ASSERT_TRUE(replay.valid());
     ASSERT_TRUE(replay.send_hello_bytes(first.hello_bytes()));
-    EXPECT_TRUE(replay.wait_closed_for(2000));
-    EXPECT_EQ(echo.accepted(), 0U);
+    // A replay is masked like any unauthenticated visitor: the backend gets
+    // the hello verbatim, no ServerHello is produced.
+    Bytes echoed(first.hello_bytes().size());
+    EXPECT_TRUE(recv_exact(replay.fd(), echoed.data(), echoed.size(), 2000));
+    EXPECT_EQ(echoed, first.hello_bytes());
+    EXPECT_GE(echo.accepted(), 1U);
     EXPECT_GE(stat_counter(daemon.services.stats, "handshakes", "replay"), 1U);
     first.close();
 }

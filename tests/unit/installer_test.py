@@ -76,6 +76,64 @@ class InstallerTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.root / "installed").read_bytes(), b"previous")
 
+    def publish(self, directory, binary):
+        release = self.root / directory
+        release.mkdir()
+        (release / "mtdd-linux-x86_64").write_bytes(binary)
+        (release / "SHA256SUMS").write_text(
+            f"{hashlib.sha256(binary).hexdigest()}  mtdd-linux-x86_64\n")
+
+    def test_main_installs_the_latest_release(self):
+        binary = b"#!/bin/sh\necho latest\n"
+        self.publish("latest", binary)
+        result = self.run_installer("--branch", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "installed").read_bytes(), binary)
+
+    def sh(self, body):
+        env = os.environ.copy()
+        env["MTDD_INSTALLER_SOURCE_ONLY"] = "1"
+        return subprocess.run(["bash", "-c", f'set -Eeuo pipefail; source "{INSTALLER}"; {body}'],
+                              text=True, capture_output=True, env=env, timeout=20)
+
+    def test_default_main_url_is_github_latest(self):
+        r = self.sh('repo=a/b channel=main release_version=; base_url=; init_base_url; release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/latest/download")
+        r = self.sh('repo=a/b channel=dev release_version=; base_url=; init_base_url; release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/download/channel-dev")
+        r = self.sh('repo=a/b channel=main release_version=v1.2.3; base_url=; init_base_url; '
+                    'release_url')
+        self.assertEqual(r.stdout, "https://github.com/a/b/releases/download/v1.2.3")
+
+    def test_version_pins_an_immutable_main_release(self):
+        for requested, directory in (("1.2.3", "v1.2.3"), ("v1.2.4", "v1.2.4")):
+            with self.subTest(requested=requested):
+                binary = f"#!/bin/sh\necho {directory}\n".encode()
+                self.publish(directory, binary)
+                result = self.run_installer("--branch", "main", "--version", requested)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.root / "installed").read_bytes(), binary)
+                self.assertIn(directory, result.stdout)
+
+    def test_missing_version_fails_without_touching_the_binary(self):
+        (self.root / "installed").write_bytes(b"previous")
+        result = self.run_installer("--branch", "main", "--version", "9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.root / "installed").read_bytes(), b"previous")
+
+    def test_malformed_version_or_dev_version_is_rejected(self):
+        for args in (("--branch", "main", "--version", "1.2"),
+                     ("--branch", "main", "--version", "latest"),
+                     ("--branch", "main", "--version", "dev-1a2b3c4"),
+                     ("--branch", "main", "--version", "../channel-dev"),
+                     ("--branch", "main", "--version", "1.2.3; id"),
+                     ("--branch", "dev", "--version", "1.2.3")):
+            with self.subTest(args=args):
+                result = self.run_installer(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--version", result.stderr)
+                self.assertFalse((self.root / "installed").exists())
+
     def test_invalid_branch_is_rejected(self):
         result = self.run_installer("--branch", "other")
         self.assertNotEqual(result.returncode, 0)
@@ -85,7 +143,7 @@ class InstallerTest(unittest.TestCase):
         result = subprocess.run(["bash", str(INSTALLER), "--help"],
                                 text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        for option in ("--branch", "--domain", "--ad-tag", "--public-host",
+        for option in ("--branch", "--version", "--domain", "--ad-tag", "--public-host",
                        "--public-port", "--binary-only"):
             self.assertIn(option, result.stdout)
 
@@ -220,7 +278,11 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --public-host proxy.example.org --public-port 443
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL" --domain ignored.example --port 14444
-python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; d["me_connections_per_dc"]=20; open(p,"w").write(json.dumps(d))'
+python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; d["me_connections_per_dc"]=20; ram=next(int(l.split()[1])*1024 for l in open("/proc/meminfo") if l.startswith("MemTotal:")); d["global_buffer_bytes"]=max(64<<20, min(ram//4, 1<<30)); open(p,"w").write(json.dumps(d))'
+bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
+  --base-url "$MTDD_TEST_URL"
+cp /etc/mtdd/config.json /etc/mtdd/config.after-legacy.json
+python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); d["global_buffer_bytes"]=3<<30; open(p,"w").write(json.dumps(d))'
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL"
 '''
@@ -245,8 +307,11 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
         self.assertEqual((sandbox / "etc/mtdd/credentials.env").stat().st_mode & 0o777, 0o600)
         self.assertTrue((sandbox / "etc/systemd/system/mtdd.service").exists())
         # Capacity defaults: filled when absent, never overriding an operator.
-        self.assertGreaterEqual(config["global_buffer_bytes"], 64 << 20)
-        self.assertLessEqual(config["global_buffer_bytes"], 1 << 30)
+        # The budget is sized by the binary: a value an older installer wrote
+        # (a quarter of RAM capped at 1 GiB) is dropped, an explicit one kept.
+        legacy = json.loads((sandbox / "etc/mtdd/config.after-legacy.json").read_text())
+        self.assertNotIn("global_buffer_bytes", legacy)
+        self.assertEqual(config["global_buffer_bytes"], 3 << 30)
         self.assertEqual(config["me_connections_per_dc"], 20,
                          "an operator's explicit value must survive the update")
         unit = (sandbox / "etc/systemd/system/mtdd.service").read_text()
@@ -888,6 +953,13 @@ class UserPolicyTest(PolicyShellCase):
         for raw in ("0", "1000001", "-1", "1.5", "x"):
             with self.subTest(raw=raw):
                 self.assertRejected("max_devices", raw)
+
+    def test_ad_tag_is_lowercased_hex(self):
+        self.assertBody("ad_tag", "00112233445566778899AABBCCDDEEFF", "00112233445566778899aabbccddeeff")
+        self.assertBody("ad_tag", "none", None)
+        for raw in ("0" * 32, "0011", "zz112233445566778899aabbccddeeff", "0" * 31 + "1" + "0"):
+            with self.subTest(raw=raw):
+                self.assertRejected("ad_tag", raw, "ad_tag")
 
     def test_expiry_date_becomes_end_of_day_utc(self):
         self.assertBody("expires_at", "2030-01-01", "2030-01-01T23:59:59Z")

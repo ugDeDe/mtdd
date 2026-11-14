@@ -40,6 +40,7 @@ namespace {
 using namespace std::chrono_literals;
 using mtdd::control::ApiMethod;
 using mtdd::control::ApiRoute;
+using mtdd::control::BudgetRefusal;
 using mtdd::control::BufferState;
 using mtdd::control::ControlServer;
 using mtdd::control::CreateUserRequest;

@@ -23,6 +23,7 @@ readonly MTDD_NETTUNE_SERVICE=mtdd-nettune.service
 repo=${MTDD_REPOSITORY:-ugDeDe/mtdd}
 channel=main
 channel_set=0
+release_version=  # --version X.Y.Z: этот релиз main вместо последнего
 domain=
 ad_tag=
 proxy_port=443
@@ -194,7 +195,7 @@ mtdd — установка и управление MTProto-прокси
   users rotate ИМЯ                Заменить секрет и показать новую ссылку
   users show ИМЯ                  Политики и статистика пользователя
   users devices ИМЯ               Устройства: платформа, DC, IP, подключено ли
-  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости/устройств, canary, заметка (none — снять)
+  users set ИМЯ ПОЛЕ ЗНАЧЕНИЕ     Срок, квота, лимиты IP/скорости/устройств, canary, заметка, ad_tag (none — снять)
   users reset-quota ИМЯ           Сбросить использованную квоту
   users audit [N]                 Последние N событий журнала аудита
   links [ИМЯ]                     Ссылки подключения (все или одного)
@@ -207,14 +208,15 @@ mtdd — установка и управление MTProto-прокси
   metrics all|ФИЛЬТР              Сырые метрики Prometheus (по умолчанию mtdd_)
   host АДРЕС [ПОРТ]               Сменить публичный адрес ссылок и перезапустить
   check-config                    Проверить конфигурацию бинарником
-  update [--branch main|dev]      Обновить бинарник (то же, что повторная установка)
+  update [--branch main|dev] [--version X.Y.Z]
+                                  Обновить бинарник (то же, что повторная установка)
   uninstall [--yes]               Удалить прокси с сервера
   menu                            Меню управления
 
 Настройка новой установки:
 
   --domain HOST           Домен маскировки FakeTLS
-  --ad-tag HEX            Ненулевой рекламный тег Telegram (32 hex)
+  --ad-tag HEX            Рекламный тег Telegram (32 hex), необязателен
   --port PORT             Порт прокси (по умолчанию 443)
   --user NAME             Первый пользователь (по умолчанию admin)
   --public-host HOST      Внешний IP или DNS (по умолчанию автоопределение)
@@ -223,6 +225,7 @@ mtdd — установка и управление MTProto-прокси
 Сборка и режим работы:
 
   --branch main|dev       Канал бинарника (по умолчанию main)
+  --version X.Y.Z         Конкретный релиз main вместо последнего (откат, фиксация)
   --binary-only           Скачать бинарник без установки службы
   --output PATH           Путь для --binary-only
   --repo OWNER/REPO       Репозиторий релизов (по умолчанию ugDeDe/mtdd)
@@ -240,10 +243,11 @@ SUBCOMMANDS=" status service start stop restart logs users links suspects rotate
 positional=()
 while (($#)); do
     case $1 in
-        --repo|--branch|--domain|--ad-tag|--port|--public-host|--public-port|--user|--output|--base-url)
+        --repo|--branch|--version|--domain|--ad-tag|--port|--public-host|--public-port|--user|--output|--base-url)
             (($# >= 2)) || die "Не указано значение для $1"
             case $1 in
-                --repo) repo=$2 ;; --branch) channel=$2; channel_set=1 ;; --domain) domain=$2 ;;
+                --repo) repo=$2 ;; --branch) channel=$2; channel_set=1 ;; --version) release_version=$2 ;;
+                --domain) domain=$2 ;;
                 --ad-tag) ad_tag=$2 ;; --port) proxy_port=$2; port_set=1 ;; --user) user_name=$2; user_set=1 ;;
                 --public-host) public_host=$2 ;; --public-port) public_port=$2 ;;
                 --output) output=$2 ;; --base-url) base_url=$2 ;;
@@ -682,6 +686,13 @@ elif field == "max_devices":
         if not re.fullmatch(r"\d{1,7}", raw) or not 1 <= int(raw) <= 1000000:
             fail("Лимит устройств: целое число от 1 до 1000000 или none")
         value = int(raw)
+elif field == "ad_tag":
+    if raw.lower() in CLEAR:
+        value = None
+    else:
+        value = raw.lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", value) or set(value) == {"0"}:
+            fail("ad_tag: 32 шестнадцатеричных символа (не все нули) или none")
 elif field == "note":
     try:
         raw.encode("utf-8")
@@ -803,6 +814,7 @@ rows = [
     ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
     ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
     ("Заметка", user.get("note") or "—"),
+    ("Свой ad_tag", user.get("ad_tag") or "общий"),
     ("Соединений", str(stats.get("active_connections", 0))),
     ("Уникальных IP", str(stats.get("unique_ips_active", 0))),
     ("Устройств", "{} подключено · {} за 15 мин".format(stats.get("devices_connected", 0), stats.get("devices", 0))),
@@ -921,7 +933,7 @@ cmd_users() {
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users devices ИМЯ'; return 1; }
             cmd_users_devices "${cargs[1]}" ;;
         set)
-            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note ЗНАЧЕНИЕ'; return 1; }
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note|ad_tag ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
         reset-quota)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
@@ -2546,12 +2558,40 @@ install_launcher_copy() {
     ensure_sudo_visibility
 }
 
+# Откуда качать бинарник и SHA256SUMS:
+#   main             — последний релиз vX.Y.Z (GitHub: releases/latest);
+#   main --version   — неизменяемый релиз vX.Y.Z;
+#   dev              — релиз channel-dev, CI перезаливает его при каждой сборке.
+# Зеркало (--base-url) повторяет каталоги релизов: vX.Y.Z/, channel-dev/ и
+# latest/ — копию последнего релиза main.
+release_url() {
+    local version=$release_version
+    if [[ -n $version ]]; then
+        [[ $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            die 'Для --version укажите версию вида 1.2.3'
+        [[ $channel == main ]] || die '--version выбирает релиз main; канал dev не версионируется'
+        printf '%s/v%s' "$base_url" "${version#v}"
+    elif [[ $channel == dev ]]; then
+        printf '%s/channel-dev' "$base_url"
+    elif [[ $base_url == "https://github.com/$repo/releases/download" ]]; then
+        printf 'https://github.com/%s/releases/latest/download' "$repo"
+    else
+        printf '%s/latest' "$base_url"
+    fi
+}
+
 download_and_stage() {
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
     asset=mtdd-linux-x86_64
-    url="$base_url/channel-$channel"
-    step "Скачиваю бинарник и контрольную сумму канала $channel…"
+    url=$(release_url)
+    if [[ -n $release_version ]]; then
+        step "Скачиваю бинарник и контрольную сумму релиза v${release_version#v}…"
+    elif [[ $channel == dev ]]; then
+        step 'Скачиваю бинарник и контрольную сумму канала dev…'
+    else
+        step 'Скачиваю бинарник и контрольную сумму последнего релиза main…'
+    fi
     spin --quiet 'Скачивание бинарника' \
         curl -fsSL --retry 3 --connect-timeout 20 "$url/$asset" -o "$work/$asset" \
         || die 'Не удалось скачать бинарник; проверьте доступность release-канала'
@@ -2588,22 +2628,22 @@ run_install() {
         section 'Настройка прокси'
         step 'FakeTLS-домен — маскировка, а не адрес вашего сервера.'
         if ((needs_dialog)); then
-            has_tty || die 'Для новой установки укажите --domain и --ad-tag (либо запустите установщик в терминале)'
+            has_tty || die 'Для новой установки укажите --domain (либо запустите установщик в терминале)'
             if ((!channel_set)); then
                 printf '  Каналы: main — основной, dev — тестовый\n\n' >/dev/tty
                 prompt channel 'Канал сборки (main/dev)' "$channel"
                 [[ $channel == main || $channel == dev ]] || die 'Для --branch укажите main или dev'
             fi
             [[ -n $domain ]] || prompt domain 'Домен FakeTLS'
-            [[ -n $ad_tag ]] || prompt ad_tag 'Рекламный тег Telegram (32 hex)'
+            # Рекламный тег необязателен: пусто — прокси без спонсорского канала.
+            [[ -n $ad_tag ]] || prompt ad_tag 'Рекламный тег Telegram (32 hex, Enter — пропустить)' ""
             ((!port_set)) && prompt proxy_port 'TCP-порт прокси' "$proxy_port"
             ((!user_set)) && prompt user_name 'Имя первого пользователя' "$user_name"
         fi
         [[ -n $domain ]] || die 'Укажите домен FakeTLS через --domain'
-        [[ -n $ad_tag ]] || die 'Укажите рекламный тег через --ad-tag'
     fi
     if ((fresh)); then
-        [[ $ad_tag =~ ^[[:xdigit:]]{32}$ && $ad_tag != 00000000000000000000000000000000 ]] || die 'Тег должен содержать 32 hex-символа и не состоять из нулей'
+        [[ -z $ad_tag || ( $ad_tag =~ ^[[:xdigit:]]{32}$ && $ad_tag != 00000000000000000000000000000000 ) ]] || die 'Тег должен содержать 32 hex-символа и не состоять из нулей (или быть пустым)'
         valid_port "$proxy_port" || die 'Порт прокси должен быть в диапазоне 1–65535'
         [[ $user_name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die 'Имя пользователя: 1–32 символа A–Z, a–z, 0–9, _ или -'
         valid_dns_name "$domain" || die 'Неверное DNS-имя FakeTLS'
@@ -2659,7 +2699,9 @@ from pathlib import Path
 config = {"proxy_host": "0.0.0.0", "proxy_port": int(os.environ["MTDD_INSTALL_PORT"]),
           "control_host": "127.0.0.1", "control_port": 9090,
           "api_token_env": "MTDD_API_TOKEN", "tls_domain": os.environ["MTDD_INSTALL_DOMAIN"],
-          "ad_tag": os.environ["MTDD_INSTALL_TAG"], "users_path": "/var/lib/mtdd/users.json"}
+          "users_path": "/var/lib/mtdd/users.json"}
+if os.environ.get("MTDD_INSTALL_TAG"):
+    config["ad_tag"] = os.environ["MTDD_INSTALL_TAG"]
 config["public_host"] = os.environ["MTDD_PUBLIC_HOST"]
 if os.environ["MTDD_PUBLIC_PORT"]:
     config["public_port"] = int(os.environ["MTDD_PUBLIC_PORT"])
@@ -2713,15 +2755,16 @@ if os.environ['MTDD_PUBLIC_PORT']:
     config['public_port'] = int(os.environ['MTDD_PUBLIC_PORT'])
 # Capacity defaults for thousands of concurrent clients. Only missing keys are
 # filled, so an operator's explicit values survive every update. The relay
-# buffer budget scales with RAM (a quarter, 64 MiB..1 GiB): the old 64 MiB
-# default is split over the reactors and runs out at a few thousand clients,
-# which pauses the shared ME reads and stalls everyone.
+# buffer budget is left to the binary, which sizes it from the memory the
+# service may use (a quarter of RAM or of its cgroup limit). Earlier installers
+# wrote a quarter of RAM capped at 1 GiB; that exact value is the installer's,
+# not the operator's, so it is dropped to let the binary size it again.
 try:
     ram = next(int(l.split()[1]) * 1024 for l in open('/proc/meminfo') if l.startswith('MemTotal:'))
 except (OSError, StopIteration, ValueError):
     ram = 0
-if ram:
-    config.setdefault('global_buffer_bytes', max(64 << 20, min(ram // 4, 1 << 30)))
+if ram and config.get('global_buffer_bytes') == max(64 << 20, min(ram // 4, 1 << 30)):
+    del config['global_buffer_bytes']
 config.setdefault('me_connections_per_dc', 16)
 scoped = {'api_read_token_env': 'MTDD_API_READ_TOKEN', 'metrics_token_env': 'MTDD_METRICS_TOKEN',
           'usage_state_path': '/var/lib/mtdd/usage.json'}
@@ -3018,6 +3061,7 @@ fi
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || die 'Поддерживается только Linux x86_64'
 [[ $channel == main || $channel == dev ]] || die 'Для --branch укажите main или dev'
 init_base_url
+if [[ -n $release_version ]]; then release_url >/dev/null; fi  # формат — до любых действий
 if ((binary_only)); then
     banner 'загрузка бинарника · MTProto / FakeTLS'
     step "Скачивание бинарника · канал: $channel"
