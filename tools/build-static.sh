@@ -478,8 +478,12 @@ BIN="$COPY"
 
 if ((VERIFY)); then
     log "running binary/API checks against the static artifact"
+    # The embedded version is MTDD_BUILD_VERSION (CI sets it to the release
+    # X.Y.Z or dev-<sha>); locally it defaults to the VERSION file plus
+    # "-local". Check against whatever we actually built with, not a constant.
+    EXPECT_VERSION=${MTDD_BUILD_VERSION:-"$(head -n 1 "$REPO_ROOT/VERSION" | tr -d '[:space:]')-local"}
     VERSION_OUTPUT=$("$BIN" --version)
-    [[ $VERSION_OUTPUT == "mtdd 0.1.0" ]] || die "unexpected --version output: $VERSION_OUTPUT"
+    [[ $VERSION_OUTPUT == "mtdd $EXPECT_VERSION" ]] || die "unexpected --version output: $VERSION_OUTPUT (expected mtdd $EXPECT_VERSION)"
 
     CHECK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mtdd-static-check.XXXXXX")
     trap 'rm -rf "$CHECK_DIR"' EXIT
