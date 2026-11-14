@@ -315,9 +315,8 @@ void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
 }
 
 void Runtime::RuntimeState::set_ad_tag(const std::array<std::uint8_t, 16>& tag) {
-    if (std::all_of(tag.begin(), tag.end(), [](std::uint8_t byte) { return byte == 0; })) {
-        throw std::invalid_argument("ad_tag must not be all zero");
-    }
+    // All-zero clears the ad tag (no sponsored channel); the reactors stop
+    // emitting the TL_PROXY_TAG block on their next frames.
     {
         std::lock_guard lock(shared->ad_tag_mutex);
         shared->ad_tag = tag;

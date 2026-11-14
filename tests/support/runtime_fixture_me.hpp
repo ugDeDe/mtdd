@@ -263,14 +263,22 @@ private:
             if (payload.size() == 12 && rd32(payload, 0) == 0x1fcf425dU) {
                 continue; // per-logical RPC_CLOSE_CONN: shared transport stays up
             }
-            if (payload.size() < 84 + min_inner_) return false;
             if (rd32(payload, 0) != 0x36cef1eeU) return false;
+            // HAS_AD_TAG (0x8) decides whether the 28-byte TL_PROXY_TAG block
+            // is present: with it the inner payload starts at 84, without it
+            // (no-tag proxy) the block and its extra_size field are absent and
+            // the inner starts right after the 56-byte header.
+            const bool has_tag = (rd32(payload, 4) & 0x8U) != 0;
+            const std::size_t inner_off = has_tag ? 84 : 56;
+            if (payload.size() < inner_off + min_inner_) return false;
             ConnId frame_conn{};
             std::copy_n(payload.begin() + 8, 8, frame_conn.begin());
             std::copy_n(payload.begin() + 16, 20, observation.client_addr.begin());
             std::copy_n(payload.begin() + 36, 20, observation.our_addr.begin());
-            std::copy_n(payload.begin() + 65, 16, observation.ad_tag.begin());
-            observation.inner.assign(payload.begin() + 84, payload.end());
+            observation.ad_tag.fill(0);
+            if (has_tag) std::copy_n(payload.begin() + 65, 16, observation.ad_tag.begin());
+            observation.inner.assign(payload.begin() + static_cast<std::ptrdiff_t>(inner_off),
+                                     payload.end());
             if (require_sequence_ && !respond_each_ &&
                 observation.inner != burst_payload(data_frames)) {
                 return false;

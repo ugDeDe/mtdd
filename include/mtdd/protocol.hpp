@@ -568,7 +568,7 @@ struct MiddleEndConfig {
   // source port. The address family may differ from the transport (the wire
   // form supports IPv4-mapped and native IPv6); the port must be non-zero.
   Endpoint advertised;
-  AdTag ad_tag;                      // mandatory; always emitted in RPC_PROXY_REQ
+  AdTag ad_tag;                      // all-zero = no tag (RPC_PROXY_REQ omits the tag block)
   RandomFn random;                   // required
   ClockFn clock;                     // defaults to system time
   // RPC_HANDSHAKE process_id material (12-byte process ids, same layout as
@@ -672,7 +672,8 @@ class MiddleEndSession {
   // RPC_PING (0x5730a2df) + ping_id for connection keepalive; transport stays up.
   Status encode_ping(std::int64_t ping_id, std::vector<std::uint8_t>& to_me);
   // Replaces the ad tag carried by every later RPC_PROXY_REQ (live ad-tag
-  // override). Throws std::invalid_argument for an all-zero tag.
+  // override). An all-zero tag switches the session to no-tag (later
+  // RPC_PROXY_REQ frames omit the TL_PROXY_TAG block).
   void set_ad_tag(const AdTag& tag);
 
   State state() const;

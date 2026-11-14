@@ -2,6 +2,7 @@
 #include "mtdd/metadata.hpp"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -213,10 +214,15 @@ TEST(Config, RejectsUnknownOptionsInsteadOfSilentlyIgnoringThem) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
-TEST(Config, RequiresExplicitAdTagAndValidDomain) {
+TEST(Config, AdTagIsOptionalButValidatedWhenSet) {
+    // Absent ad_tag is allowed and means "no sponsored channel" (all-zero).
     auto value = minimal_config();
     value.erase("ad_tag");
-    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    const auto no_tag = mtdd::Config::parse(value, "/work");
+    EXPECT_TRUE(std::all_of(no_tag.ad_tag.begin(), no_tag.ad_tag.end(),
+                            [](auto b) { return b == 0; }));
+    EXPECT_FALSE(no_tag.public_view()["ad_tag_set"].get<bool>());
+    // When present it must be 32 hex characters and not all zero.
     value = minimal_config();
     value["ad_tag"] = "bad";
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);

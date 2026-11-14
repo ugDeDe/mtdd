@@ -225,10 +225,6 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
             throw std::invalid_argument("proxy_protocol requires a non-empty proxy_protocol_allow");
         }
     }
-    if (std::all_of(config_.ad_tag.begin(), config_.ad_tag.end(),
-                    [](std::uint8_t byte) { return byte == 0; })) {
-        throw std::invalid_argument("runtime requires a non-zero 16-byte ad tag");
-    }
     if (config_.handshake_timeout.count() <= 0 || config_.shutdown_timeout.count() <= 0) {
         throw std::invalid_argument("runtime timeouts must be positive");
     }

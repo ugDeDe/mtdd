@@ -445,12 +445,18 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         throw std::invalid_argument("me_nat_ip must be a specific numeric IP address");
     config.tls_domain = text(value, "tls_domain", "");
     if (!valid_domain(config.tls_domain)) throw std::invalid_argument("tls_domain must be a DNS hostname");
-    const auto tag = text(value, "ad_tag", "");
-    if (tag.size() != 32) throw std::invalid_argument("ad_tag is required and must have 32 hexadecimal characters");
-    for (std::size_t i{}; i < config.ad_tag.size(); ++i)
-        config.ad_tag[i] = static_cast<std::uint8_t>((hex_digit(tag[i * 2]) << 4) | hex_digit(tag[i * 2 + 1]));
-    if (std::all_of(config.ad_tag.begin(), config.ad_tag.end(), [](auto byte) { return byte == 0; }))
-        throw std::invalid_argument("ad_tag must not be all zero");
+    // ad_tag is optional: absent (or an all-zero value) means the proxy runs
+    // without a sponsored channel, and RPC_PROXY_REQ omits the tag block. When
+    // present it must be 32 hexadecimal characters and not all zero.
+    config.ad_tag.fill(0);
+    if (value.contains("ad_tag")) {
+        const auto tag = text(value, "ad_tag", "");
+        if (tag.size() != 32) throw std::invalid_argument("ad_tag must have 32 hexadecimal characters");
+        for (std::size_t i{}; i < config.ad_tag.size(); ++i)
+            config.ad_tag[i] = static_cast<std::uint8_t>((hex_digit(tag[i * 2]) << 4) | hex_digit(tag[i * 2 + 1]));
+        if (std::all_of(config.ad_tag.begin(), config.ad_tag.end(), [](auto byte) { return byte == 0; }))
+            throw std::invalid_argument("ad_tag must not be all zero when set");
+    }
     config.users_path = resolve(base, text(value, "users_path", "users.json"));
     if (value.contains("me_config_path")) config.me_config_path = resolve(base, text(value, "me_config_path", ""));
     if (value.contains("me_secret_path")) config.me_secret_path = resolve(base, text(value, "me_secret_path", ""));

@@ -216,7 +216,7 @@ mtdd — установка и управление MTProto-прокси
 Настройка новой установки:
 
   --domain HOST           Домен маскировки FakeTLS
-  --ad-tag HEX            Ненулевой рекламный тег Telegram (32 hex)
+  --ad-tag HEX            Рекламный тег Telegram (32 hex), необязателен
   --port PORT             Порт прокси (по умолчанию 443)
   --user NAME             Первый пользователь (по умолчанию admin)
   --public-host HOST      Внешний IP или DNS (по умолчанию автоопределение)
@@ -2628,22 +2628,22 @@ run_install() {
         section 'Настройка прокси'
         step 'FakeTLS-домен — маскировка, а не адрес вашего сервера.'
         if ((needs_dialog)); then
-            has_tty || die 'Для новой установки укажите --domain и --ad-tag (либо запустите установщик в терминале)'
+            has_tty || die 'Для новой установки укажите --domain (либо запустите установщик в терминале)'
             if ((!channel_set)); then
                 printf '  Каналы: main — основной, dev — тестовый\n\n' >/dev/tty
                 prompt channel 'Канал сборки (main/dev)' "$channel"
                 [[ $channel == main || $channel == dev ]] || die 'Для --branch укажите main или dev'
             fi
             [[ -n $domain ]] || prompt domain 'Домен FakeTLS'
-            [[ -n $ad_tag ]] || prompt ad_tag 'Рекламный тег Telegram (32 hex)'
+            # Рекламный тег необязателен: пусто — прокси без спонсорского канала.
+            [[ -n $ad_tag ]] || prompt ad_tag 'Рекламный тег Telegram (32 hex, Enter — пропустить)' ""
             ((!port_set)) && prompt proxy_port 'TCP-порт прокси' "$proxy_port"
             ((!user_set)) && prompt user_name 'Имя первого пользователя' "$user_name"
         fi
         [[ -n $domain ]] || die 'Укажите домен FakeTLS через --domain'
-        [[ -n $ad_tag ]] || die 'Укажите рекламный тег через --ad-tag'
     fi
     if ((fresh)); then
-        [[ $ad_tag =~ ^[[:xdigit:]]{32}$ && $ad_tag != 00000000000000000000000000000000 ]] || die 'Тег должен содержать 32 hex-символа и не состоять из нулей'
+        [[ -z $ad_tag || ( $ad_tag =~ ^[[:xdigit:]]{32}$ && $ad_tag != 00000000000000000000000000000000 ) ]] || die 'Тег должен содержать 32 hex-символа и не состоять из нулей (или быть пустым)'
         valid_port "$proxy_port" || die 'Порт прокси должен быть в диапазоне 1–65535'
         [[ $user_name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die 'Имя пользователя: 1–32 символа A–Z, a–z, 0–9, _ или -'
         valid_dns_name "$domain" || die 'Неверное DNS-имя FakeTLS'
@@ -2699,7 +2699,9 @@ from pathlib import Path
 config = {"proxy_host": "0.0.0.0", "proxy_port": int(os.environ["MTDD_INSTALL_PORT"]),
           "control_host": "127.0.0.1", "control_port": 9090,
           "api_token_env": "MTDD_API_TOKEN", "tls_domain": os.environ["MTDD_INSTALL_DOMAIN"],
-          "ad_tag": os.environ["MTDD_INSTALL_TAG"], "users_path": "/var/lib/mtdd/users.json"}
+          "users_path": "/var/lib/mtdd/users.json"}
+if os.environ.get("MTDD_INSTALL_TAG"):
+    config["ad_tag"] = os.environ["MTDD_INSTALL_TAG"]
 config["public_host"] = os.environ["MTDD_PUBLIC_HOST"]
 if os.environ["MTDD_PUBLIC_PORT"]:
     config["public_port"] = int(os.environ["MTDD_PUBLIC_PORT"])
