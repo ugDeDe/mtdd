@@ -494,7 +494,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         reaccount_shared();
         return;
     }
-    client.metrics->add_payload(control::Direction::server_to_client, payload.size());
+    add_payload(client, control::Direction::server_to_client, payload.size());
     note_activity(client, payload.size());
     note_ip_payload(client, payload.size());
     // ME shares one socket across users, so s2c cannot be gated at the source.

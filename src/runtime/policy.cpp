@@ -235,6 +235,10 @@ void Runtime::Impl::sweep_user_policy(Time now) {
         const auto& policy = user->policy;
         // Quota enforcement is checked once per sweep, so a live session can
         // overshoot its quota by up to one tick of traffic; that is accepted.
+        // Payload is batched per connection (detail::PayloadBatch): this
+        // reactor's batches were flushed by the 1 Hz pass just before this
+        // sweep, other reactors' lag by at most one flush (1 s or 64 KiB per
+        // connection), so enforcement may trail the wire by that much more.
         if ((policy.expires_at && *policy.expires_at <= now_unix) ||
             (policy.data_quota_bytes &&
              client->metrics->quota_used_bytes() >= *policy.data_quota_bytes)) {

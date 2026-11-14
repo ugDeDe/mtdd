@@ -697,6 +697,8 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
                      control::HandshakeResult::failure);
         return;
     }
+    // Live connections' batched payload (detail::PayloadBatch) is not yet in
+    // this total; it trails by at most one flush per connection.
     if (user->policy.data_quota_bytes &&
         client.metrics->quota_used_bytes() >= *user->policy.data_quota_bytes) {
         reject_close(client, control::RejectReason::user_quota_exceeded,
@@ -1065,8 +1067,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             return;
         }
         if (client.metrics) {
-            client.metrics->add_payload(control::Direction::client_to_server,
-                                        plain_buffer_.size());
+            add_payload(client, control::Direction::client_to_server, plain_buffer_.size());
             note_ip_payload(client, plain_buffer_.size());
             note_activity(client, plain_buffer_.size());
             if (client.rate_up != 0) {
@@ -1087,7 +1088,21 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         return;
     }
     if (!plain_buffer_.empty() && client.phase == Client::Phase::relay) {
-        std::vector<protocol::TransportDecoder::Message> messages;
+        // Reused per-reactor scratch: no vector allocation per read event.
+        // Every exit (including the early closes below) empties it, so payloads
+        // that were not moved into client.c2s are never retained; a burst of
+        // tiny frames that grew it is released instead of pinned.
+        auto& messages = decoded_messages_;
+        struct MessagesReset {
+            std::vector<protocol::TransportDecoder::Message>& messages;
+            ~MessagesReset() {
+                messages.clear();
+                if (messages.capacity() > detail::kMessageScratchRetain) {
+                    std::vector<protocol::TransportDecoder::Message>().swap(messages);
+                }
+            }
+        } messages_reset{messages};
+        messages.clear();
         const auto decoded = client.decoder->feed(plain_buffer_, messages);
         if (decoded == protocol::Status::ProtocolError) {
             close_client(token);
@@ -1138,8 +1153,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
                 close_client(token);
                 return;
             }
-            client.metrics->add_payload(control::Direction::client_to_server,
-                                        message.data.size());
+            add_payload(client, control::Direction::client_to_server, message.data.size());
             note_ip_payload(client, message.data.size());
             note_activity(client, message.data.size());
             if (client.rate_up != 0) {

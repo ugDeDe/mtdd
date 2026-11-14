@@ -605,8 +605,9 @@ struct StatisticsSnapshot {
 };
 
 // Connection-lifetime handle. All operations are lock-free atomics; workers may
-// hold one for the lifetime of a connection and update it per accepted payload
-// without a mutex.
+// hold one for the lifetime of a connection and update it without a mutex. The
+// runtime batches payload per connection (64 KiB, the 1 Hz client pass, and
+// close), so payload totals read here trail live traffic by at most that much.
 class UserMetrics {
  public:
   void connection_opened() noexcept;
@@ -668,7 +669,10 @@ class UserMetrics {
   std::atomic<uint64_t> qualified_ips_{0};
   std::atomic<uint64_t> devices_{0};
   std::atomic<uint64_t> devices_connected_{0};
-  std::atomic<uint64_t> payload_c2s_{0};
+  // Own cache line: payload flushes from every reactor serving the user write
+  // here, and must not invalidate the connection/IP gauges above (nor the
+  // rate buckets below).
+  alignas(64) std::atomic<uint64_t> payload_c2s_{0};
   std::atomic<uint64_t> payload_s2c_{0};
   // Quota usage is (c2s + s2c) - quota_base_: the hot path pays only the
   // existing per-direction counter, and reset/restore just move the base.

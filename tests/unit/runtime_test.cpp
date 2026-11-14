@@ -247,10 +247,16 @@ TEST(Runtime, BurstIsChunkedThroughSharedMiddleEndWriter) {
     ASSERT_TRUE(client.read_message(response));
     const Bytes expected{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44};
     EXPECT_EQ(response, expected);
-    const auto snapshot = daemon.services.stats.snapshot();
-    const auto user = snapshot.users.find("alice");
-    ASSERT_NE(user, snapshot.users.end());
-    EXPECT_GE(user->second.payload_c2s_bytes, kBurstCount * kBurstSize);
+    // Per-user payload is batched per connection and published by the 1 Hz
+    // pass (or every 64 KiB), so the total may trail the reply briefly.
+    EXPECT_TRUE(wait_for(
+        [&] {
+            const auto snapshot = daemon.services.stats.snapshot();
+            const auto user = snapshot.users.find("alice");
+            return user != snapshot.users.end() &&
+                   user->second.payload_c2s_bytes >= kBurstCount * kBurstSize;
+        },
+        3s));
 }
 
 

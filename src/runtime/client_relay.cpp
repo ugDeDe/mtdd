@@ -517,6 +517,11 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     client.fd.close();
     if (client.ip_counted) decrement_client_unique_ip(client);
     set_counted_active(client, false);
+    // Every close (reject, policy sweep, error, shutdown via finalize()) runs
+    // here exactly once, before the recycle below drops `metrics`: the batched
+    // payload is added to the user's totals now, and zeroed, so it is neither
+    // lost nor counted twice.
+    flush_payload(client);
     if (client.metrics_counted && client.metrics) client.metrics->connection_closed();
     if (client.connection_counted) {
         stats_.connection_closed();

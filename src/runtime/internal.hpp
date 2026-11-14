@@ -99,6 +99,44 @@ inline constexpr std::size_t kIdleRetainedBytes = 64U * 1024U;
 // A client's coalesced ME answers are handed to its queue once they reach this
 // size even before the ME read ends, bounding the per-read staging copy.
 inline constexpr std::size_t kS2cBatchFlushBytes = 128U * 1024U;
+// Per-connection payload bytes are added to the process-wide per-user counters
+// (control::UserMetrics) in batches of this size, by the 1 Hz client pass and
+// on close, instead of one shared atomic write per frame.
+inline constexpr std::uint64_t kPayloadFlushBytes = 64U * 1024U;
+// Decoded client messages of one read event (Runtime::Impl::decoded_messages_)
+// keep at most this many slots between events.
+inline constexpr std::size_t kMessageScratchRetain = 1024;
+
+// Payload bytes a connection moved but has not yet added to its user's shared
+// UserMetrics counters. With one public secret every reactor writes the same
+// per-user atomics, so a per-frame fetch_add bounced one cache line between all
+// reactors on every frame. Totals read from UserMetrics (stats snapshots, the
+// API, quota checks, usage_state checkpoints) therefore lag the wire by at most
+// kPayloadFlushBytes per live connection or one 1 Hz pass, whichever is first;
+// a closed connection's bytes are always fully counted (close_client flushes).
+struct PayloadBatch {
+    std::uint64_t c2s{0};
+    std::uint64_t s2c{0};
+
+    // Adds `bytes`; true when the batch reached kPayloadFlushBytes and should
+    // be flushed now.
+    bool add(control::Direction direction, std::uint64_t bytes) noexcept {
+        (direction == control::Direction::client_to_server ? c2s : s2c) += bytes;
+        return c2s + s2c >= kPayloadFlushBytes;
+    }
+    bool empty() const noexcept { return c2s == 0 && s2c == 0; }
+    // Moves the pending bytes to `metrics` and zeroes the batch, so a second
+    // flush (e.g. the 1 Hz pass followed by close) never counts them twice.
+    // Without metrics the bytes are dropped, as before batching.
+    void flush(control::UserMetrics* metrics) noexcept {
+        if (metrics != nullptr) {
+            if (c2s != 0) metrics->add_payload(control::Direction::client_to_server, c2s);
+            if (s2c != 0) metrics->add_payload(control::Direction::server_to_client, s2c);
+        }
+        c2s = 0;
+        s2c = 0;
+    }
+};
 
 // Releases a worker scratch buffer that grew for one large frame.
 inline void trim_buffer(std::vector<std::uint8_t>& buffer) {
@@ -1113,6 +1151,8 @@ struct Runtime::Impl {
         std::string user_name;
         std::uint64_t generation{0};
         std::shared_ptr<control::UserMetrics> metrics;
+        // Payload not yet added to `metrics` (see detail::PayloadBatch).
+        detail::PayloadBatch payload_pending;
         detail::ConnId conn_id{};
         MeConn* me{nullptr};
         DeadlineKind deadline_kind{DeadlineKind::handshake};
@@ -1597,6 +1637,16 @@ struct Runtime::Impl {
         client.window_bytes += bytes;
         if (!client.counted_active && rate_limited(client)) set_counted_active(client, true);
     }
+    // Hot path: per-user payload accounting, batched per connection. Shared
+    // UserMetrics counters are written once per kPayloadFlushBytes, by the 1 Hz
+    // client pass (before sweep_user_policy) and by close_client.
+    static void add_payload(Client& client, control::Direction direction,
+                            std::uint64_t bytes) noexcept {
+        if (client.payload_pending.add(direction, bytes)) flush_payload(client);
+    }
+    static void flush_payload(Client& client) noexcept {
+        client.payload_pending.flush(client.metrics.get());
+    }
     void reject_close(Client& client, control::RejectReason reason,
                       std::optional<control::HandshakeResult> handshake);
     void close_client(std::uint64_t token, bool record_pending_handshake = true);
@@ -1858,6 +1908,9 @@ struct Runtime::Impl {
     std::vector<std::uint8_t> frame_buffer_;
     std::vector<std::uint8_t> wire_buffer_;
     std::vector<std::uint8_t> to_me_buffer_;
+    // Reused output of the client TransportDecoder (feed_client_tls); empty
+    // between read events.
+    std::vector<protocol::TransportDecoder::Message> decoded_messages_;
     // Reused output of encode_client_message (no allocation per request).
     std::vector<std::uint8_t> me_encode_buffer_;
     // ME connections with staged, not yet written requests (by token: a

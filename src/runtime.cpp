@@ -562,6 +562,10 @@ void Runtime::Impl::run() {
                 // re-reads its share of the user's (and media) limits.
                 for (auto& [token, client] : clients_) {
                     (void)token;
+                    // Batched per-user payload (detail::PayloadBatch): totals
+                    // lag by at most this pass; sweep_user_policy() below
+                    // reads this reactor's quota usage after the flush.
+                    flush_payload(*client);
                     if (client->counted_active && client->window_bytes == 0) {
                         set_counted_active(*client, false);
                     }

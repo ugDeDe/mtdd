@@ -402,11 +402,19 @@ TEST(Runtime, FullRelayThroughFakeMiddleEnd) {
     const Bytes expected{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44};
     EXPECT_EQ(response, expected);
 
+    // Per-user payload is batched per connection and published by the 1 Hz
+    // pass, so the totals may trail the reply briefly.
+    EXPECT_TRUE(wait_for(
+        [&] {
+            const auto current = daemon.services.stats.snapshot();
+            const auto found = current.users.find("alice");
+            return found != current.users.end() &&
+                   found->second.payload_c2s_bytes >= request.size() &&
+                   found->second.payload_s2c_bytes >= expected.size();
+        },
+        3000ms));
     const auto snapshot = daemon.services.stats.snapshot();
-    const auto user = snapshot.users.find("alice");
-    ASSERT_NE(user, snapshot.users.end());
-    EXPECT_GE(user->second.payload_c2s_bytes, request.size());
-    EXPECT_GE(user->second.payload_s2c_bytes, expected.size());
+    ASSERT_NE(snapshot.users.find("alice"), snapshot.users.end());
     ASSERT_NE(snapshot.me_dcs.find("2"), snapshot.me_dcs.end());
     EXPECT_TRUE(snapshot.me_dcs.at("2").connected);
     EXPECT_GE(snapshot.me_dcs.at("2").requests_success, 1U);
@@ -877,7 +885,13 @@ TEST(Runtime, ClientObjectsAreReusedWithoutStateBleed) {
               alice_after_close.payload_c2s_bytes);
     EXPECT_EQ(snapshot.users.at("alice").payload_s2c_bytes,
               alice_after_close.payload_s2c_bytes);
-    EXPECT_GE(snapshot.users.at("bob").payload_c2s_bytes, 16U * 1024U);
+    // bob is still connected: his batched payload shows after the 1 Hz pass.
+    EXPECT_TRUE(wait_for(
+        [&] {
+            return daemon.services.stats.snapshot().users.at("bob").payload_c2s_bytes >=
+                   16U * 1024U;
+        },
+        3000ms));
     EXPECT_EQ(snapshot.users.at("bob").unique_ips_active, 1U);
     EXPECT_EQ(snapshot.active_unique_ips, 1U);
     EXPECT_EQ(stat_counter(daemon.services.stats, "handshakes", "success"), 2U);

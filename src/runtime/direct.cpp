@@ -355,7 +355,7 @@ void Runtime::Impl::read_direct_backend(Client& client, Time now) {
                 return;
             }
             if (client.metrics) {
-                client.metrics->add_payload(control::Direction::server_to_client, bytes);
+                add_payload(client, control::Direction::server_to_client, bytes);
                 note_ip_payload(client, bytes);
                 if (client.rate_down != 0) {
                     charge_rate(client, control::Direction::server_to_client, bytes, now);
