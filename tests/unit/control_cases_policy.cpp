@@ -17,6 +17,8 @@ UserPolicy full_policy() {
   policy.canary = true;
   policy.rate_limit_up_bytes_per_sec = 1 << 20;
   policy.rate_limit_down_bytes_per_sec = 4 << 20;
+  policy.media_rate_limit_up_bytes_per_sec = 0;  // exempt is a value, not "unset"
+  policy.media_rate_limit_down_bytes_per_sec = 2 << 20;
   policy.note = "семья · laptop";
   return policy;
 }
@@ -102,6 +104,10 @@ TEST(UserPolicyStoreTest, RejectsOutOfRangeValuesWithoutMutating) {
   rejects([](UserPolicyPatch& p) { p.max_unique_ips = std::optional<uint32_t>(0); });
   rejects([](UserPolicyPatch& p) { p.max_devices = std::optional<uint32_t>(0); });
   rejects([](UserPolicyPatch& p) { p.rate_limit_up_bytes_per_sec = std::optional<uint64_t>(1023); });
+  rejects([](UserPolicyPatch& p) { p.rate_limit_up_bytes_per_sec = std::optional<uint64_t>(0); });
+  rejects([](UserPolicyPatch& p) {
+    p.media_rate_limit_down_bytes_per_sec = std::optional<uint64_t>(1023);
+  });
   rejects([](UserPolicyPatch& p) { p.expires_at = std::optional<int64_t>(-1); });
   rejects([](UserPolicyPatch& p) { p.note = std::string(257, 'x'); });
   rejects([](UserPolicyPatch& p) { p.note = std::string("line\nbreak"); });
@@ -175,6 +181,29 @@ TEST(UserPolicyHttpTest, CreatePatchAndReadPolicyFields) {
   const auto plain = h.req("POST", "/v1/users", make_user_body("bob"));
   ASSERT_EQ(plain.status, 201);
   EXPECT_TRUE(parse_json(plain)["data"]["user"]["expires_at"].is_null());
+}
+
+TEST(UserPolicyHttpTest, MediaRateLimitsAcceptZeroAsExemptAndNullAsUnset) {
+  Harness h;
+  const auto created = h.req("POST", "/v1/users",
+                             R"({"name":"alice","secret":"00112233445566778899aabbccddeeff",)"
+                             R"("media_rate_limit_down_bytes_per_sec":0,)"
+                             R"("media_rate_limit_up_bytes_per_sec":262144})");
+  ASSERT_EQ(created.status, 201) << created.body;
+  auto user = parse_json(created)["data"]["user"];
+  EXPECT_EQ(user["media_rate_limit_down_bytes_per_sec"], 0U);
+  EXPECT_EQ(user["media_rate_limit_up_bytes_per_sec"], 262144U);
+
+  const auto patched = h.req("PATCH", "/v1/users/alice",
+                             R"({"media_rate_limit_down_bytes_per_sec":null})");
+  ASSERT_EQ(patched.status, 200) << patched.body;
+  user = parse_json(patched)["data"]["user"];
+  EXPECT_TRUE(user["media_rate_limit_down_bytes_per_sec"].is_null());
+  EXPECT_EQ(user["media_rate_limit_up_bytes_per_sec"], 262144U);
+
+  const auto bad = h.req("PATCH", "/v1/users/alice",
+                         R"({"media_rate_limit_up_bytes_per_sec":512})");
+  EXPECT_EQ(bad.status, 400) << bad.body;
 }
 
 TEST(UserPolicyHttpTest, RejectsMalformedPolicyFields) {

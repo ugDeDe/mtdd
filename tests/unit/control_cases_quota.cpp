@@ -60,27 +60,6 @@ TEST(QuotaTest, PrometheusExposesQuotaGaugeAndNewRejectReasons) {
   EXPECT_EQ(snapshot.rejected_by_reason.at("user_ip_limit"), 1U);
 }
 
-TEST(QuotaTest, RateBucketAllowsBurstThenPacesAtRate) {
-  Statistics stats;
-  auto user = stats.user("alice");
-  constexpr uint64_t kRate = 1000 * 1000;  // 1 MB/s, burst = max(rate, 64 KiB)
-  EXPECT_EQ(mtdd::control::UserMetrics::rate_burst_bytes(10), 64U * 1024U);
-  EXPECT_EQ(mtdd::control::UserMetrics::rate_burst_bytes(kRate), kRate);
-  const int64_t t0 = 1'000'000'000'000;
-  // Half a second of data is within the one second burst: no pause.
-  EXPECT_EQ(user->rate_consume(Direction::client_to_server, kRate / 2, kRate, t0), 0);
-  EXPECT_EQ(user->rate_consume(Direction::client_to_server, kRate / 2, kRate, t0), 0);
-  // The next half second overdraws: resume once the debt is back at the burst.
-  const int64_t resume = user->rate_consume(Direction::client_to_server, kRate / 2, kRate, t0);
-  EXPECT_EQ(resume, t0 + 500'000'000);
-  EXPECT_EQ(user->rate_resume_at(Direction::client_to_server, kRate, t0), resume);
-  EXPECT_EQ(user->rate_resume_at(Direction::client_to_server, kRate, resume), 0);
-  // Directions are independent buckets.
-  EXPECT_EQ(user->rate_resume_at(Direction::server_to_client, kRate, t0), 0);
-  // rate 0 means unlimited.
-  EXPECT_EQ(user->rate_consume(Direction::client_to_server, 1 << 30, 0, t0), 0);
-}
-
 TEST(UsageStateTest, SerializeParseRoundTrip) {
   UsageMap usage;
   usage["alice"] = UsageRecord{123, 1700000000};

@@ -33,6 +33,46 @@ struct UpstreamConfig {
     std::vector<std::string> scopes;  // empty: the default scope
 };
 
+// One media shaping rule (config "shaping.media_download" / "media_upload").
+// It applies to media connections (signed DC < 0: file/photo/video transfers)
+// in one direction, selected by `dcs`. Rates are kbit/s, 0 = no limit.
+//   user_kbps   per proxy user, split over the user's active connections in
+//               this class (a user's media_rate_limit_* overrides it);
+//   total_kbps  process-wide, split evenly over the users active in this
+//               class first, then over each user's connections;
+//   burst_kib   bytes a connection that has been quiet may move at full speed
+//               before the rate applies (a user's burst is split over its
+//               active connections). Short transfers such as photos fit in
+//               it; long ones (video, files) settle at the rate. 0 = one
+//               second of the connection's share, at least 64 KiB.
+//   dcs         media DCs this rule covers (-1..-5); empty = every media DC.
+// Rates and burst reload with SIGHUP; a dcs change applies to new connections.
+struct MediaShapingRule {
+    std::uint64_t user_kbps{0};
+    std::uint64_t total_kbps{0};
+    std::uint64_t burst_kib{0};
+    std::vector<std::int16_t> dcs;
+    bool operator==(const MediaShapingRule&) const = default;
+};
+
+struct ShapingConfig {
+    MediaShapingRule media_download;  // Telegram -> client
+    MediaShapingRule media_upload;    // client -> Telegram
+    bool operator==(const ShapingConfig&) const = default;
+};
+
+// Parses a "shaping" object (the config key, or a PATCH /v1/shaping body).
+// Rules and fields that `value` leaves out keep their values from `base`; a
+// given "dcs" replaces the list. Throws std::invalid_argument with the
+// offending key on a bad value.
+ShapingConfig parse_shaping(const nlohmann::json& value, const ShapingConfig& base = {});
+// {"media_download": {user_kbps, total_kbps, burst_kib, dcs}, "media_upload": ...}
+nlohmann::json shaping_view(const ShapingConfig& shaping);
+
+inline constexpr std::uint64_t kMaxShapingRateKbps = 100'000'000;
+inline constexpr std::uint64_t kMinShapingBurstKib = 16;
+inline constexpr std::uint64_t kMaxShapingBurstKib = 1024 * 1024;
+
 struct Config {
     std::string proxy_host{"127.0.0.1"};
     std::uint16_t proxy_port{14443};
@@ -153,11 +193,9 @@ struct Config {
     // them a vanished mobile client holds its slot until idle_timeout.
     std::chrono::seconds client_keepalive{60};
     std::chrono::seconds client_ack_timeout{90};
-    // Media shaping for signed DC < 0 (file/photo/video downloads), kbit/s.
-    // Per proxy user across all of its media connections, and a process-wide
-    // cap. 0 disables. Reloadable with SIGHUP.
-    std::uint64_t media_user_rate_kbps{0};
-    std::uint64_t media_total_rate_kbps{0};
+    // Media shaping (see MediaShapingRule). The legacy top-level keys
+    // media_user_rate_kbps / media_total_rate_kbps fill media_download.
+    ShapingConfig shaping;
     // How long a device's auth key stays listed in the devices gauge after its
     // last connection closed. An idle key never blocks a new device.
     std::chrono::seconds device_window{900};

@@ -1259,7 +1259,7 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
 void Runtime::Impl::client_tls_ready(Client& client, Time now) {
     const auto tag = client.tls->proto_tag();
     const std::int16_t dc = client.tls->dc_id();
-    client.media = dc < 0;
+    assign_media_classes(client, dc);
     // Devices are counted per signed DC: a device holds one current auth key
     // per DC, and Android uses a separate temporary key for media DCs.
     client.device_dc = dc;
@@ -1271,8 +1271,8 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
                       " route=" + (direct_route_enabled(dc) ? "direct" : "me"));
     }
     // The share was first computed at authentication, before the DC (and so
-    // the media class) was known.
-    if (client.media) recompute_rate_share(client);
+    // the media classes) was known.
+    if (client.media[0] || client.media[1]) recompute_rate_share(client);
     if (tag != protocol::ProtoTag::Secure || dc == 0) {
         reject_close(client, control::RejectReason::auth_failed,
                      client.handshake_pending ? std::optional{control::HandshakeResult::failure}

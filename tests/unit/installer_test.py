@@ -153,7 +153,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         for token in ("status", "users add", "users remove", "users rotate",
                       "metrics", "uninstall", "menu", "mtdd-ctl", "logs",
-                      "check-config", "host"):
+                      "check-config", "host", "shaping set", "shaping reset"):
             self.assertIn(token, result.stdout)
 
     def test_unknown_command_is_rejected(self):
@@ -931,6 +931,13 @@ class UserPolicyTest(PolicyShellCase):
         self.assertRejected("rate_limit_up_bytes_per_sec", "1023", "1K")
         self.assertRejected("rate_limit_down_bytes_per_sec", "0.5K", "1K")
 
+    def test_media_rate_limits_accept_zero_as_exempt(self):
+        self.assertBody("media_rate_limit_down_bytes_per_sec", "1M", 1024 ** 2)
+        self.assertBody("media_rate_limit_up_bytes_per_sec", "0", 0)
+        self.assertBody("media_rate_limit_down_bytes_per_sec", "none", None)
+        self.assertRejected("media_rate_limit_up_bytes_per_sec", "512", "1K")
+        self.assertRejected("media_rate_limit_down_bytes_per_sec", "abc")
+
     def test_unique_ip_limit_bounds(self):
         self.assertBody("max_unique_ips", "3", 3)
         self.assertBody("max_unique_ips", "4294967295", 4294967295)
@@ -1019,7 +1026,7 @@ class UserPolicyApiTest(PolicyShellCase):
                 handler.end_headers()
                 handler.wfile.write(raw)
 
-            do_GET = do_POST = do_PATCH = handle_any
+            do_GET = do_POST = do_PATCH = do_DELETE = handle_any
 
             def log_message(handler, *_args):
                 pass
@@ -1131,6 +1138,104 @@ class UserPolicyApiTest(PolicyShellCase):
         for text in ("2030-01-01 10:00:00", "user.update", "bob", "enabled, note"):
             self.assertIn(text, result.stdout)
         self.assertNotEqual(self.sh("cmd_audit abc").returncode, 0)
+
+    def shaping_view(self, source="config"):
+        rule = {"user_kbps": 8000, "total_kbps": 0, "burst_kib": 4096, "dcs": [-2, -4]}
+        idle = {"active_users": 0, "heavy_users": 0, "light_bytes_per_sec": 0}
+        return {"ok": True, "request_id": 7, "data": {
+            "source": source,
+            "effective": {"media_download": rule, "media_upload": dict(rule, user_kbps=0, dcs=[])},
+            "configured": {"media_download": dict(rule, user_kbps=4000),
+                           "media_upload": dict(rule, user_kbps=0, dcs=[])},
+            "state": {"media_download": {"active_users": 5, "heavy_users": 2,
+                                         "light_bytes_per_sec": 3 * 1024 ** 2},
+                      "media_upload": idle}}}
+
+    def test_shaping_show_renders_rules_source_and_load(self):
+        seen = self.start_api({("GET", "/v1/shaping"): (200, self.shaping_view("api"))})
+        result = self.sh("NO_COLOR=1; cmd_shaping")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(seen[0][:2], ("GET", "/v1/shaping"))
+        for text in ("API", "8000 кбит/с", "4096 КиБ", "-2, -4", "все медиа-DC",
+                     "5 (тяжёлых 2)", "3.0 МиБ/с", "без лимита", "В конфиге", "4000 кбит/с"):
+            self.assertIn(text, result.stdout)
+
+    def test_shaping_set_sends_patch_and_reset_sends_delete(self):
+        seen = self.start_api({})
+        result = self.sh('cmd_shaping set media_download dcs "$T1"', "-2,-4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.sh("cmd_shaping set media_upload user_kbps 2000")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.sh("cmd_shaping reset")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(m, p) for m, p, _, _ in seen],
+                         [("PATCH", "/v1/shaping"), ("PATCH", "/v1/shaping"),
+                          ("DELETE", "/v1/shaping")])
+        self.assertEqual(json.loads(seen[0][2]), {"media_download": {"dcs": [-2, -4]}})
+        self.assertEqual(json.loads(seen[1][2]), {"media_upload": {"user_kbps": 2000}})
+        self.assertEqual(seen[2][2], "")
+
+    def test_shaping_errors_are_shown_and_nothing_is_sent_for_bad_input(self):
+        seen = self.start_api({("PATCH", "/v1/shaping"): (
+            400, {"ok": False, "request_id": 8,
+                  "error": {"type": "invalid_field", "message": "shaping.media_download.x"}})})
+        result = self.sh("cmd_shaping set media_download user_kbps 1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("shaping.media_download.x", result.stderr)
+        self.assertEqual(len(seen), 1)
+        for args in ("set media_video user_kbps 1", "set media_download speed 1",
+                     "set media_download", "bogus"):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.sh(f"cmd_shaping {args}").returncode, 0)
+        self.assertEqual(len(seen), 1)
+
+
+class ShapingBodyTest(PolicyShellCase):
+    """Тело PATCH /v1/shaping из аргументов лаунчера."""
+
+    def body(self, rule, field, value):
+        return self.sh('shaping_body "$T1" "$T2" "$T3"', rule, field, value)
+
+    def assertBody(self, rule, field, value, expected):
+        result = self.body(rule, field, value)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {rule: {field: expected}})
+
+    def assertRejected(self, rule, field, value):
+        result = self.body(rule, field, value)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.strip())
+
+    def test_rates_are_kbps_integers_within_bounds(self):
+        self.assertBody("media_download", "user_kbps", "8000", 8000)
+        self.assertBody("media_upload", "total_kbps", "0", 0)
+        self.assertBody("media_download", "total_kbps", "100000000", 100000000)
+        for raw in ("", "-1", "1.5", "8M", "100000001", "abc"):
+            with self.subTest(raw=raw):
+                self.assertRejected("media_download", "user_kbps", raw)
+
+    def test_burst_is_zero_or_within_limits(self):
+        self.assertBody("media_download", "burst_kib", "0", 0)
+        self.assertBody("media_download", "burst_kib", "16", 16)
+        self.assertBody("media_upload", "burst_kib", "1048576", 1048576)
+        for raw in ("8", "15", "1048577", "x"):
+            with self.subTest(raw=raw):
+                self.assertRejected("media_download", "burst_kib", raw)
+
+    def test_dcs_list_or_all(self):
+        self.assertBody("media_download", "dcs", "-2,-4", [-2, -4])
+        self.assertBody("media_download", "dcs", " -1 , -5 ", [-1, -5])
+        for raw in ("all", "none", ""):
+            with self.subTest(raw=raw):
+                self.assertBody("media_upload", "dcs", raw, [])
+        for raw in ("2", "-6", "-2,-2", "-2;-4", "x"):
+            with self.subTest(raw=raw):
+                self.assertRejected("media_download", "dcs", raw)
+
+    def test_unknown_rule_or_field_is_rejected(self):
+        self.assertRejected("media_video", "user_kbps", "1")
+        self.assertRejected("media_download", "rate", "1")
 
 
 if __name__ == "__main__":

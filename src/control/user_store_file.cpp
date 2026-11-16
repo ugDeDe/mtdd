@@ -221,6 +221,14 @@ std::optional<Error> validate_policy_json(const json& j, UserPolicy& out) {
                                    out.rate_limit_down_bytes_per_sec)) {
     return error;
   }
+  if (auto error = optional_number(j, "media_rate_limit_up_bytes_per_sec",
+                                   out.media_rate_limit_up_bytes_per_sec)) {
+    return error;
+  }
+  if (auto error = optional_number(j, "media_rate_limit_down_bytes_per_sec",
+                                   out.media_rate_limit_down_bytes_per_sec)) {
+    return error;
+  }
   if (j.contains("note")) {
     if (!j["note"].is_string()) {
       return Error{ErrorCode::invalid_field, "user.note must be a string"};
@@ -265,7 +273,8 @@ std::optional<Error> validate_user_json(const json& j, uint64_t version,
                  j, {"name", "secret", "enabled", "max_connections", "generation",
                      "expires_at", "data_quota_bytes", "max_unique_ips", "max_devices",
                      "rate_limit_up_bytes_per_sec",
-                     "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
+                     "rate_limit_down_bytes_per_sec", "media_rate_limit_up_bytes_per_sec",
+                     "media_rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
                      "ad_tag"})) {
     return error;
   }
@@ -444,6 +453,15 @@ std::string serialize_snapshot(uint64_t revision,
       entry["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
       entry["rate_limit_down_bytes_per_sec"] =
           nullable(policy.rate_limit_down_bytes_per_sec);
+      // Written only when set, so a file without personal media limits keeps
+      // the exact layout older version 2 readers accept.
+      if (policy.media_rate_limit_up_bytes_per_sec) {
+        entry["media_rate_limit_up_bytes_per_sec"] = *policy.media_rate_limit_up_bytes_per_sec;
+      }
+      if (policy.media_rate_limit_down_bytes_per_sec) {
+        entry["media_rate_limit_down_bytes_per_sec"] =
+            *policy.media_rate_limit_down_bytes_per_sec;
+      }
       entry["note"] = policy.note;
       if (policy.canary) entry["canary"] = true;
       if (!policy.tls_domain.empty()) entry["tls_domain"] = policy.tls_domain;

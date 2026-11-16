@@ -92,7 +92,7 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     shared->me_clients_per_writer.store(config.me_clients_per_writer, std::memory_order_relaxed);
     shared->me_connections_per_dc.store(config.me_connections_per_dc, std::memory_order_relaxed);
     set_me_writer_cap(config.me_connections_per_dc_total);
-    set_media_limits(config.media_user_rate_kbps, config.media_total_rate_kbps);
+    set_shaping(config.shaping);
 
     // Prime the process CSPRNG on the constructing thread before any reactor
     // thread exists. OpenSSL 3 performs a one-time DRBG setup on the first
@@ -332,10 +332,8 @@ void Runtime::RuntimeState::set_me_writer_cap(std::uint32_t me_connections_per_d
                                               std::memory_order_relaxed);
 }
 
-void Runtime::RuntimeState::set_media_limits(std::uint64_t user_kbps,
-                                             std::uint64_t total_kbps) noexcept {
-    // kbit/s -> bytes/s.
-    shared->set_media_rates(user_kbps * 125U, total_kbps * 125U);
+void Runtime::RuntimeState::set_shaping(const ShapingConfig& shaping) noexcept {
+    shared->set_shaping(shaping);
 }
 
 void Runtime::RuntimeState::set_ad_tag(const std::array<std::uint8_t, 16>& tag) {
@@ -378,8 +376,25 @@ void Runtime::on_reload(std::function<void()> hook) { state_->on_reload(std::mov
 
 void Runtime::set_ad_tag(const std::array<std::uint8_t, 16>& tag) { state_->set_ad_tag(tag); }
 
-void Runtime::set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept {
-    state_->set_media_limits(user_kbps, total_kbps);
+void Runtime::set_shaping(const ShapingConfig& shaping) noexcept {
+    state_->set_shaping(shaping);
+}
+
+ShapingState Runtime::shaping_state() const noexcept {
+    const auto read = [](const detail::SharedState::MediaShaping& media) {
+        ShapingClassState out;
+        out.active_users = std::max<std::int64_t>(
+            media.active_users.load(std::memory_order_relaxed), 0);
+        out.heavy_users = std::max<std::int64_t>(
+            media.heavy_users.load(std::memory_order_relaxed), 0);
+        out.light_bytes_per_sec = static_cast<std::uint64_t>(std::max<std::int64_t>(
+            media.light_bytes.load(std::memory_order_relaxed), 0));
+        return out;
+    };
+    ShapingState state;
+    state.media_upload = read(state_->shared->media[0]);
+    state.media_download = read(state_->shared->media[1]);
+    return state;
 }
 
 std::uint16_t Runtime::port() const noexcept { return state_->port(); }

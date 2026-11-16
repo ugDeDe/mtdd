@@ -140,6 +140,12 @@ struct UserPolicy {
   // connections: up = client to Telegram, down = Telegram to client.
   std::optional<uint64_t> rate_limit_up_bytes_per_sec;
   std::optional<uint64_t> rate_limit_down_bytes_per_sec;
+  // Personal media shaping (signed DC < 0 selected by the config's
+  // shaping.media_upload / media_download), bytes per second, in place of
+  // the rule's user_kbps. 0 exempts the user from the per-user media limit
+  // (the process-wide total_kbps still applies); nullopt = the rule's value.
+  std::optional<uint64_t> media_rate_limit_up_bytes_per_sec;
+  std::optional<uint64_t> media_rate_limit_down_bytes_per_sec;
   std::string note;  // admin free text, <= kMaxNoteBytes of printable UTF-8
   // Bait user: its link is published on purpose, so every connection that
   // authenticates with it is reported as a suspect (signal "canary").
@@ -158,6 +164,7 @@ struct UserPolicy {
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           !media_rate_limit_up_bytes_per_sec && !media_rate_limit_down_bytes_per_sec &&
            note.empty() && !canary && tls_domain.empty() && ad_tag.empty();
   }
   bool operator==(const UserPolicy&) const = default;
@@ -174,6 +181,8 @@ struct UserPolicyPatch {
   Patch<uint32_t> max_devices;
   Patch<uint64_t> rate_limit_up_bytes_per_sec;
   Patch<uint64_t> rate_limit_down_bytes_per_sec;
+  Patch<uint64_t> media_rate_limit_up_bytes_per_sec;
+  Patch<uint64_t> media_rate_limit_down_bytes_per_sec;
   std::optional<std::string> note;  // "" clears
   std::optional<bool> canary;
   std::optional<std::string> tls_domain;  // "" clears (back to the global domain)
@@ -182,6 +191,7 @@ struct UserPolicyPatch {
   bool empty() const noexcept {
     return !expires_at && !data_quota_bytes && !max_unique_ips && !max_devices &&
            !rate_limit_up_bytes_per_sec && !rate_limit_down_bytes_per_sec &&
+           !media_rate_limit_up_bytes_per_sec && !media_rate_limit_down_bytes_per_sec &&
            !note && !canary && !tls_domain && !ad_tag;
   }
 };
@@ -428,6 +438,7 @@ enum class ApiRoute {
   suspects,
   ad_tag,
   ja4,
+  shaping,
 };
 enum class ApiMethod { get, post, patch, delete_, other };
 
@@ -456,6 +467,23 @@ struct UserMetricsSnapshot {
   uint64_t quota_used_bytes{0};
   // Unix seconds of the last reset_quota(); 0 = never reset.
   int64_t quota_reset_at{0};
+  // Rate shaping: active limited connections, heavy ones per direction
+  // ([0] = up, [1] = down; media classes included in these), and what one
+  // heavy connection may move now (bytes/s, 0 = unlimited).
+  int64_t rate_active_connections{0};
+  std::array<int64_t, 2> rate_heavy_connections{};
+  std::array<uint64_t, 2> rate_share_bytes_per_sec{};
+};
+
+// One media shaping class as published by the runtime (index 0 =
+// media_upload, 1 = media_download): its rule and live split counters.
+struct ShapingClassSnapshot {
+  uint64_t user_rate_bytes_per_sec{0};
+  uint64_t total_rate_bytes_per_sec{0};
+  uint64_t burst_bytes{0};
+  int64_t active_users{0};
+  int64_t heavy_users{0};
+  uint64_t light_bytes_per_sec{0};
 };
 
 struct MeDcSnapshot {
@@ -603,6 +631,8 @@ struct StatisticsSnapshot {
   std::array<uint64_t, kSuspectSignals> suspect_events_total{};
   uint64_t suspect_shadow_bans_total{0};
   uint64_t media_throttled_total{0};
+  uint64_t media_upload_throttled_total{0};
+  std::array<ShapingClassSnapshot, 2> shaping{};  // [0] media_upload, [1] media_download
   uint64_t replay_cache_entries{0};
   // Live replay entries dropped to make room (fixed-size cache).
   uint64_t replay_cache_evicted_total{0};
@@ -646,25 +676,34 @@ class UserMetrics {
   void reset_quota() noexcept;
   int64_t quota_reset_at() const noexcept;
 
-  // Per-user token bucket (one per direction), shared by every connection of
-  // the user on every reactor. Implemented as a GCRA "theoretical arrival
-  // time" in steady-clock nanoseconds, so it is one lock-free atomic per
-  // direction and a rate change needs no bucket state migration.
-  // Charges `bytes` against `rate_bytes_per_sec` (0 = unlimited, no-op).
-  // Always succeeds (debt model): returns the steady-clock time in ns at which
-  // the direction may be read again, or 0 if no pause is needed.
-  int64_t rate_consume(Direction direction, uint64_t bytes,
-                       uint64_t rate_bytes_per_sec, int64_t now_ns) noexcept;
-  // Same pause computation without charging anything.
-  int64_t rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
-                         int64_t now_ns) const noexcept;
-  // Burst allowance in bytes for a rate: max(rate, 64 KiB).
-  static uint64_t rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept;
-  // Connections of this user that moved payload in the last second (all, and
-  // media DCs only), summed over reactors. Rate limits are split by these.
-  void add_active_connections(int64_t all, int64_t media) noexcept;
+  // Connections of this user that moved payload in the last second, summed
+  // over reactors: all of them (for the user's own rate limits) and those in
+  // each media shaping class (signed DC < 0 selected by shaping.media_*).
+  // Rate limits are split by these counts.
+  void add_active_connections(int64_t delta) noexcept;
   int64_t active_rate_connections() const noexcept;
-  int64_t active_media_connections() const noexcept;
+  // Adds `delta` to the media class of `direction` (server_to_client =
+  // media_download, client_to_server = media_upload). Returns +1 when the
+  // user's count went from 0 to non-zero, -1 when it went back to 0, else 0,
+  // so the caller can keep a process-wide count of active users per class.
+  int add_active_media(Direction direction, int64_t delta) noexcept;
+  int64_t active_media_connections(Direction direction) const noexcept;
+  // Work-conserving split (runtime policy.cpp). Per rate class, the user's
+  // active limited connections that are held at their share ("heavy": paused,
+  // or used >= 90% of it in the last second) and the last-second payload of
+  // the others ("light"). Heavy connections share what light ones leave.
+  enum class RateClass : uint8_t { up, down, media_up, media_down };
+  static constexpr size_t kRateClasses = 4;
+  // Returns +1 when the user's heavy count went from 0 to non-zero, -1 when
+  // it went back to 0, else 0 (for process-wide heavy-user counts).
+  int add_heavy_connections(RateClass rate_class, int64_t delta) noexcept;
+  void add_light_bytes(RateClass rate_class, int64_t delta) noexcept;
+  int64_t heavy_connections(RateClass rate_class) const noexcept;
+  int64_t light_bytes(RateClass rate_class) const noexcept;
+  // What one heavy connection of this user may move now, bytes/s per
+  // direction (0 = unlimited); published by the runtime for /metrics.
+  void set_rate_share(Direction direction, uint64_t bytes_per_sec) noexcept;
+  uint64_t rate_share(Direction direction) const noexcept;
   // Bumped on every active-count change, so connections can refresh their
   // share as soon as the split changes instead of on the next 1 Hz pass.
   uint64_t active_generation() const noexcept;
@@ -695,11 +734,16 @@ class UserMetrics {
   // existing per-direction counter, and reset/restore just move the base.
   std::atomic<int64_t> quota_base_{0};
   std::atomic<int64_t> quota_reset_at_{0};
-  // Own cache line: rate buckets are written by every reactor serving the user.
-  alignas(64) std::atomic<int64_t> rate_tat_[2]{};
-  std::atomic<int64_t> active_rate_conns_{0};
-  std::atomic<int64_t> active_media_conns_{0};
+  // Own cache line: active counts are written by every reactor serving the
+  // user whenever a limited connection becomes active or idle.
+  alignas(64) std::atomic<int64_t> active_rate_conns_{0};
+  // [0] = media_upload (client_to_server), [1] = media_download.
+  std::atomic<int64_t> active_media_conns_[2]{};
   std::atomic<uint64_t> active_generation_{0};
+  std::atomic<int64_t> heavy_conns_[kRateClasses]{};
+  std::atomic<int64_t> light_bytes_[kRateClasses]{};
+  // [0] = up (client_to_server), [1] = down.
+  std::atomic<uint64_t> rate_share_[2]{};
 };
 
 // What became of a ClientHello whose JA4 fingerprint was recorded.
@@ -898,7 +942,12 @@ class Statistics {
   void budget_refusal(BudgetRefusal kind) noexcept;
   void relay_closed(RelayCloseReason reason) noexcept;
   // Media shaping held a client (one count per throttle episode).
+  // A media connection paused by its rate share: download (s2c) or upload.
   void media_throttled() noexcept;
+  void media_upload_throttled() noexcept;
+  // Published by the runtime once a second: index 0 = media_upload,
+  // 1 = media_download.
+  void set_shaping_class(size_t index, const ShapingClassSnapshot& value) noexcept;
   void set_replay_cache_entries(uint64_t entries) noexcept;
   void set_replay_cache_entries(std::size_t worker, uint64_t entries) noexcept;
 
@@ -1075,6 +1124,16 @@ struct HttpOptions {
   // one) and returns false when the runtime rejected it. Nothing is persisted:
   // a restart returns to config.ad_tag. Without a hook the route answers 404.
   std::function<bool(const std::optional<std::array<uint8_t, 16>>&)> ad_tag_hook;
+  // api role, optional: live media shaping (GET/PATCH/DELETE /v1/shaping).
+  // Both hooks are JSON text so this library stays free of the config types.
+  // shaping_view_hook returns the object served as "data" ({source,
+  // effective, configured, state}). shaping_update_hook receives a PATCH body
+  // object (merged onto the effective rules) or nullopt (drop the override,
+  // back to the configured rules) and returns an empty string on success or
+  // the validation message, answered as 400 invalid_field. Nothing is
+  // persisted. Without both hooks the route answers 404.
+  std::function<std::string()> shaping_view_hook;
+  std::function<std::string(const std::optional<std::string>&)> shaping_update_hook;
 };
 
 class ControlServer {

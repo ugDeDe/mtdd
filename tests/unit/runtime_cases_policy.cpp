@@ -299,6 +299,32 @@ TEST(RuntimePolicy, DownstreamRateLimitHoldsThroughputWithinTenPercent) {
     EXPECT_LT(rate, kRate * 1.1) << rate;
 }
 
+TEST(RuntimePolicy, MediaUploadRuleLimitsClientToTelegramOnMediaDcs) {
+    // shaping.media_upload: 4096 kbit/s = 512000 B/s on media DC -2, with no
+    // personal rate limit at all.
+    mtdd::test::FakeDirectDc dc(-2);
+    PolicyDirectEndpointScope endpoint(dc.port());
+    Daemon daemon(1, true, [](mtdd::Config& config) {
+        enable_policy_direct(config);
+        config.direct_fallback_dcs = {-2};
+        config.shaping.media_upload.user_kbps = 4096;
+    });
+    constexpr double kRate = 4096.0 * 125.0;
+    ASSERT_TRUE(add_policy_user(daemon, {}));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(-2));
+    const auto metrics = daemon.services.stats.user("alice");
+    Pump pump(client, 0);
+    const double rate = measure([&] { return metrics->payload_c2s_bytes(); }, 1600ms, 2000ms);
+    EXPECT_GT(rate, kRate * 0.9) << rate;
+    EXPECT_LT(rate, kRate * 1.1) << rate;
+    EXPECT_GE(daemon.services.stats.snapshot().media_upload_throttled_total, 1U);
+}
+
 TEST(RuntimePolicy, RateLimitChangeAppliesToLiveSessions) {
     mtdd::test::FakeDirectDc dc(2);
     PolicyDirectEndpointScope endpoint(dc.port());

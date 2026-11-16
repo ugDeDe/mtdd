@@ -3,6 +3,7 @@
 #include "mtdd/metadata.hpp"
 #include "mtdd/runtime.hpp"
 #include "mtdd/runtime_support.hpp"
+#include "shaping_override.hpp"
 
 #include <pthread.h>
 #include <signal.h>
@@ -120,19 +121,36 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
     stats.enable_ip_history(config.unique_ip_stats_path.string());
     mtdd::MetadataProvider metadata{config};
     mtdd::Runtime runtime{config, users, stats, metadata, applied};
+    // Media shaping: the config file's rules, or a live API override
+    // (PATCH/DELETE /v1/shaping) that a reload does not replace.
+    mtdd::ShapingOverride shaping{config.shaping, [&runtime](const mtdd::ShapingConfig& rules) {
+                                      runtime.set_shaping(rules);
+                                  }};
     // systemctl reload mtdd (SIGHUP): re-read the file and apply the settings
     // that can change without dropping clients. Others need a restart.
-    runtime.on_reload([&runtime, config_path] {
+    runtime.on_reload([&runtime, &shaping, config_path] {
         try {
             const auto fresh = mtdd::Config::load(config_path);
             runtime.set_tunables(fresh.me_clients_per_writer, fresh.me_connections_per_dc);
             runtime.set_me_writer_cap(fresh.me_connections_per_dc_total);
-            runtime.set_media_limits(fresh.media_user_rate_kbps, fresh.media_total_rate_kbps);
+            if (shaping.reload(fresh.shaping))
+                std::cerr << "mtdd: shaping override from the API stays in effect; the reloaded "
+                             "rules apply after DELETE /v1/shaping\n";
+            const auto rule = [](const mtdd::MediaShapingRule& r) {
+                std::string out = "user_kbps=" + std::to_string(r.user_kbps) +
+                                  " total_kbps=" + std::to_string(r.total_kbps) +
+                                  " burst_kib=" + std::to_string(r.burst_kib) + " dcs=";
+                if (r.dcs.empty()) out += "all";
+                for (std::size_t i = 0; i < r.dcs.size(); ++i) {
+                    out += (i == 0 ? "" : ",") + std::to_string(r.dcs[i]);
+                }
+                return out;
+            };
             std::cerr << "mtdd: reloaded me_clients_per_writer=" << fresh.me_clients_per_writer
                       << " me_connections_per_dc=" << fresh.me_connections_per_dc
                       << " me_connections_per_dc_total=" << fresh.me_connections_per_dc_total
-                      << " media_user_rate_kbps=" << fresh.media_user_rate_kbps
-                      << " media_total_rate_kbps=" << fresh.media_total_rate_kbps << '\n';
+                      << " media_download{" << rule(fresh.shaping.media_download) << "}"
+                      << " media_upload{" << rule(fresh.shaping.media_upload) << "}\n";
         } catch (const std::exception& error) {
             std::cerr << "mtdd: reload rejected, keeping current settings: " << error.what()
                       << '\n';
@@ -160,6 +178,31 @@ int serve(const mtdd::Config& config, const std::filesystem::path& config_path) 
             return true;
         } catch (const std::exception&) {
             return false;
+        }
+    };
+    http.shaping_view_hook = [&runtime, &shaping] {
+        const auto state = runtime.shaping_state();
+        const auto counters = [](const mtdd::ShapingClassState& c) {
+            return nlohmann::json{{"active_users", c.active_users},
+                                  {"heavy_users", c.heavy_users},
+                                  {"light_bytes_per_sec", c.light_bytes_per_sec}};
+        };
+        auto view = shaping.view();
+        view["state"] = {{"media_download", counters(state.media_download)},
+                         {"media_upload", counters(state.media_upload)}};
+        return view.dump();
+    };
+    http.shaping_update_hook = [&shaping](const std::optional<std::string>& patch) -> std::string {
+        try {
+            if (!patch) {
+                shaping.reset();
+                return {};
+            }
+            shaping.patch(nlohmann::json::parse(*patch));
+            return {};
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            return message.empty() ? std::string{"invalid shaping rules"} : message;
         }
     };
     std::optional<mtdd::control::ControlServer> management;

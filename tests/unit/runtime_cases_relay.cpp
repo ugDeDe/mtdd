@@ -1365,7 +1365,7 @@ std::chrono::milliseconds fetch_media(std::uint64_t user_kbps, std::size_t count
     Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
         std::ofstream file{config.me_config_path, std::ios::binary};
         file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
-        config.media_user_rate_kbps = user_kbps;
+        config.shaping.media_download.user_kbps = user_kbps;
         config.idle_timeout = 60s;
     });
     if (!daemon.services.add_user("alice", std::string(kSecretHex))) return -1ms;
@@ -1409,7 +1409,7 @@ TEST(Runtime, MediaUserRateIsSplitEvenlyAcrossConnections) {
     Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
         std::ofstream file{config.me_config_path, std::ios::binary};
         file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
-        config.media_user_rate_kbps = 4000;
+        config.shaping.media_download.user_kbps = 4000;
         config.idle_timeout = 60s;
     });
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
@@ -1444,6 +1444,248 @@ TEST(Runtime, MediaUserRateIsSplitEvenlyAcrossConnections) {
     EXPECT_LT(static_cast<double>(slowest.count()),
               2.0 * static_cast<double>(fastest.count()))
         << "fastest=" << fastest.count() << "ms slowest=" << slowest.count() << "ms";
+}
+
+namespace {
+struct MediaFetch {
+    std::chrono::milliseconds elapsed{-1};
+    std::uint64_t throttled{0};
+    std::uint64_t idle_closes{0};
+};
+
+// Fetches `count` 128 KiB answers from media DC `dc` for "alice" (created with
+// `policy`), one request at a time, under `shaping` and `idle_timeout`.
+MediaFetch fetch_media_shaped(const mtdd::ShapingConfig& shaping, std::size_t count,
+                              std::int16_t dc = -2,
+                              const mtdd::control::UserPolicy& policy = {},
+                              std::chrono::seconds idle_timeout = 60s) {
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    MediaFetch out;
+    FakeMe me{me_secret(), 100000, 0ms, 1, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for " << dc << " 127.0.0.1:" << me.port() << ";\n";
+        config.shaping = shaping;
+        config.idle_timeout = idle_timeout;
+    });
+    mtdd::control::CreateUserRequest request;
+    request.name = "alice";
+    request.secret = std::string(kSecretHex);
+    request.policy = policy;
+    if (!daemon.services.store->create_user(request).ok()) return out;
+    if (!wait_for([&] { return daemon.services.stats.ready(); }, 4s)) return out;
+    TestClient client(daemon.port(), secret_bytes());
+    if (!client.valid() || !client.send_hello() || !client.start_obfuscation(dc)) return out;
+    const auto started = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!client.send_message(burst_payload(index))) return out;
+        Bytes response;
+        if (!client.read_message(response, 15000) || response.size() != kAnswer) return out;
+    }
+    out.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    const auto snapshot = daemon.services.stats.snapshot();
+    out.throttled = snapshot.media_throttled_total;
+    out.idle_closes = snapshot.relay_closes_total[static_cast<std::size_t>(
+        mtdd::control::RelayCloseReason::idle_timeout)];
+    return out;
+}
+
+mtdd::ShapingConfig download_rule(std::uint64_t user_kbps, std::uint64_t burst_kib = 0,
+                                  std::vector<std::int16_t> dcs = {}) {
+    mtdd::ShapingConfig shaping;
+    shaping.media_download.user_kbps = user_kbps;
+    shaping.media_download.burst_kib = burst_kib;
+    shaping.media_download.dcs = std::move(dcs);
+    return shaping;
+}
+} // namespace
+
+TEST(Runtime, MediaBurstLetsShortTransfersThroughAndPacesLongOnes) {
+    // 4000 kbit/s = 500 KB/s with a 1 MiB burst. Six answers (768 KiB) fit in
+    // the burst: a loopback copy. Sixteen (2 MiB) spend the burst and then
+    // move the remaining 1 MiB at the rate: about two seconds.
+    const auto short_fetch = fetch_media_shaped(download_rule(4000, 1024), 6);
+    ASSERT_GE(short_fetch.elapsed.count(), 0);
+    EXPECT_LT(short_fetch.elapsed, 1000ms);
+    EXPECT_EQ(short_fetch.throttled, 0U);
+
+    const auto long_fetch = fetch_media_shaped(download_rule(4000, 1024), 16);
+    ASSERT_GE(long_fetch.elapsed.count(), 0) << "a shaped download must complete";
+    EXPECT_GE(long_fetch.elapsed, 1500ms);
+    EXPECT_LT(long_fetch.elapsed, 8000ms);
+    EXPECT_GE(long_fetch.throttled, 1U);
+}
+
+TEST(Runtime, MediaRuleCoversOnlyItsSelectedDcs) {
+    // A 100 KB/s rule for DC -3 leaves a DC -2 download alone.
+    const auto other = fetch_media_shaped(download_rule(800, 0, {-3}), 12, -2);
+    ASSERT_GE(other.elapsed.count(), 0);
+    EXPECT_LT(other.elapsed, 1500ms);
+    EXPECT_EQ(other.throttled, 0U);
+    // The same rule selecting DC -2 does throttle it.
+    const auto selected = fetch_media_shaped(download_rule(4000, 0, {-3, -2}), 12, -2);
+    ASSERT_GE(selected.elapsed.count(), 0);
+    EXPECT_GE(selected.elapsed, 1800ms);
+    EXPECT_GE(selected.throttled, 1U);
+}
+
+TEST(Runtime, PersonalMediaLimitOverridesTheRule) {
+    // 0 exempts the user from the rule's per-user limit.
+    mtdd::control::UserPolicy exempt;
+    exempt.media_rate_limit_down_bytes_per_sec = 0;
+    const auto free_fetch = fetch_media_shaped(download_rule(800), 12, -2, exempt);
+    ASSERT_GE(free_fetch.elapsed.count(), 0);
+    EXPECT_LT(free_fetch.elapsed, 1500ms);
+    EXPECT_EQ(free_fetch.throttled, 0U);
+    // A personal value limits the user even when the rule sets no user limit.
+    mtdd::control::UserPolicy limited;
+    limited.media_rate_limit_down_bytes_per_sec = 500U * 1000U;
+    const auto slow = fetch_media_shaped(mtdd::ShapingConfig{}, 12, -2, limited);
+    ASSERT_GE(slow.elapsed.count(), 0);
+    EXPECT_GE(slow.elapsed, 1800ms);
+    EXPECT_GE(slow.throttled, 1U);
+}
+
+TEST(Runtime, RatePausedConnectionOutlivesIdleTimeout) {
+    // 128 kbit/s = 16 KB/s: each 128 KiB answer pauses this connection's
+    // requests for about four seconds, twice the idle timeout. The pause is
+    // the proxy's doing, so the connection must not be closed as idle.
+    const auto fetch = fetch_media_shaped(download_rule(128), 2, -2, {}, 2s);
+    ASSERT_GE(fetch.elapsed.count(), 0) << "the paused connection was closed";
+    EXPECT_GE(fetch.elapsed, 3000ms);
+    EXPECT_EQ(fetch.idle_closes, 0U);
+}
+
+TEST(Runtime, MediaTotalIsSharedPerUserBeforePerConnection) {
+    // A 500 KB/s total: alice downloads on two connections, bob on one. The
+    // total goes to users first, so bob gets about as much as alice, not half.
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    FakeMe me{me_secret(), 100000, 0ms, 3, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.shaping.media_download.total_kbps = 4000;
+        config.idle_timeout = 60s;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(daemon.services.add_user("bob", "101112131415161718191a1b1c1d1e1f"));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::atomic<bool> stop{false};
+    std::atomic<int> failures{0};
+    const auto fetch = [&](const A16& secret, std::uint8_t variant) {
+        TestClient client(daemon.port(), secret);
+        if (!client.valid() || !client.send_hello(0, variant) || !client.start_obfuscation(-2)) {
+            failures.fetch_add(1);
+            return;
+        }
+        for (std::size_t index = 0; !stop.load(); ++index) {
+            if (!client.send_message(burst_payload(index % 200))) break;
+            Bytes response;
+            if (!client.read_message(response, 15000) || response.size() != kAnswer) {
+                if (!stop.load()) failures.fetch_add(1);
+                return;
+            }
+        }
+    };
+    std::thread alice_one(fetch, secret_bytes(), 0);
+    std::thread alice_two(fetch, secret_bytes(), 1);
+    std::thread bob(fetch, bob_secret_bytes(), 2);
+    const auto alice_metrics = daemon.services.stats.user("alice");
+    const auto bob_metrics = daemon.services.stats.user("bob");
+    std::this_thread::sleep_for(2000ms);  // past the bursts and the first split
+    const std::uint64_t alice0 = alice_metrics->payload_s2c_bytes();
+    const std::uint64_t bob0 = bob_metrics->payload_s2c_bytes();
+    std::this_thread::sleep_for(5000ms);
+    const auto alice_bytes = static_cast<double>(alice_metrics->payload_s2c_bytes() - alice0);
+    const auto bob_bytes = static_cast<double>(bob_metrics->payload_s2c_bytes() - bob0);
+    stop.store(true);
+    alice_one.join();
+    alice_two.join();
+    bob.join();
+    ASSERT_EQ(failures.load(), 0);
+    ASSERT_GT(bob_bytes, 0.0);
+    // Per connection the split would give alice twice bob's bytes.
+    EXPECT_LT(alice_bytes / bob_bytes, 1.5) << "alice=" << alice_bytes << " bob=" << bob_bytes;
+    EXPECT_GT(alice_bytes / bob_bytes, 0.6) << "alice=" << alice_bytes << " bob=" << bob_bytes;
+    // Together they stay near the total (ME answers are whole, so allow slack).
+    EXPECT_LT((alice_bytes + bob_bytes) / 5.0, 500000.0 * 1.4);
+}
+
+TEST(Runtime, MediaShareUnusedByALightConnectionGoesToTheHeavyOne) {
+    // alice has a 500 KB/s media limit and two connections: one downloads
+    // continuously, the other fetches one 128 KiB answer a second (light).
+    // An equal split would cap the heavy one at 250 KB/s; the work-conserving
+    // split gives it what the light one leaves, about 370 KB/s.
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    FakeMe me{me_secret(), 100000, 0ms, 2, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.shaping.media_download.user_kbps = 4000;
+        config.idle_timeout = 60s;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::atomic<bool> stop{false};
+    std::atomic<int> failures{0};
+    std::atomic<std::uint64_t> heavy_bytes{0};
+    const auto run = [&](std::uint8_t variant, bool heavy) {
+        TestClient client(daemon.port(), secret_bytes());
+        if (!client.valid() || !client.send_hello(0, variant) || !client.start_obfuscation(-2)) {
+            failures.fetch_add(1);
+            return;
+        }
+        for (std::size_t index = 0; !stop.load(); ++index) {
+            if (!client.send_message(burst_payload(index % 200))) break;
+            Bytes response;
+            if (!client.read_message(response, 15000) || response.size() != kAnswer) {
+                if (!stop.load()) failures.fetch_add(1);
+                return;
+            }
+            if (heavy) {
+                heavy_bytes.fetch_add(response.size());
+            } else {
+                std::this_thread::sleep_for(1000ms);
+            }
+        }
+    };
+    std::thread light_thread(run, 0, false);
+    std::thread heavy_thread(run, 1, true);
+    std::this_thread::sleep_for(3000ms);  // bursts spent, demand classified
+    // Live counters while both are running.
+    const auto during = daemon.services.stats.snapshot();
+    const auto metrics_text = daemon.services.stats.prometheus_text();
+    const std::uint64_t start = heavy_bytes.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(5000ms);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double heavy_rate = static_cast<double>(heavy_bytes.load() - start) / seconds;
+    stop.store(true);
+    light_thread.join();
+    heavy_thread.join();
+    ASSERT_EQ(failures.load(), 0);
+    EXPECT_GT(heavy_rate, 300000.0) << heavy_rate;
+    EXPECT_LT(heavy_rate, 500000.0 * 1.2) << heavy_rate;
+
+    const auto& download = during.shaping[1];
+    EXPECT_EQ(download.user_rate_bytes_per_sec, 500000U);
+    EXPECT_EQ(download.active_users, 1);
+    EXPECT_EQ(download.heavy_users, 1);
+    EXPECT_GT(download.light_bytes_per_sec, 0U);
+    const auto& alice = during.users.at("alice");
+    EXPECT_EQ(alice.rate_active_connections, 2);
+    EXPECT_EQ(alice.rate_heavy_connections[1], 1);
+    EXPECT_GT(alice.rate_share_bytes_per_sec[1], 250000U);
+    for (const char* needle :
+         {"mtdd_shaping_active_users{class=\"media_download\"} 1",
+          "mtdd_shaping_heavy_users{class=\"media_download\"} 1",
+          "mtdd_shaping_limit_bytes_per_second{class=\"media_download\",scope=\"user\"} 500000",
+          "mtdd_user_rate_heavy_connections{user=\"alice\",direction=\"s2c\"} 1",
+          "mtdd_user_rate_share_bytes_per_second{user=\"alice\",direction=\"s2c\"}"}) {
+        EXPECT_NE(metrics_text.find(needle), std::string::npos) << needle;
+    }
 }
 
 TEST(Runtime, DeviceLimitClosesNewAuthKeyOnTheMiddleEndPath) {

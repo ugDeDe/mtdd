@@ -555,6 +555,7 @@ void Runtime::Impl::run() {
             if (now >= next_gauge_) {
                 reaccount_shared();
                 unpause_clients_if_possible(now);
+                if (worker_index_ == 0) publish_shaping_state();
                 // Buffer/replay gauges are refreshed at 1 Hz, not per packet.
                 stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
                 std::uint64_t queued = 0;
@@ -571,10 +572,14 @@ void Runtime::Impl::run() {
                     // lag by at most this pass; sweep_user_policy() below
                     // reads this reactor's quota usage after the flush.
                     flush_payload(*client);
-                    if (client->counted_active && client->window_bytes == 0) {
+                    // A connection held by its own rate pause still wants to
+                    // move data: it stays counted (and heavy).
+                    if (client->counted_active && client->window_bytes == 0 &&
+                        !client->rate_pause_c2s && !client->rate_pause_s2c) {
                         set_counted_active(*client, false);
                     }
                     client->window_bytes = 0;
+                    update_rate_demand(*client);
                     if (client->counted_active || client->rate_up != 0 ||
                         client->rate_down != 0 || rate_limited(*client)) {
                         recompute_rate_share(*client);

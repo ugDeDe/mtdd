@@ -1,5 +1,6 @@
 #include "mtdd/config.hpp"
 #include "mtdd/metadata.hpp"
+#include "../../src/shaping_override.hpp"
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -823,4 +824,176 @@ TEST(Config, BufferBudgetAcceptsMoreThanOneGibibyte) {
     EXPECT_EQ(mtdd::Config::parse(value, "/work").global_buffer_bytes, 8 * kGiB);
     value["global_buffer_bytes"] = mtdd::kMaxGlobalBufferBytes + 1;
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
+TEST(Config, ShapingIsOffByDefaultAndParsesBothMediaRules) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.shaping, mtdd::ShapingConfig{});
+    EXPECT_EQ(defaults.public_view()["shaping"]["media_download"]["user_kbps"], 0U);
+
+    auto value = minimal_config();
+    value["shaping"] = {
+        {"media_download", {{"user_kbps", 8000}, {"total_kbps", 400000},
+                            {"burst_kib", 4096}, {"dcs", {-2, -4}}}},
+        {"media_upload", {{"user_kbps", 2000}}}};
+    const auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.shaping.media_download.user_kbps, 8000U);
+    EXPECT_EQ(config.shaping.media_download.total_kbps, 400000U);
+    EXPECT_EQ(config.shaping.media_download.burst_kib, 4096U);
+    EXPECT_EQ(config.shaping.media_download.dcs, (std::vector<std::int16_t>{-2, -4}));
+    EXPECT_EQ(config.shaping.media_upload.user_kbps, 2000U);
+    EXPECT_TRUE(config.shaping.media_upload.dcs.empty());
+    const auto view = config.public_view()["shaping"];
+    EXPECT_EQ(view["media_download"]["burst_kib"], 4096U);
+    EXPECT_EQ(view["media_download"]["dcs"], nlohmann::json::array({-2, -4}));
+    EXPECT_EQ(view["media_upload"]["user_kbps"], 2000U);
+}
+
+TEST(Config, LegacyMediaRateKeysFillTheDownloadRule) {
+    auto value = minimal_config();
+    value["media_user_rate_kbps"] = 4000;
+    value["media_total_rate_kbps"] = 100000;
+    const auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.shaping.media_download.user_kbps, 4000U);
+    EXPECT_EQ(config.shaping.media_download.total_kbps, 100000U);
+    EXPECT_EQ(config.shaping.media_upload, mtdd::MediaShapingRule{});
+
+    // Mixing the legacy keys with the new download rule is ambiguous.
+    value["shaping"] = {{"media_download", {{"user_kbps", 1}}}};
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    // ... but an upload rule next to them is fine.
+    value["shaping"] = {{"media_upload", {{"user_kbps", 1}}}};
+    EXPECT_NO_THROW(mtdd::Config::parse(value, "/work"));
+}
+
+TEST(Config, InvalidShapingIsRefused) {
+    const std::vector<nlohmann::json> bad{
+        nlohmann::json::array(),
+        {{"media_video", nlohmann::json::object()}},
+        {{"media_download", 5}},
+        {{"media_download", {{"rate", 1}}}},
+        {{"media_download", {{"user_kbps", -1}}}},
+        {{"media_download", {{"user_kbps", mtdd::kMaxShapingRateKbps + 1}}}},
+        {{"media_download", {{"burst_kib", 8}}}},
+        {{"media_download", {{"burst_kib", mtdd::kMaxShapingBurstKib + 1}}}},
+        {{"media_download", {{"dcs", -2}}}},
+        {{"media_download", {{"dcs", {2}}}}},
+        {{"media_download", {{"dcs", {-6}}}}},
+        {{"media_download", {{"dcs", {-2, -2}}}}},
+        {{"media_upload", {{"dcs", {"-2"}}}}}};
+    for (const auto& shaping : bad) {
+        auto value = minimal_config();
+        value["shaping"] = shaping;
+        EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument) << shaping.dump();
+    }
+    auto value = minimal_config();
+    value["shaping"] = {{"media_download", {{"burst_kib", 0}}}};
+    EXPECT_NO_THROW(mtdd::Config::parse(value, "/work"));
+}
+
+namespace {
+mtdd::ShapingConfig sample_shaping() {
+    mtdd::ShapingConfig shaping;
+    shaping.media_download = {8000, 400000, 4096, {-2, -4}};
+    shaping.media_upload = {2000, 0, 0, {}};
+    return shaping;
+}
+} // namespace
+
+TEST(Config, ParseShapingMergesOntoBase) {
+    const auto base = sample_shaping();
+    // A partial rule keeps the base's other fields and the untouched rule.
+    auto merged = mtdd::parse_shaping({{"media_download", {{"user_kbps", 6000}}}}, base);
+    EXPECT_EQ(merged.media_download.user_kbps, 6000U);
+    EXPECT_EQ(merged.media_download.total_kbps, 400000U);
+    EXPECT_EQ(merged.media_download.burst_kib, 4096U);
+    EXPECT_EQ(merged.media_download.dcs, (std::vector<std::int16_t>{-2, -4}));
+    EXPECT_EQ(merged.media_upload, base.media_upload);
+    // An empty object changes nothing.
+    EXPECT_EQ(mtdd::parse_shaping(nlohmann::json::object(), base), base);
+    // A given "dcs" replaces the list; [] means every media DC.
+    merged = mtdd::parse_shaping({{"media_download", {{"dcs", {-1}}}}}, base);
+    EXPECT_EQ(merged.media_download.dcs, (std::vector<std::int16_t>{-1}));
+    merged = mtdd::parse_shaping({{"media_download", {{"dcs", nlohmann::json::array()}}}}, base);
+    EXPECT_TRUE(merged.media_download.dcs.empty());
+    EXPECT_EQ(merged.media_download.user_kbps, 8000U);
+}
+
+TEST(Config, ParseShapingWithBaseNamesTheBadKey) {
+    const auto base = sample_shaping();
+    const auto message = [&](const nlohmann::json& value) {
+        try {
+            (void)mtdd::parse_shaping(value, base);
+        } catch (const std::invalid_argument& error) {
+            return std::string{error.what()};
+        }
+        return std::string{"no error"};
+    };
+    EXPECT_NE(message({{"media_video", nlohmann::json::object()}}).find("shaping.media_video"),
+              std::string::npos);
+    EXPECT_NE(message({{"media_upload", {{"rate", 1}}}}).find("shaping.media_upload.rate"),
+              std::string::npos);
+    EXPECT_NE(message({{"media_download", {{"burst_kib", 8}}}}).find("burst_kib"),
+              std::string::npos);
+}
+
+TEST(ShapingOverride, PatchMergesOntoEffectiveAndResetReturnsToConfig) {
+    std::vector<mtdd::ShapingConfig> applied;
+    mtdd::ShapingOverride state{sample_shaping(),
+                                [&applied](const mtdd::ShapingConfig& s) { applied.push_back(s); }};
+    EXPECT_FALSE(state.overridden());
+    EXPECT_EQ(state.view()["source"], "config");
+
+    state.patch({{"media_download", {{"user_kbps", 6000}}}});
+    ASSERT_EQ(applied.size(), 1U);
+    EXPECT_EQ(applied.back().media_download.user_kbps, 6000U);
+    EXPECT_EQ(applied.back().media_download.burst_kib, 4096U);
+    // A second patch builds on the first one, not on the config file.
+    state.patch({{"media_upload", {{"total_kbps", 1000}}}});
+    EXPECT_EQ(applied.back().media_download.user_kbps, 6000U);
+    EXPECT_EQ(applied.back().media_upload.total_kbps, 1000U);
+    const auto view = state.view();
+    EXPECT_EQ(view["source"], "api");
+    EXPECT_EQ(view["effective"]["media_download"]["user_kbps"], 6000U);
+    EXPECT_EQ(view["configured"]["media_download"]["user_kbps"], 8000U);
+
+    EXPECT_TRUE(state.reset());
+    EXPECT_EQ(applied.back(), sample_shaping());
+    EXPECT_FALSE(state.overridden());
+    EXPECT_FALSE(state.reset());
+}
+
+TEST(ShapingOverride, InvalidPatchLeavesStateAndRuntimeUntouched) {
+    std::vector<mtdd::ShapingConfig> applied;
+    mtdd::ShapingOverride state{sample_shaping(),
+                                [&applied](const mtdd::ShapingConfig& s) { applied.push_back(s); }};
+    EXPECT_THROW(state.patch({{"media_download", {{"user_kbps", -1}}}}), std::invalid_argument);
+    EXPECT_THROW(state.patch({{"other", nlohmann::json::object()}}), std::invalid_argument);
+    EXPECT_TRUE(applied.empty());
+    EXPECT_FALSE(state.overridden());
+    EXPECT_EQ(state.effective(), sample_shaping());
+}
+
+TEST(ShapingOverride, ReloadWhileOverriddenKeepsTheOverride) {
+    std::vector<mtdd::ShapingConfig> applied;
+    mtdd::ShapingOverride state{sample_shaping(),
+                                [&applied](const mtdd::ShapingConfig& s) { applied.push_back(s); }};
+    // Without an override a reload applies the new file's rules.
+    mtdd::ShapingConfig reloaded;
+    reloaded.media_download.user_kbps = 1000;
+    EXPECT_FALSE(state.reload(reloaded));
+    EXPECT_EQ(applied.back(), reloaded);
+
+    state.patch({{"media_upload", {{"user_kbps", 500}}}});
+    const auto overridden = applied.back();
+    mtdd::ShapingConfig newer;
+    newer.media_download.user_kbps = 2000;
+    EXPECT_TRUE(state.reload(newer));
+    EXPECT_EQ(applied.back(), overridden);
+    EXPECT_EQ(state.view()["configured"]["media_download"]["user_kbps"], 2000U);
+    EXPECT_EQ(state.view()["effective"]["media_download"]["user_kbps"], 1000U);
+
+    // Dropping the override lands on the newest configured rules.
+    EXPECT_TRUE(state.reset());
+    EXPECT_EQ(applied.back(), newer);
 }

@@ -199,6 +199,10 @@ mtdd — установка и управление MTProto-прокси
   users reset-quota ИМЯ           Сбросить использованную квоту
   users audit [N]                 Последние N событий журнала аудита
   links [ИМЯ]                     Ссылки подключения (все или одного)
+  shaping                         Медиа-шейпинг: правила, источник, живая нагрузка
+  shaping set ПРАВИЛО ПОЛЕ ЗНАЧ.  Изменить без перезапуска: media_download|media_upload,
+                                  user_kbps|total_kbps|burst_kib|dcs (dcs: -2,-4 или all)
+  shaping reset                   Вернуть правила из файла конфигурации
   suspects [МИН_СОВПАДЕНИЙ]       Подозрительные адреса: признаки, fraud score, отпечаток
   suspects json                   То же в JSON (для сбора с нескольких серверов)
   suspects block [МИН_SCORE]      Заблокировать в nftables адреса со score ≥ МИН_SCORE (по умолчанию 60)
@@ -239,7 +243,7 @@ EOF
 
 # Разбор аргументов: первый позиционный токен — подкоманда управления,
 # остальные позиционные — её аргументы; флаги принадлежат установщику.
-SUBCOMMANDS=" status service start stop restart logs users links suspects rotate metrics host check-config update uninstall menu help "
+SUBCOMMANDS=" status service start stop restart logs users links shaping suspects rotate metrics host check-config update uninstall menu help "
 positional=()
 while (($#)); do
     case $1 in
@@ -664,6 +668,11 @@ elif field in ("rate_limit_up_bytes_per_sec", "rate_limit_down_bytes_per_sec"):
     value = None if raw.lower() in CLEAR else parse_size(raw)
     if value is not None and value < 1024:
         fail("Лимит скорости должен быть не меньше 1K (1024 байт/с)")
+elif field in ("media_rate_limit_up_bytes_per_sec", "media_rate_limit_down_bytes_per_sec"):
+    # none — как в shaping конфига; 0 — без личного медиа-лимита (общий total_kbps действует).
+    value = None if raw.lower() in CLEAR else parse_size(raw)
+    if value is not None and 0 < value < 1024:
+        fail("Медиа-лимит: 0 (без лимита) или не меньше 1K (1024 байт/с)")
 elif field == "max_unique_ips":
     if raw.lower() in CLEAR:
         value = None
@@ -801,6 +810,12 @@ def rate(v):
     return "без лимита" if v is None else size(v) + "/s"
 
 
+def media_rate(v):
+    if v is None:
+        return "по конфигу (shaping)"
+    return "без личного лимита" if v == 0 else size(v) + "/s"
+
+
 used = user.get("quota_used_bytes", data.get("quota_used_bytes", stats.get("quota_used_bytes")))
 rows = [
     ("Имя", user.get("name", "?")),
@@ -812,6 +827,8 @@ rows = [
     ("Ловушка (canary)", "да — каждое подключение считается подозрительным" if user.get("canary") else "нет"),
     ("Скорость ↑", rate(user.get("rate_limit_up_bytes_per_sec"))),
     ("Скорость ↓", rate(user.get("rate_limit_down_bytes_per_sec"))),
+    ("Медиа ↑", media_rate(user.get("media_rate_limit_up_bytes_per_sec"))),
+    ("Медиа ↓", media_rate(user.get("media_rate_limit_down_bytes_per_sec"))),
     ("Макс. соединений", "без лимита" if user.get("max_connections") is None else str(user["max_connections"])),
     ("Заметка", user.get("note") or "—"),
     ("Свой ad_tag", user.get("ad_tag") or "общий"),
@@ -933,7 +950,7 @@ cmd_users() {
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users devices ИМЯ'; return 1; }
             cmd_users_devices "${cargs[1]}" ;;
         set)
-            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|note|ad_tag ЗНАЧЕНИЕ'; return 1; }
+            ((${#cargs[@]} >= 4)) || { err 'Использование: install.sh users set ИМЯ expires_at|data_quota_bytes|max_unique_ips|max_devices|canary|rate_limit_up_bytes_per_sec|rate_limit_down_bytes_per_sec|media_rate_limit_up_bytes_per_sec|media_rate_limit_down_bytes_per_sec|note|ad_tag ЗНАЧЕНИЕ'; return 1; }
             cmd_users_set "${cargs[1]}" "${cargs[2]}" "${cargs[3]}" ;;
         reset-quota)
             ((${#cargs[@]} >= 2)) || { err 'Использование: install.sh users reset-quota ИМЯ'; return 1; }
@@ -942,6 +959,151 @@ cmd_users() {
             cmd_audit "${cargs[1]-}" ;;
         *)
             err "Неизвестное действие users: $action (list|add|enable|disable|remove|rotate|show|devices|set|reset-quota|audit)"
+            return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Медиа-шейпинг: живые правила через API (/v1/shaping), без перезапуска
+# ---------------------------------------------------------------------------
+shaping_body() { # shaping_body ПРАВИЛО ПОЛЕ ЗНАЧЕНИЕ — печатает JSON-тело PATCH или причину отказа (код 1)
+    python3 - "${1-}" "${2-}" "${3-}" <<'PY'
+import json
+import re
+import sys
+
+rule, field, raw = sys.argv[1], sys.argv[2], sys.argv[3].strip()
+MAX_RATE = 100_000_000
+MIN_BURST, MAX_BURST = 16, 1024 * 1024
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+if rule not in ("media_download", "media_upload"):
+    fail("Правило: media_download (загрузка медиа клиентом) или media_upload (отправка)")
+if field in ("user_kbps", "total_kbps"):
+    if not re.fullmatch(r"\d{1,9}", raw) or int(raw) > MAX_RATE:
+        fail("{}: целое число кбит/с от 0 (без лимита) до {}".format(field, MAX_RATE))
+    value = int(raw)
+elif field == "burst_kib":
+    if not re.fullmatch(r"\d{1,7}", raw) or not (int(raw) == 0 or MIN_BURST <= int(raw) <= MAX_BURST):
+        fail("burst_kib: 0 (по умолчанию) или от {} до {} КиБ".format(MIN_BURST, MAX_BURST))
+    value = int(raw)
+elif field == "dcs":
+    if raw.lower() in ("", "all", "none", "-", "все"):
+        value = []
+    else:
+        value = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not re.fullmatch(r"-[1-5]", part):
+                fail("dcs: медиа-DC через запятую (-1…-5), например -2,-4; all — все медиа-DC")
+            if int(part) in value:
+                fail("dcs: DC {} указан дважды".format(part))
+            value.append(int(part))
+else:
+    fail("Поле: user_kbps, total_kbps, burst_kib или dcs")
+print(json.dumps({rule: {field: value}}, ensure_ascii=True, separators=(",", ":")))
+PY
+}
+
+shaping_render() { # shaping_render — читает ответ /v1/shaping из stdin, печатает строки «ПОДПИСЬ<TAB>ЗНАЧЕНИЕ»
+    python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin).get("data") or {}
+
+
+def rate(kbps):
+    kbps = int(kbps or 0)
+    if kbps == 0:
+        return "без лимита"
+    return "{} кбит/с (≈{:.2f} МБ/с)".format(kbps, kbps * 125 / 1e6)
+
+
+def speed(bps):
+    value = float(bps or 0)
+    for unit in ("Б/с", "КиБ/с", "МиБ/с", "ГиБ/с"):
+        if value < 1024 or unit == "ГиБ/с":
+            return "{:.0f} {}".format(value, unit) if unit == "Б/с" else "{:.1f} {}".format(value, unit)
+        value /= 1024
+
+
+def dcs(items):
+    return ", ".join(str(dc) for dc in items) if items else "все медиа-DC"
+
+
+source = data.get("source")
+rows = [("Источник", "API (до перезапуска или reset)" if source == "api" else "файл конфигурации")]
+names = (("media_download", "Медиа ↓ (Telegram → клиент)"), ("media_upload", "Медиа ↑ (клиент → Telegram)"))
+effective = data.get("effective") or {}
+configured = data.get("configured") or {}
+state = data.get("state") or {}
+for key, title in names:
+    rule = effective.get(key) or {}
+    live = state.get(key) or {}
+    rows.append(("", ""))
+    rows.append((title, ""))
+    rows.append(("  На пользователя", rate(rule.get("user_kbps"))))
+    rows.append(("  Всего на сервер", rate(rule.get("total_kbps"))))
+    burst = int(rule.get("burst_kib") or 0)
+    rows.append(("  Запас (burst)", "{} КиБ".format(burst) if burst else "по умолчанию"))
+    rows.append(("  DC", dcs(rule.get("dcs") or [])))
+    if source == "api" and configured.get(key) != rule:
+        base = configured.get(key) or {}
+        rows.append(("  В конфиге", "{} / всего {} / burst {} / DC {}".format(
+            rate(base.get("user_kbps")), rate(base.get("total_kbps")),
+            base.get("burst_kib", 0), dcs(base.get("dcs") or []))))
+    rows.append(("  Активных", "{} (тяжёлых {})".format(live.get("active_users", 0), live.get("heavy_users", 0))))
+    rows.append(("  Лёгкие используют", speed(live.get("light_bytes_per_sec", 0))))
+for label, value in rows:
+    print("{}\t{}".format(label, value))
+'
+}
+
+cmd_shaping_show() {
+    local response rows label value
+    response=$(api_try GET /v1/shaping 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    api_check "$response" 2>/dev/null || { err "Не удалось получить правила шейпинга:$(api_check "$response" 2>&1 || true)"; return 1; }
+    rows=$(printf '%s' "$response" | shaping_render) || { err 'Не удалось разобрать ответ'; return 1; }
+    section 'Медиа-шейпинг'
+    while IFS=$'\t' read -r label value; do
+        if [[ -z $label ]]; then printf '\n'; else kv "$label" "$value"; fi
+    done <<<"$rows"
+}
+
+cmd_shaping_set() { # cmd_shaping_set ПРАВИЛО ПОЛЕ ЗНАЧЕНИЕ — изменить одно поле живого правила
+    local body response msg
+    body=$(shaping_body "${1-}" "${2-}" "${3-}" 2>&1) || { err "$body"; return 1; }
+    response=$(api_try PATCH /v1/shaping "$body" 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    msg=$(api_check "$response" 2>&1) || { err "Не удалось изменить шейпинг:${msg}"; return 1; }
+    ok "Шейпинг $1.$2 обновлён · действует до перезапуска или shaping reset"
+}
+
+cmd_shaping_reset() {
+    local response msg
+    response=$(api_try DELETE /v1/shaping 2>&1) \
+        || { err "Нет связи с API: ${response:-ошибка curl}"; return 1; }
+    msg=$(api_check "$response" 2>&1) || { err "Не удалось сбросить шейпинг:${msg}"; return 1; }
+    ok 'Шейпинг возвращён к правилам из файла конфигурации'
+}
+
+cmd_shaping() { # cmd_shaping [show|set ПРАВИЛО ПОЛЕ ЗНАЧЕНИЕ|reset]
+    local action=${1-show}
+    case $action in
+        show) cmd_shaping_show ;;
+        set)
+            (($# >= 4)) || { err 'Использование: install.sh shaping set media_download|media_upload user_kbps|total_kbps|burst_kib|dcs ЗНАЧЕНИЕ'; return 1; }
+            cmd_shaping_set "$2" "$3" "$4" ;;
+        reset) cmd_shaping_reset ;;
+        *)
+            err "Неизвестное действие shaping: $action (show|set|reset)"
             return 1 ;;
     esac
 }
@@ -2215,6 +2377,7 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
         menu_row 4 'Лимит уникальных IP' 9 'Отключить'
         menu_row 5 'Лимит скорости ↑' 10 'Сбросить квоту'
         menu_row 11 'Лимит устройств' 12 'Устройства'
+        menu_row 13 'Медиа-лимит ↓' 14 'Медиа-лимит ↑'
         menu_row 0 'Назад'
         menu_footer
         menu_read choice '  › ' || return 0
@@ -2230,6 +2393,8 @@ menu_user_policy() { # menu_user_policy ИМЯ — политики одного
             9) menu_run cmd_users_action "$name" disable; menu_pause ;;
             10) menu_run cmd_users_action "$name" reset-quota; menu_pause ;;
             12) menu_run cmd_users_devices "$name"; menu_pause ;;
+            13) menu_ask_set "$name" media_rate_limit_down_bytes_per_sec 'Медиа ↓ в секунду (например 1M; 0 — без личного лимита; Enter/none — как в конфиге)'; menu_pause ;;
+            14) menu_ask_set "$name" media_rate_limit_up_bytes_per_sec 'Медиа ↑ в секунду (например 1M; 0 — без личного лимита; Enter/none — как в конфиге)'; menu_pause ;;
             11) menu_ask_set "$name" max_devices 'Макс. устройств (по auth_key_id; Enter/none — без лимита)'; menu_pause ;;
             0|q|Q) return 0 ;;
             *) : ;;
@@ -2279,6 +2444,37 @@ menu_users() {
                 [[ -n $name ]] && menu_user_policy "$name" ;;
             8)
                 menu_run cmd_audit 20
+                menu_pause ;;
+            0|q|Q) return 0 ;;
+            *) : ;;
+        esac
+    done
+}
+
+menu_shaping() {
+    local choice rule field value
+    while :; do
+        menu_frame 'Медиа-шейпинг' ''
+        menu_row 1 'Правила и нагрузка' 3 'Вернуть из конфига'
+        menu_row 2 'Изменить поле' 0 'Назад'
+        menu_footer
+        menu_read choice '  › ' || return 0
+        case $choice in
+            1) menu_run cmd_shaping_show; menu_pause ;;
+            2)
+                menu_read rule '  › Правило (1 — media_download ↓, 2 — media_upload ↑): ' || return 0
+                case $rule in
+                    1|'') rule=media_download ;;
+                    2) rule=media_upload ;;
+                esac
+                menu_read field '  › Поле (user_kbps, total_kbps, burst_kib, dcs): ' || return 0
+                menu_read value '  › Значение (кбит/с, КиБ или DC через запятую, all — все): ' || return 0
+                [[ -n $field ]] && menu_run cmd_shaping_set "$rule" "$field" "$value"
+                menu_pause ;;
+            3)
+                if confirm 'Сбросить изменения шейпинга из API и вернуть правила конфигурации?'; then
+                    menu_run cmd_shaping_reset
+                fi
                 menu_pause ;;
             0|q|Q) return 0 ;;
             *) : ;;
@@ -2336,7 +2532,7 @@ cmd_menu() {
         menu_row 3 'Ссылки' 8 'Публичный адрес'
         menu_row 4 'Журнал' 9 'Проверить конфигурацию'
         menu_row 5 'Перезапуск службы' 10 'Подозрительные адреса'
-        menu_row 0 'Выход'
+        menu_row 11 'Медиа-шейпинг' 0 'Выход'
         menu_footer
         printf '  %sРаздел — цифра · q — выход%s\n\n' "$dim" "$reset" >/dev/tty
         menu_read choice '  › ' || break
@@ -2351,6 +2547,7 @@ cmd_menu() {
             10)
                 menu_run cmd_suspects list
                 menu_pause ;;
+            11) menu_shaping ;;
             4)
                 menu_run cmd_logs 50
                 menu_pause ;;
@@ -3038,6 +3235,7 @@ if [[ -n $command ]]; then
         logs) mg_require_root && mg_require_install && mg_require_tools && cmd_logs "${cargs[0]-}" ;;
         users) mg_require_root && mg_require_install && mg_require_tools && cmd_users "${cargs[@]}" ;;
         links) mg_require_root && mg_require_install && mg_require_tools && cmd_links "${cargs[@]}" ;;
+        shaping) mg_require_root && mg_require_install && mg_require_tools && cmd_shaping "${cargs[@]}" ;;
         suspects) mg_require_root && mg_require_install && mg_require_tools && cmd_suspects "${cargs[@]}" ;;
         rotate) mg_require_root && mg_require_install && mg_require_tools && cmd_rotate "${cargs[@]}" ;;
         metrics) mg_require_root && mg_require_install && mg_require_tools && cmd_metrics "${cargs[@]}" ;;

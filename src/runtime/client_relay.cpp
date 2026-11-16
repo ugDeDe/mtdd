@@ -404,10 +404,15 @@ void Runtime::Impl::on_client_deadline(Client& client, Time now) {
         return;
     }
     const auto idle = config_.idle_timeout;
-    if (now - client.last_activity >= idle) {
-        close_client(token, control::RelayCloseReason::idle_timeout);
-    } else {
+    if (now - client.last_activity < idle) {
         deadlines_.set(token, client.last_activity + idle);
+    } else if (client.rate_pause_c2s || client.rate_pause_s2c) {
+        // Silent because the proxy itself holds it to its rate share (a large
+        // answer at a small share can take longer than idle_timeout): not the
+        // peer's idleness. Check again a full period after the pause.
+        deadlines_.set(token, now + idle);
+    } else {
+        close_client(token, control::RelayCloseReason::idle_timeout);
     }
 }
 

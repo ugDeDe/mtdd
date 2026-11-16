@@ -30,6 +30,53 @@ std::uint64_t number(const nlohmann::json& value, const char* key, std::uint64_t
     return result;
 }
 
+MediaShapingRule parse_shaping_rule(const nlohmann::json& value, const std::string& name,
+                                    const MediaShapingRule& base) {
+    const std::string prefix = "shaping." + name + ".";
+    if (!value.is_object()) throw std::invalid_argument("shaping." + name + " must be an object");
+    for (const auto& [key, ignored] : value.items()) {
+        (void)ignored;
+        if (key != "user_kbps" && key != "total_kbps" && key != "burst_kib" && key != "dcs")
+            throw std::invalid_argument("unknown configuration option: " + prefix + key);
+    }
+    MediaShapingRule rule = base;
+    try {
+        rule.user_kbps = number(value, "user_kbps", base.user_kbps, 0, kMaxShapingRateKbps);
+        rule.total_kbps = number(value, "total_kbps", base.total_kbps, 0, kMaxShapingRateKbps);
+        rule.burst_kib = number(value, "burst_kib", base.burst_kib, 0, kMaxShapingBurstKib);
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(prefix + error.what());
+    }
+    if (rule.burst_kib != 0 && rule.burst_kib < kMinShapingBurstKib)
+        throw std::invalid_argument(prefix + "burst_kib must be 0 or at least " +
+                                    std::to_string(kMinShapingBurstKib));
+    if (value.contains("dcs")) {
+        const auto& dcs = value.at("dcs");
+        if (!dcs.is_array()) throw std::invalid_argument(prefix + "dcs must be an array");
+        rule.dcs.clear();
+        std::set<std::int16_t> seen;
+        for (const auto& field : dcs) {
+            if (!field.is_number_integer())
+                throw std::invalid_argument(prefix + "dcs entries must be integers");
+            const auto raw = field.get<std::int64_t>();
+            if (raw < -5 || raw > -1)
+                throw std::invalid_argument(prefix + "dcs supports only media DCs -1..-5");
+            const auto dc = static_cast<std::int16_t>(raw);
+            if (!seen.insert(dc).second)
+                throw std::invalid_argument(prefix + "dcs contains a duplicate DC");
+            rule.dcs.push_back(dc);
+        }
+    }
+    return rule;
+}
+
+nlohmann::json shaping_rule_view(const MediaShapingRule& rule) {
+    return {{"user_kbps", rule.user_kbps},
+            {"total_kbps", rule.total_kbps},
+            {"burst_kib", rule.burst_kib},
+            {"dcs", rule.dcs}};
+}
+
 std::string text(const nlohmann::json& value, const char* key, const std::string& fallback) {
     if (!value.contains(key)) return fallback;
     if (!value.at(key).is_string()) throw std::invalid_argument(std::string(key) + " must be a string");
@@ -353,7 +400,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "api_read_token_env", "control_allow",
         "metrics_host", "metrics_port", "metrics_token_env", "metrics_allow", "unique_ip_min_bytes",
         "proxy_protocol", "proxy_protocol_allow", "upstreams", "masking_scope", "me_nat_ip",
-        "me_connections_per_dc_total", "me_ipv6", "me_config_v6_path"};
+        "me_connections_per_dc_total", "me_ipv6", "me_config_v6_path", "shaping"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -553,8 +600,18 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     config.metadata_refresh = std::chrono::seconds(number(value, "metadata_refresh_seconds", 3600, 60, 86400));
     config.client_keepalive = std::chrono::seconds(number(value, "client_keepalive_seconds", 60, 0, 7200));
     config.client_ack_timeout = std::chrono::seconds(number(value, "client_ack_timeout_seconds", 90, 0, 3600));
-    config.media_user_rate_kbps = static_cast<std::uint64_t>(number(value, "media_user_rate_kbps", 0, 0, 100000000));
-    config.media_total_rate_kbps = static_cast<std::uint64_t>(number(value, "media_total_rate_kbps", 0, 0, 100000000));
+    if (value.contains("shaping")) config.shaping = parse_shaping(value.at("shaping"));
+    // Legacy keys: the download rule without burst or DC selection.
+    if (value.contains("media_user_rate_kbps") || value.contains("media_total_rate_kbps")) {
+        if (value.contains("shaping") && value.at("shaping").contains("media_download"))
+            throw std::invalid_argument(
+                "media_user_rate_kbps/media_total_rate_kbps and shaping.media_download are "
+                "mutually exclusive; use shaping.media_download");
+        config.shaping.media_download.user_kbps =
+            number(value, "media_user_rate_kbps", 0, 0, kMaxShapingRateKbps);
+        config.shaping.media_download.total_kbps =
+            number(value, "media_total_rate_kbps", 0, 0, kMaxShapingRateKbps);
+    }
     config.device_window = std::chrono::seconds(number(value, "device_window_seconds", 900, 60, 86400));
     if (config.client_ack_timeout.count() != 0 && config.client_ack_timeout.count() < 10)
         throw std::invalid_argument("client_ack_timeout_seconds must be 0 or at least 10");
@@ -599,6 +656,26 @@ Config Config::load(const std::filesystem::path& path) {
         throw std::invalid_argument("invalid JSON configuration");
     }
 }
+ShapingConfig parse_shaping(const nlohmann::json& value, const ShapingConfig& base) {
+    if (!value.is_object()) throw std::invalid_argument("shaping must be an object");
+    ShapingConfig shaping = base;
+    for (const auto& [key, rule] : value.items()) {
+        if (key == "media_download") {
+            shaping.media_download = parse_shaping_rule(rule, key, base.media_download);
+        } else if (key == "media_upload") {
+            shaping.media_upload = parse_shaping_rule(rule, key, base.media_upload);
+        } else {
+            throw std::invalid_argument("unknown configuration option: shaping." + key);
+        }
+    }
+    return shaping;
+}
+
+nlohmann::json shaping_view(const ShapingConfig& shaping) {
+    return {{"media_download", shaping_rule_view(shaping.media_download)},
+            {"media_upload", shaping_rule_view(shaping.media_upload)}};
+}
+
 nlohmann::json Config::public_view() const {
     nlohmann::json dcs = nlohmann::json::array();
     for (const auto dc : direct_fallback_dcs) dcs.push_back(dc);
@@ -669,7 +746,9 @@ nlohmann::json Config::public_view() const {
         {"direct_fallback_dcs", std::move(dcs)},
         {"upstreams", std::move(upstream_views)},
         {"masking_scope", masking_scope},
-        {"me_nat_ip", me_nat_ip}};
+        {"me_nat_ip", me_nat_ip},
+        {"shaping", shaping_view(shaping)},
+        {"device_window_seconds", device_window.count()}};
 }
 
 nlohmann::json Config::security_posture() const {

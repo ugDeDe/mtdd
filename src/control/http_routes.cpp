@@ -98,7 +98,8 @@ RouteInfo classify_route(evhttp_request* request) {
       {"/v1/events", ApiRoute::events},
       {"/v1/suspects", ApiRoute::suspects},
       {"/v1/ad-tag", ApiRoute::ad_tag},
-      {"/v1/ja4", ApiRoute::ja4}};
+      {"/v1/ja4", ApiRoute::ja4},
+      {"/v1/shaping", ApiRoute::shaping}};
   for (const auto& [fixed, route] : kFixed) {
     if (path == fixed) {
       info.route = route;
@@ -164,6 +165,9 @@ bool method_allowed(ApiRoute route, ApiMethod method) {
       return method == ApiMethod::post;
     case ApiRoute::ad_tag:
       return method == ApiMethod::get || method == ApiMethod::post ||
+             method == ApiMethod::delete_;
+    case ApiRoute::shaping:
+      return method == ApiMethod::get || method == ApiMethod::patch ||
              method == ApiMethod::delete_;
     case ApiRoute::unknown:
       return false;
@@ -428,7 +432,10 @@ std::optional<HttpError> parse_policy_patch(const json& body, UserPolicyPatch& o
   for (const auto& [key, target] :
        {std::pair{"data_quota_bytes", &out.data_quota_bytes},
         std::pair{"rate_limit_up_bytes_per_sec", &out.rate_limit_up_bytes_per_sec},
-        std::pair{"rate_limit_down_bytes_per_sec", &out.rate_limit_down_bytes_per_sec}}) {
+        std::pair{"rate_limit_down_bytes_per_sec", &out.rate_limit_down_bytes_per_sec},
+        std::pair{"media_rate_limit_up_bytes_per_sec", &out.media_rate_limit_up_bytes_per_sec},
+        std::pair{"media_rate_limit_down_bytes_per_sec",
+                  &out.media_rate_limit_down_bytes_per_sec}}) {
     if (auto error = parse_nullable_u64(body, key, UINT64_MAX, *target)) return error;
   }
   if (body.contains("note")) {
@@ -473,6 +480,12 @@ UserPolicy apply_policy_patch(const UserPolicyPatch& patch) {
   if (patch.rate_limit_down_bytes_per_sec) {
     policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
   }
+  if (patch.media_rate_limit_up_bytes_per_sec) {
+    policy.media_rate_limit_up_bytes_per_sec = *patch.media_rate_limit_up_bytes_per_sec;
+  }
+  if (patch.media_rate_limit_down_bytes_per_sec) {
+    policy.media_rate_limit_down_bytes_per_sec = *patch.media_rate_limit_down_bytes_per_sec;
+  }
   if (patch.note) policy.note = *patch.note;
   if (patch.canary) policy.canary = *patch.canary;
   if (patch.tls_domain) {
@@ -502,6 +515,9 @@ json policy_json(const UserPolicy& policy) {
   out["max_devices"] = nullable(policy.max_devices);
   out["rate_limit_up_bytes_per_sec"] = nullable(policy.rate_limit_up_bytes_per_sec);
   out["rate_limit_down_bytes_per_sec"] = nullable(policy.rate_limit_down_bytes_per_sec);
+  out["media_rate_limit_up_bytes_per_sec"] = nullable(policy.media_rate_limit_up_bytes_per_sec);
+  out["media_rate_limit_down_bytes_per_sec"] =
+      nullable(policy.media_rate_limit_down_bytes_per_sec);
   out["note"] = policy.note;
   out["canary"] = policy.canary;
   out["tls_domain"] = policy.tls_domain.empty() ? json(nullptr) : json(policy.tls_domain);

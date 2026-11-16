@@ -2,21 +2,39 @@
 // and the periodic expiry/quota sweep.
 //
 // Rate limit design (per user, enforced per connection):
-//   * A user's limit (UserPolicy::rate_limit_*), the per-user media limit and
-//     the process-wide media cap are each split evenly over the connections
-//     that were active (moved payload) in the last second. Activity is counted
-//     by every reactor in its 1 Hz gauge pass and published to shared counters.
-//   * Each connection keeps its own GCRA state for its share, so connections
-//     slow down evenly and independently: no shared bucket, no shared queue and
-//     no lock or atomic on the hot path. An unlimited connection pays one branch.
+//   * A user's limit (UserPolicy::rate_limit_*) is split evenly over the
+//     user's connections that were active (moved payload) in the last second.
+//     Activity is counted by every reactor in its 1 Hz gauge pass and
+//     published to shared counters.
+//   * Media shaping (Config::shaping, one class per direction) is
+//     hierarchical: the process-wide total is split evenly over the users
+//     active in the class, a user's part (capped by the rule's or the user's
+//     own per-user media limit) over that user's active connections in the
+//     class. A user with many connections therefore gets no more of the total
+//     than a user with one.
+//   * Work-conserving: at every level the split gives "heavy" connections
+//     (held at their share in the last second: paused, or moving >= 90% of
+//     it) what the "light" ones leave unused, never less than the equal
+//     share. Light connections keep the equal share; one that needs more is
+//     paused there, turns heavy on the next 1 Hz pass and then takes part in
+//     the leftover. A user's light connections count against the user, and
+//     light users against the total. The overshoot when light connections
+//     all wake up at once is bounded by one second at the equal share.
+//   * Each connection keeps its own GCRA state for the tightest of its
+//     shares, so connections slow down evenly and independently: no shared
+//     bucket, no shared queue and no lock or atomic on the hot path. An
+//     unlimited connection pays one branch. A media rule's burst_kib sets the
+//     GCRA tolerance while the media share is the binding one.
 //   * An overdrawn connection removes EPOLLIN from the source of that direction
 //     (and holds already-read ME requests); nothing is dropped or buffered
 //     additionally. process_rate_resumes() re-arms it on time.
 #include "internal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace mtdd {
@@ -30,6 +48,8 @@ constexpr std::uint64_t kRateMinBurstBytes = 64U * 1024U;
 // A share never drops below this, so a user with very many active connections
 // still makes progress on each of them.
 constexpr std::uint64_t kRateMinShareBytes = 1024U;
+// Nor does a split media burst drop below this.
+constexpr std::uint64_t kRateMinSplitBurstBytes = 16U * 1024U;
 constexpr std::int64_t kRateMaxCostNs = 1'000'000'000'000'000;
 
 std::int64_t rate_ns_for(std::uint64_t bytes, std::uint64_t rate) noexcept {
@@ -38,9 +58,10 @@ std::int64_t rate_ns_for(std::uint64_t bytes, std::uint64_t rate) noexcept {
                                                            : static_cast<std::int64_t>(ns);
 }
 
-// One second of traffic at the share, at least 64 KiB.
-std::int64_t burst_ns(std::uint64_t rate) noexcept {
-    return rate_ns_for(std::max(rate, kRateMinBurstBytes), rate);
+// GCRA tolerance: `burst` bytes when set, else one second of traffic at the
+// share, at least 64 KiB.
+std::int64_t burst_ns(std::uint64_t rate, std::uint64_t burst) noexcept {
+    return rate_ns_for(burst != 0 ? burst : std::max(rate, kRateMinBurstBytes), rate);
 }
 
 std::uint64_t share_of(std::uint64_t total, std::int64_t active) noexcept {
@@ -55,12 +76,43 @@ std::uint64_t tighter(std::uint64_t left, std::uint64_t right) noexcept {
     return std::min(left, right);
 }
 
+constexpr std::array<control::Direction, 2> kMediaDirections{
+    control::Direction::client_to_server, control::Direction::server_to_client};
+
+using RateClass = control::UserMetrics::RateClass;
+constexpr std::array<RateClass, 2> kAllClasses{RateClass::up, RateClass::down};
+constexpr std::array<RateClass, 2> kMediaClasses{RateClass::media_up, RateClass::media_down};
+
+std::uint64_t nonnegative(std::int64_t value) noexcept {
+    return value > 0 ? static_cast<std::uint64_t>(value) : 0U;
+}
+
+// Work-conserving share of `budget` for one connection among `active`, of
+// which `heavy` are held at their share and the others moved `light` bytes in
+// the last second. 0 = unlimited.
+std::uint64_t fair_share(std::uint64_t budget, std::int64_t active, std::int64_t heavy,
+                         std::int64_t light, bool is_heavy) noexcept {
+    if (budget == 0) return 0;
+    const std::uint64_t equal = share_of(budget, active);
+    if (!is_heavy || heavy <= 0) return equal;
+    const std::uint64_t used = nonnegative(light);
+    const std::uint64_t spare = budget > used ? budget - used : 0;
+    return std::max(equal, spare / static_cast<std::uint64_t>(heavy));
+}
+
 } // namespace
 
 void Runtime::Impl::load_client_rates(Client& client, const control::UserRecord& user) {
     client.policy_up = user.policy.rate_limit_up_bytes_per_sec.value_or(0);
     client.policy_down = user.policy.rate_limit_down_bytes_per_sec.value_or(0);
     client.max_devices = user.policy.max_devices.value_or(0);
+    const std::array<std::optional<std::uint64_t>, 2> media{
+        user.policy.media_rate_limit_up_bytes_per_sec,
+        user.policy.media_rate_limit_down_bytes_per_sec};
+    for (std::size_t index = 0; index < media.size(); ++index) {
+        client.media_policy_set[index] = media[index].has_value();
+        client.media_policy[index] = media[index].value_or(0);
+    }
     recompute_rate_share(client);
     load_client_ad_tag(client, user);
 }
@@ -87,65 +139,153 @@ void Runtime::Impl::load_client_ad_tag(Client& client, const control::UserRecord
     client.has_ad_tag = nonzero;
 }
 
+void Runtime::Impl::assign_media_classes(Client& client, std::int16_t dc) noexcept {
+    for (std::size_t index = 0; index < client.media.size(); ++index) {
+        client.media[index] = shared_->media[index].selects(dc);
+    }
+}
+
 void Runtime::Impl::recompute_rate_share(Client& client) noexcept {
     if (client.metrics) client.share_generation = client.metrics->active_generation();
-    client.share_media_generation =
-        shared_->active_media_generation.load(std::memory_order_relaxed);
-    const std::int64_t all = client.metrics ? client.metrics->active_rate_connections() : 1;
-    std::uint64_t down = share_of(client.policy_down, all);
-    if (client.media) {
-        const std::int64_t media = client.metrics ? client.metrics->active_media_connections() : 1;
-        down = tighter(down, share_of(shared_->media_user_rate.load(std::memory_order_relaxed),
-                                      media));
-        down = tighter(down, share_of(shared_->media_total_rate.load(std::memory_order_relaxed),
-                                      shared_->active_media_total.load(std::memory_order_relaxed)));
+    const auto* metrics = client.metrics.get();
+    const std::int64_t all = metrics ? metrics->active_rate_connections() : 1;
+    const std::array<std::uint64_t, 2> policy{client.policy_up, client.policy_down};
+    // Index 0 = up (client_to_server), 1 = down, as SharedState::media. Both
+    // the connection's own share and what a heavy connection of the user gets
+    // (published for metrics) are computed.
+    std::array<std::uint64_t, 2> rate{};
+    std::array<std::uint64_t, 2> heavy_rate{};
+    std::array<std::uint64_t, 2> burst{};
+    for (std::size_t index = 0; index < 2; ++index) {
+        const std::int64_t heavy = metrics ? metrics->heavy_connections(kAllClasses[index]) : 0;
+        const std::int64_t light = metrics ? metrics->light_bytes(kAllClasses[index]) : 0;
+        rate[index] = fair_share(policy[index], all, heavy, light, client.demand_heavy[index]);
+        heavy_rate[index] = fair_share(policy[index], all, heavy, light, true);
+        if (!client.media[index]) continue;
+        const auto& rule = shared_->media[index];
+        client.share_media_generation[index] = rule.generation.load(std::memory_order_relaxed);
+        const std::uint64_t user_cap = client.media_policy_set[index]
+                                           ? client.media_policy[index]
+                                           : rule.user_rate.load(std::memory_order_relaxed);
+        const std::uint64_t total = rule.total_rate.load(std::memory_order_relaxed);
+        const std::int64_t connections =
+            metrics ? metrics->active_media_connections(kMediaDirections[index]) : 1;
+        const std::int64_t user_heavy =
+            metrics ? metrics->heavy_connections(kMediaClasses[index]) : 0;
+        const std::int64_t user_light = metrics ? metrics->light_bytes(kMediaClasses[index]) : 0;
+        const std::int64_t users = rule.active_users.load(std::memory_order_relaxed);
+        const std::int64_t heavy_users = rule.heavy_users.load(std::memory_order_relaxed);
+        const std::int64_t class_light = rule.light_bytes.load(std::memory_order_relaxed);
+        const auto media_share = [&](bool is_heavy) {
+            // Per-user cap: water-filled over the user's own connections.
+            const std::uint64_t by_user =
+                fair_share(user_cap, connections, user_heavy, user_light, is_heavy);
+            // Total: equal part of an equal user part, or for a heavy
+            // connection what light users and light connections leave,
+            // split over heavy users and then the user's heavy connections.
+            std::uint64_t by_total = 0;
+            if (total != 0) {
+                by_total = share_of(share_of(total, users), connections);
+                if (is_heavy && heavy_users > 0 && user_heavy > 0) {
+                    const std::uint64_t used = nonnegative(class_light);
+                    const std::uint64_t spare = total > used ? total - used : 0;
+                    by_total = std::max(by_total, spare / static_cast<std::uint64_t>(heavy_users) /
+                                                      static_cast<std::uint64_t>(user_heavy));
+                }
+            }
+            return tighter(by_user, by_total);
+        };
+        heavy_rate[index] = tighter(heavy_rate[index], media_share(true));
+        const std::uint64_t share = media_share(client.demand_heavy[index]);
+        if (share == 0) continue;
+        if (rate[index] == 0 || share <= rate[index]) {
+            rate[index] = share;
+            const std::uint64_t rule_burst = rule.burst.load(std::memory_order_relaxed);
+            if (rule_burst != 0) {
+                const auto n = static_cast<std::uint64_t>(std::max<std::int64_t>(connections, 1));
+                burst[index] = std::max(rule_burst / n, kRateMinSplitBurstBytes);
+            }
+        }
     }
-    client.rate_down = down;
-    client.rate_up = share_of(client.policy_up, all);
+    client.rate_up = rate[0];
+    client.rate_down = rate[1];
+    client.burst_up = burst[0];
+    client.burst_down = burst[1];
+    if (client.metrics && client.counted_active) {
+        client.metrics->set_rate_share(control::Direction::client_to_server, heavy_rate[0]);
+        client.metrics->set_rate_share(control::Direction::server_to_client, heavy_rate[1]);
+    }
 }
 
 bool Runtime::Impl::rate_limited(const Client& client) const noexcept {
     if (client.policy_up != 0 || client.policy_down != 0) return true;
-    return client.media &&
-           (shared_->media_user_rate.load(std::memory_order_relaxed) != 0 ||
-            shared_->media_total_rate.load(std::memory_order_relaxed) != 0);
+    for (std::size_t index = 0; index < 2; ++index) {
+        if (!client.media[index]) continue;
+        const auto& rule = shared_->media[index];
+        const bool user_limited = client.media_policy_set[index]
+                                      ? client.media_policy[index] != 0
+                                      : rule.user_rate.load(std::memory_order_relaxed) != 0;
+        if (user_limited || rule.total_rate.load(std::memory_order_relaxed) != 0) return true;
+    }
+    return false;
 }
 
 void Runtime::Impl::set_counted_active(Client& client, bool active) noexcept {
     if (client.counted_active == active || !client.metrics) return;
     client.counted_active = active;
     const std::int64_t delta = active ? 1 : -1;
-    client.metrics->add_active_connections(delta, client.media ? delta : 0);
-    if (client.media) {
-        shared_->active_media_total.fetch_add(delta, std::memory_order_relaxed);
-        shared_->active_media_generation.fetch_add(1, std::memory_order_relaxed);
+    // An idle or closed connection takes its demand out of the split.
+    if (!active) {
+        for (std::size_t index = 0; index < 2; ++index) set_rate_demand(client, index, false, 0);
+    }
+    client.metrics->add_active_connections(delta);
+    for (std::size_t index = 0; index < 2; ++index) {
+        if (!client.media[index]) continue;
+        auto& rule = shared_->media[index];
+        const int users = client.metrics->add_active_media(kMediaDirections[index], delta);
+        if (users != 0) rule.active_users.fetch_add(users, std::memory_order_relaxed);
+        rule.generation.fetch_add(1, std::memory_order_relaxed);
     }
     // A newly active connection takes its share right away; the others of
     // the user adjust on the next 1 Hz pass.
     if (active) recompute_rate_share(client);
 }
 
+bool Runtime::Impl::rate_share_stale(const Client& client) const noexcept {
+    if (client.metrics && client.metrics->active_generation() != client.share_generation) {
+        return true;
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+        if (client.media[index] &&
+            shared_->media[index].generation.load(std::memory_order_relaxed) !=
+                client.share_media_generation[index]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Runtime::Impl::charge_rate(Client& client, control::Direction direction,
                                 std::uint64_t bytes, Time now) {
-    // The split changed (a connection of this user, or a media connection
-    // anywhere, became active or idle): take the new share before charging.
-    if ((client.metrics && client.metrics->active_generation() != client.share_generation) ||
-        (client.media && shared_->active_media_generation.load(std::memory_order_relaxed) !=
-                             client.share_media_generation)) {
-        recompute_rate_share(client);
-    }
+    // The split changed (a connection of this user, or a media user anywhere,
+    // became active or idle, or the rule was reloaded): take the new share
+    // before charging.
+    if (rate_share_stale(client)) recompute_rate_share(client);
     const bool up = direction == control::Direction::client_to_server;
     const std::uint64_t rate = up ? client.rate_up : client.rate_down;
     if (rate == 0) return;
+    client.rate_window[up ? 0 : 1] += bytes;
     const std::int64_t now_ns = steady_ns(now);
     std::int64_t& tat = up ? client.rate_tat_up : client.rate_tat_down;
     tat = std::max(tat, now_ns) + rate_ns_for(bytes, rate);
-    const std::int64_t resume = tat - burst_ns(rate);
+    const std::int64_t resume = tat - burst_ns(rate, up ? client.burst_up : client.burst_down);
     if (resume <= now_ns) return;
     bool& flag = up ? client.rate_pause_c2s : client.rate_pause_s2c;
     if (flag) return;
     flag = true;
-    if (!up && client.media) stats_.media_throttled();
+    client.rate_window_paused[up ? 0 : 1] = true;
+    if (up && client.media[0]) stats_.media_upload_throttled();
+    if (!up && client.media[1]) stats_.media_throttled();
     if (!client.rate_listed) {
         client.rate_listed = true;
         rate_clients_.push_back(client.token);
@@ -154,6 +294,60 @@ void Runtime::Impl::charge_rate(Client& client, control::Direction direction,
     if (at < next_rate_resume_) next_rate_resume_ = at;
     update_client_interest(client);
     if (client.route == Client::Route::direct) update_direct_interest(client);
+}
+
+void Runtime::Impl::set_rate_demand(Client& client, std::size_t direction, bool heavy,
+                                    std::int64_t light) noexcept {
+    if (!client.metrics) return;
+    const std::int64_t heavy_delta =
+        static_cast<std::int64_t>(heavy) - static_cast<std::int64_t>(client.demand_heavy[direction]);
+    const std::int64_t light_delta = light - client.demand_light[direction];
+    if (heavy_delta == 0 && light_delta == 0) return;
+    client.demand_heavy[direction] = heavy;
+    client.demand_light[direction] = light;
+    client.metrics->add_heavy_connections(kAllClasses[direction], heavy_delta);
+    client.metrics->add_light_bytes(kAllClasses[direction], light_delta);
+    if (!client.media[direction]) return;
+    auto& rule = shared_->media[direction];
+    const int users = client.metrics->add_heavy_connections(kMediaClasses[direction], heavy_delta);
+    client.metrics->add_light_bytes(kMediaClasses[direction], light_delta);
+    if (users != 0) rule.heavy_users.fetch_add(users, std::memory_order_relaxed);
+    if (light_delta != 0) rule.light_bytes.fetch_add(light_delta, std::memory_order_relaxed);
+    // A heavy-set change moves everyone's share; light bytes alone are picked
+    // up by the 1 Hz recompute.
+    if (heavy_delta != 0) rule.generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Runtime::Impl::update_rate_demand(Client& client) noexcept {
+    const std::array<std::uint64_t, 2> rate{client.rate_up, client.rate_down};
+    const std::array<bool, 2> paused{client.rate_pause_c2s, client.rate_pause_s2c};
+    for (std::size_t index = 0; index < 2; ++index) {
+        bool heavy = false;
+        std::int64_t light = 0;
+        if (client.counted_active && rate[index] != 0) {
+            const std::uint64_t moved = client.rate_window[index];
+            heavy = client.rate_window_paused[index] || paused[index] ||
+                    moved / 9U >= rate[index] / 10U;
+            if (!heavy) light = static_cast<std::int64_t>(moved);
+        }
+        set_rate_demand(client, index, heavy, light);
+        client.rate_window[index] = 0;
+        client.rate_window_paused[index] = false;
+    }
+}
+
+void Runtime::Impl::publish_shaping_state() noexcept {
+    for (std::size_t index = 0; index < shared_->media.size(); ++index) {
+        const auto& rule = shared_->media[index];
+        control::ShapingClassSnapshot entry;
+        entry.user_rate_bytes_per_sec = rule.user_rate.load(std::memory_order_relaxed);
+        entry.total_rate_bytes_per_sec = rule.total_rate.load(std::memory_order_relaxed);
+        entry.burst_bytes = rule.burst.load(std::memory_order_relaxed);
+        entry.active_users = std::max<std::int64_t>(rule.active_users.load(std::memory_order_relaxed), 0);
+        entry.heavy_users = std::max<std::int64_t>(rule.heavy_users.load(std::memory_order_relaxed), 0);
+        entry.light_bytes_per_sec = nonnegative(rule.light_bytes.load(std::memory_order_relaxed));
+        stats_.set_shaping_class(index, entry);
+    }
 }
 
 void Runtime::Impl::process_rate_resumes(Time now) {
@@ -171,9 +365,10 @@ void Runtime::Impl::process_rate_resumes(Time now) {
         Client& client = *found->second;
         bool changed = false;
         bool s2c_resumed = false;
-        const auto check = [&](bool& flag, std::int64_t tat, std::uint64_t rate, bool s2c) {
+        const auto check = [&](bool& flag, std::int64_t tat, std::uint64_t rate,
+                               std::uint64_t burst, bool s2c) {
             if (!flag) return;
-            const std::int64_t resume = rate == 0 ? 0 : tat - burst_ns(rate);
+            const std::int64_t resume = rate == 0 ? 0 : tat - burst_ns(rate, burst);
             if (resume <= now_ns) {
                 flag = false;
                 changed = true;
@@ -182,8 +377,9 @@ void Runtime::Impl::process_rate_resumes(Time now) {
                 next = std::min(next, Time(std::chrono::nanoseconds(resume)));
             }
         };
-        check(client.rate_pause_c2s, client.rate_tat_up, client.rate_up, false);
-        check(client.rate_pause_s2c, client.rate_tat_down, client.rate_down, true);
+        check(client.rate_pause_c2s, client.rate_tat_up, client.rate_up, client.burst_up, false);
+        check(client.rate_pause_s2c, client.rate_tat_down, client.rate_down, client.burst_down,
+              true);
         if (changed) {
             update_client_interest(client);
             if (client.route == Client::Route::direct) {

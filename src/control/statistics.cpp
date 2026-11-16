@@ -20,7 +20,7 @@ namespace {
 constexpr size_t kRejectReasonCount = 13;
 constexpr size_t kHandshakeResultCount = 4;
 constexpr size_t kBufferStateCount = 3;
-constexpr size_t kApiRouteCount = 22;
+constexpr size_t kApiRouteCount = 23;
 constexpr size_t kApiMethodCount = 5;
 constexpr size_t kApiStatusCount = 14;
 constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
@@ -59,7 +59,7 @@ constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
     "/v1/stats/summary", "/v1/stats/me", "/v1/stats/users", "/v1/events",
     "/v1/users/{name}/enable", "/v1/users/{name}/disable",
     "/v1/users/{name}/reset-quota", "/v1/users/{name}/devices", "/v1/suspects",
-    "/v1/ad-tag", "/v1/ja4"};
+    "/v1/ad-tag", "/v1/ja4", "/v1/shaping"};
 
 constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
     "GET", "POST", "PATCH", "DELETE", "OTHER"};
@@ -137,6 +137,7 @@ size_t route_index(ApiRoute route) {
     case ApiRoute::suspects: return 19;
     case ApiRoute::ad_tag: return 20;
     case ApiRoute::ja4: return 21;
+    case ApiRoute::shaping: return 22;
   }
   return 7;
 }
@@ -287,21 +288,25 @@ int64_t UserMetrics::quota_reset_at() const noexcept {
 }
 
 namespace {
-constexpr uint64_t kRateMinBurstBytes = 64 * 1024;
-constexpr int64_t kRateMaxCostNs = 1'000'000'000'000'000;  // ~11.5 days
-
-int64_t rate_ns_for(uint64_t bytes, uint64_t rate) noexcept {
-  const long double ns = static_cast<long double>(bytes) * 1e9L /
-                         static_cast<long double>(rate);
-  if (ns >= static_cast<long double>(kRateMaxCostNs)) return kRateMaxCostNs;
-  return static_cast<int64_t>(ns);
+std::size_t media_index(Direction direction) noexcept {
+  return direction == Direction::client_to_server ? 0 : 1;
 }
 }  // namespace
 
-void UserMetrics::add_active_connections(int64_t all, int64_t media) noexcept {
-  if (all != 0) active_rate_conns_.fetch_add(all, std::memory_order_relaxed);
-  if (media != 0) active_media_conns_.fetch_add(media, std::memory_order_relaxed);
-  if (all != 0 || media != 0) active_generation_.fetch_add(1, std::memory_order_relaxed);
+void UserMetrics::add_active_connections(int64_t delta) noexcept {
+  if (delta == 0) return;
+  active_rate_conns_.fetch_add(delta, std::memory_order_relaxed);
+  active_generation_.fetch_add(1, std::memory_order_relaxed);
+}
+int UserMetrics::add_active_media(Direction direction, int64_t delta) noexcept {
+  if (delta == 0) return 0;
+  const int64_t before =
+      active_media_conns_[media_index(direction)].fetch_add(delta, std::memory_order_relaxed);
+  active_generation_.fetch_add(1, std::memory_order_relaxed);
+  const int64_t after = before + delta;
+  if (before <= 0 && after > 0) return 1;
+  if (before > 0 && after <= 0) return -1;
+  return 0;
 }
 uint64_t UserMetrics::active_generation() const noexcept {
   return active_generation_.load(std::memory_order_relaxed);
@@ -309,37 +314,35 @@ uint64_t UserMetrics::active_generation() const noexcept {
 int64_t UserMetrics::active_rate_connections() const noexcept {
   return active_rate_conns_.load(std::memory_order_relaxed);
 }
-int64_t UserMetrics::active_media_connections() const noexcept {
-  return active_media_conns_.load(std::memory_order_relaxed);
+int64_t UserMetrics::active_media_connections(Direction direction) const noexcept {
+  return active_media_conns_[media_index(direction)].load(std::memory_order_relaxed);
 }
-uint64_t UserMetrics::rate_burst_bytes(uint64_t rate_bytes_per_sec) noexcept {
-  return std::max(rate_bytes_per_sec, kRateMinBurstBytes);
+int UserMetrics::add_heavy_connections(RateClass rate_class, int64_t delta) noexcept {
+  if (delta == 0) return 0;
+  const int64_t before = heavy_conns_[static_cast<size_t>(rate_class)].fetch_add(
+      delta, std::memory_order_relaxed);
+  active_generation_.fetch_add(1, std::memory_order_relaxed);
+  const int64_t after = before + delta;
+  if (before <= 0 && after > 0) return 1;
+  if (before > 0 && after <= 0) return -1;
+  return 0;
 }
-int64_t UserMetrics::rate_consume(Direction direction, uint64_t bytes,
-                                  uint64_t rate_bytes_per_sec,
-                                  int64_t now_ns) noexcept {
-  if (rate_bytes_per_sec == 0) return 0;
-  auto& tat = rate_tat_[direction == Direction::client_to_server ? 0 : 1];
-  const int64_t cost = rate_ns_for(bytes, rate_bytes_per_sec);
-  int64_t current = tat.load(std::memory_order_relaxed);
-  int64_t next = 0;
-  do {
-    next = std::max(current, now_ns) + cost;
-  } while (!tat.compare_exchange_weak(current, next, std::memory_order_relaxed,
-                                      std::memory_order_relaxed));
-  const int64_t resume =
-      next - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
-  return resume > now_ns ? resume : 0;
+void UserMetrics::add_light_bytes(RateClass rate_class, int64_t delta) noexcept {
+  if (delta != 0) {
+    light_bytes_[static_cast<size_t>(rate_class)].fetch_add(delta, std::memory_order_relaxed);
+  }
 }
-int64_t UserMetrics::rate_resume_at(Direction direction, uint64_t rate_bytes_per_sec,
-                                    int64_t now_ns) const noexcept {
-  if (rate_bytes_per_sec == 0) return 0;
-  const int64_t tat =
-      rate_tat_[direction == Direction::client_to_server ? 0 : 1].load(
-          std::memory_order_relaxed);
-  const int64_t resume =
-      tat - rate_ns_for(rate_burst_bytes(rate_bytes_per_sec), rate_bytes_per_sec);
-  return resume > now_ns ? resume : 0;
+int64_t UserMetrics::heavy_connections(RateClass rate_class) const noexcept {
+  return heavy_conns_[static_cast<size_t>(rate_class)].load(std::memory_order_relaxed);
+}
+int64_t UserMetrics::light_bytes(RateClass rate_class) const noexcept {
+  return light_bytes_[static_cast<size_t>(rate_class)].load(std::memory_order_relaxed);
+}
+void UserMetrics::set_rate_share(Direction direction, uint64_t bytes_per_sec) noexcept {
+  rate_share_[media_index(direction)].store(bytes_per_sec, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::rate_share(Direction direction) const noexcept {
+  return rate_share_[media_index(direction)].load(std::memory_order_relaxed);
 }
 uint64_t UserMetrics::active_connections() const noexcept {
   return active_.load(std::memory_order_relaxed);
@@ -546,6 +549,9 @@ struct Statistics::Impl {
   std::atomic<uint64_t> auto_delay_us{0};
   std::array<std::atomic<uint64_t>, kRelayCloseReasons> relay_closes{};
   std::atomic<uint64_t> media_throttled{0};
+  std::atomic<uint64_t> media_upload_throttled{0};
+  mutable std::mutex shaping_mutex;
+  std::array<ShapingClassSnapshot, 2> shaping{};
   std::atomic<uint64_t> hello_throttled{0};
   std::atomic<uint64_t> hello_hmac_attempts{0};
   std::atomic<uint64_t> replay_evicted{0};
@@ -800,6 +806,14 @@ void Statistics::set_client_pool(std::size_t worker, uint64_t pooled,
 }
 void Statistics::media_throttled() noexcept {
   impl_->media_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::media_upload_throttled() noexcept {
+  impl_->media_upload_throttled.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::set_shaping_class(size_t index, const ShapingClassSnapshot& value) noexcept {
+  if (index >= impl_->shaping.size()) return;
+  std::lock_guard<std::mutex> lock(impl_->shaping_mutex);
+  impl_->shaping[index] = value;
 }
 void Statistics::hello_throttled() noexcept {
   impl_->hello_throttled.fetch_add(1, std::memory_order_relaxed);
@@ -1234,6 +1248,14 @@ StatisticsSnapshot Statistics::snapshot() const {
       entry.payload_s2c_bytes = metrics->payload_s2c_bytes();
       entry.quota_used_bytes = metrics->quota_used_bytes();
       entry.quota_reset_at = metrics->quota_reset_at();
+      entry.rate_active_connections =
+          std::max<int64_t>(metrics->active_rate_connections(), 0);
+      using RateClass = UserMetrics::RateClass;
+      entry.rate_heavy_connections = {
+          std::max<int64_t>(metrics->heavy_connections(RateClass::up), 0),
+          std::max<int64_t>(metrics->heavy_connections(RateClass::down), 0)};
+      entry.rate_share_bytes_per_sec = {metrics->rate_share(Direction::client_to_server),
+                                        metrics->rate_share(Direction::server_to_client)};
       out.users.emplace(name, entry);
     }
   }
@@ -1325,6 +1347,12 @@ StatisticsSnapshot Statistics::snapshot() const {
   }
   out.suspect_shadow_bans_total = impl_->suspect_shadow_bans.load(std::memory_order_relaxed);
   out.media_throttled_total = impl_->media_throttled.load(std::memory_order_relaxed);
+  out.media_upload_throttled_total =
+      impl_->media_upload_throttled.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(impl_->shaping_mutex);
+    out.shaping = impl_->shaping;
+  }
   out.replay_cache_entries = replay_entries;
   out.replay_cache_evicted_total = impl_->replay_evicted.load(std::memory_order_relaxed);
   out.hello_throttled_total = impl_->hello_throttled.load(std::memory_order_relaxed);
@@ -1570,6 +1598,19 @@ std::string Statistics::prometheus_text() const {
                   metrics.unique_ips_active);
     append_metric(out, "mtdd_user_devices", label, metrics.devices);
     append_metric(out, "mtdd_user_devices_connected", label, metrics.devices_connected);
+    // Rate shaping gauges only for users with an active limited connection.
+    if (metrics.rate_active_connections > 0) {
+      append_metric(out, "mtdd_user_rate_active_connections", label,
+                    static_cast<uint64_t>(metrics.rate_active_connections));
+      append_metric(out, "mtdd_user_rate_heavy_connections", label + ",direction=\"c2s\"",
+                    static_cast<uint64_t>(metrics.rate_heavy_connections[0]));
+      append_metric(out, "mtdd_user_rate_heavy_connections", label + ",direction=\"s2c\"",
+                    static_cast<uint64_t>(metrics.rate_heavy_connections[1]));
+      append_metric(out, "mtdd_user_rate_share_bytes_per_second",
+                    label + ",direction=\"c2s\"", metrics.rate_share_bytes_per_sec[0]);
+      append_metric(out, "mtdd_user_rate_share_bytes_per_second",
+                    label + ",direction=\"s2c\"", metrics.rate_share_bytes_per_sec[1]);
+    }
     append_metric(out, "mtdd_user_payload_bytes_received_total",
                   label + ",direction=\"c2s\"", metrics.payload_c2s_bytes);
     append_metric(out, "mtdd_user_payload_bytes_received_total",
@@ -1614,6 +1655,51 @@ std::string Statistics::prometheus_text() const {
   }
 
   append_metric(out, "mtdd_media_throttled_total", "", snapshot.media_throttled_total);
+  append_metric(out, "mtdd_media_upload_throttled_total", "",
+                snapshot.media_upload_throttled_total);
+  {
+    static constexpr std::array<std::string_view, 2> kShapingClasses{
+        "class=\"media_upload\"", "class=\"media_download\""};
+    out << "# HELP mtdd_shaping_limit_bytes_per_second Configured media shaping "
+           "rate per class and scope (user, total), bytes/s; 0 = unlimited.\n";
+    out << "# TYPE mtdd_shaping_limit_bytes_per_second gauge\n";
+    for (size_t index = 0; index < snapshot.shaping.size(); ++index) {
+      const auto& entry = snapshot.shaping[index];
+      const std::string label(kShapingClasses[index]);
+      append_metric(out, "mtdd_shaping_limit_bytes_per_second", label + ",scope=\"user\"",
+                    entry.user_rate_bytes_per_sec);
+      append_metric(out, "mtdd_shaping_limit_bytes_per_second", label + ",scope=\"total\"",
+                    entry.total_rate_bytes_per_sec);
+    }
+    out << "# HELP mtdd_shaping_burst_bytes Media shaping burst per class; "
+           "0 = one second of the share.\n";
+    out << "# TYPE mtdd_shaping_burst_bytes gauge\n";
+    for (size_t index = 0; index < snapshot.shaping.size(); ++index) {
+      append_metric(out, "mtdd_shaping_burst_bytes", kShapingClasses[index],
+                    snapshot.shaping[index].burst_bytes);
+    }
+    out << "# HELP mtdd_shaping_active_users Users with an active rate-limited "
+           "connection in the media shaping class.\n";
+    out << "# TYPE mtdd_shaping_active_users gauge\n";
+    for (size_t index = 0; index < snapshot.shaping.size(); ++index) {
+      append_metric(out, "mtdd_shaping_active_users", kShapingClasses[index],
+                    static_cast<uint64_t>(snapshot.shaping[index].active_users));
+    }
+    out << "# HELP mtdd_shaping_heavy_users Users with a connection held at its "
+           "share in the media shaping class.\n";
+    out << "# TYPE mtdd_shaping_heavy_users gauge\n";
+    for (size_t index = 0; index < snapshot.shaping.size(); ++index) {
+      append_metric(out, "mtdd_shaping_heavy_users", kShapingClasses[index],
+                    static_cast<uint64_t>(snapshot.shaping[index].heavy_users));
+    }
+    out << "# HELP mtdd_shaping_light_bytes_per_second Last-second payload of the "
+           "class's connections below their share (left over for heavy ones).\n";
+    out << "# TYPE mtdd_shaping_light_bytes_per_second gauge\n";
+    for (size_t index = 0; index < snapshot.shaping.size(); ++index) {
+      append_metric(out, "mtdd_shaping_light_bytes_per_second", kShapingClasses[index],
+                    snapshot.shaping[index].light_bytes_per_sec);
+    }
+  }
   if (snapshot.backpressure_c2s_total != 0) {
     append_metric(out, "mtdd_backpressure_events_total", "direction=\"c2s\"",
                   snapshot.backpressure_c2s_total);

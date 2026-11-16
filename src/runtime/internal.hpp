@@ -1145,16 +1145,46 @@ struct SharedState {
     std::mutex ad_tag_mutex;
     std::array<std::uint8_t, 16> ad_tag{};
     std::atomic<std::uint64_t> ad_tag_generation{0};
-    // Media shaping (signed DC < 0, server-to-client bytes), bytes/s; 0 = off.
-    // A limit is split evenly over the currently active media connections
-    // (per user, and process-wide for the total cap).
-    std::atomic<std::uint64_t> media_user_rate{0};
-    std::atomic<std::uint64_t> media_total_rate{0};
-    std::atomic<std::int64_t> active_media_total{0};
-    std::atomic<std::uint64_t> active_media_generation{0};
-    void set_media_rates(std::uint64_t user_rate, std::uint64_t total_rate) noexcept {
-        media_user_rate.store(user_rate, std::memory_order_relaxed);
-        media_total_rate.store(total_rate, std::memory_order_relaxed);
+    // Media shaping classes (Config::shaping), indexed by media_class():
+    // [0] = media_upload (client -> Telegram), [1] = media_download.
+    // Rates and burst are bytes/s and bytes, 0 = off/default. The total rate
+    // is split evenly over the users active in the class (active_users), and
+    // each user's part over that user's active connections in the class.
+    struct MediaShaping {
+        std::atomic<std::uint64_t> user_rate{0};
+        std::atomic<std::uint64_t> total_rate{0};
+        std::atomic<std::uint64_t> burst{0};
+        // Bit (-dc - 1) for each selected media DC -1..-5; 0 = all media DCs.
+        std::atomic<std::uint32_t> dc_mask{0};
+        std::atomic<std::int64_t> active_users{0};
+        // Users with a heavy connection in the class, and the last-second
+        // payload of the class's light connections (work-conserving split).
+        std::atomic<std::int64_t> heavy_users{0};
+        std::atomic<std::int64_t> light_bytes{0};
+        // Bumped when active_users or the rule changes, so connections in the
+        // class recompute their share before the next charge.
+        std::atomic<std::uint64_t> generation{0};
+        bool selects(std::int16_t dc) const noexcept {
+            if (dc >= 0) return false;
+            const std::uint32_t mask = dc_mask.load(std::memory_order_relaxed);
+            if (mask == 0) return true;
+            return dc >= -5 && (mask & (1U << static_cast<unsigned>(-dc - 1))) != 0;
+        }
+    };
+    std::array<MediaShaping, 2> media;
+    void set_shaping(const ShapingConfig& shaping) noexcept {
+        const auto apply = [](MediaShaping& target, const MediaShapingRule& rule) {
+            std::uint32_t mask = 0;
+            for (const auto dc : rule.dcs) mask |= 1U << static_cast<unsigned>(-dc - 1);
+            // kbit/s -> bytes/s, KiB -> bytes.
+            target.user_rate.store(rule.user_kbps * 125U, std::memory_order_relaxed);
+            target.total_rate.store(rule.total_kbps * 125U, std::memory_order_relaxed);
+            target.burst.store(rule.burst_kib * 1024U, std::memory_order_relaxed);
+            target.dc_mask.store(mask, std::memory_order_relaxed);
+            target.generation.fetch_add(1, std::memory_order_relaxed);
+        };
+        apply(media[0], shaping.media_upload);
+        apply(media[1], shaping.media_download);
     }
     // SIGHUP handler installed before run(); invoked on the signal reactor.
     std::function<void()> reload_hook;
@@ -1409,8 +1439,16 @@ struct Runtime::Impl {
         // share in bytes/s (0 = unlimited); the hot path is one branch.
         std::uint64_t rate_up{0};
         std::uint64_t rate_down{0};
+        // GCRA tolerance of the current share, bytes; 0 = the default (one
+        // second of the share, at least 64 KiB). Set by a media burst_kib.
+        std::uint64_t burst_up{0};
+        std::uint64_t burst_down{0};
         std::uint64_t policy_up{0};    // user's configured total, bytes/s
         std::uint64_t policy_down{0};
+        // Personal media limits (UserPolicy::media_rate_limit_*), indexed like
+        // SharedState::media: bytes/s, 0 = exempt; only when media_policy_set.
+        std::array<std::uint64_t, 2> media_policy{};
+        std::array<bool, 2> media_policy_set{};
         std::int64_t rate_tat_up{0};   // GCRA theoretical arrival time, ns
         std::int64_t rate_tat_down{0};
         // Payload bytes moved since the last 1 Hz pass. A limited connection
@@ -1418,9 +1456,18 @@ struct Runtime::Impl {
         // by the 1 Hz pass after a silent second, or on close.
         std::uint64_t window_bytes{0};
         bool counted_active{false};
-        // Generations the current share was computed for (user, media total).
+        // Work-conserving split, per direction ([0] = up, [1] = down): bytes
+        // charged against a limited direction and whether it was paused since
+        // the last 1 Hz pass, and this connection's published contribution
+        // (heavy = held at its share; light = last-second payload otherwise).
+        std::array<std::uint64_t, 2> rate_window{};
+        std::array<bool, 2> rate_window_paused{};
+        std::array<bool, 2> demand_heavy{};
+        std::array<std::int64_t, 2> demand_light{};
+        // Generations the current share was computed for (user, and each
+        // media class).
         std::uint64_t share_generation{0};
-        std::uint64_t share_media_generation{0};
+        std::array<std::uint64_t, 2> share_media_generation{};
         // While set, reading from the source of that direction is disabled
         // (EPOLLIN removed); process_rate_resumes() re-arms it.
         bool rate_pause_c2s{false};
@@ -1498,8 +1545,10 @@ struct Runtime::Impl {
         // published once by close_client() for authenticated sessions.
         control::RelayCloseReason close_reason{control::RelayCloseReason::other};
         bool close_reason_set{false};
-        // Signed DC < 0 (file/photo/video downloads): subject to media limits.
-        bool media{false};
+        // Media shaping classes this connection belongs to, fixed when its DC
+        // is known (signed DC < 0 selected by the rule's dcs), indexed like
+        // SharedState::media. Active counts are kept by these flags.
+        std::array<bool, 2> media{};
         // Device accounting (max_devices): the first non-zero auth_key_id the
         // connection presents, registered once in SharedState::devices.
         std::uint64_t auth_key_id{0};
@@ -1886,6 +1935,16 @@ struct Runtime::Impl {
     // this reactor's active-connection counts (1 Hz, from the gauge pass).
     void recompute_rate_share(Client& client) noexcept;
     bool rate_limited(const Client& client) const noexcept;
+    bool rate_share_stale(const Client& client) const noexcept;
+    // 1 Hz: classify each limited direction as heavy or light from the last
+    // second and publish the change to the user's and the media counters.
+    void update_rate_demand(Client& client) noexcept;
+    void set_rate_demand(Client& client, std::size_t direction, bool heavy,
+                         std::int64_t light) noexcept;
+    // 1 Hz on reactor 0: publish the media shaping classes to statistics.
+    void publish_shaping_state() noexcept;
+    // Media shaping classes of a connection to signed DC `dc`.
+    void assign_media_classes(Client& client, std::int16_t dc) noexcept;
     void set_counted_active(Client& client, bool active) noexcept;
     // Hot path: one add, plus one shared increment when a limited connection
     // becomes active.
@@ -2270,7 +2329,7 @@ struct Runtime::RuntimeState {
     std::vector<std::uint64_t> replay_rejections_per_worker() const;
     void set_tunables(std::uint32_t me_clients_per_writer, std::uint32_t me_connections_per_dc);
     void set_me_writer_cap(std::uint32_t me_connections_per_dc_total);
-    void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+    void set_shaping(const ShapingConfig& shaping) noexcept;
     void set_ad_tag(const std::array<std::uint8_t, 16>& tag);
     void on_reload(std::function<void()> hook);
 

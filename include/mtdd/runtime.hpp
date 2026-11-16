@@ -40,6 +40,25 @@
 namespace mtdd {
 
 struct Config;
+struct ShapingConfig;
+
+// Live state of one media shaping class (Runtime::shaping_state()).
+struct ShapingClassState {
+    // Users with at least one rate-limited connection in the class that moved
+    // payload in the last second; the total is split over these.
+    std::int64_t active_users{0};
+    // Users with a connection held at its share (it was paused, or used at
+    // least 90% of it): they share what the light users leave unused.
+    std::int64_t heavy_users{0};
+    // Payload of the class's light connections (below their share) in the
+    // last second, bytes/s.
+    std::uint64_t light_bytes_per_sec{0};
+};
+
+struct ShapingState {
+    ShapingClassState media_download;
+    ShapingClassState media_upload;
+};
 class MetadataProvider;
 class RevisionBarrier;
 
@@ -89,9 +108,13 @@ public:
     /// 1..1024). Applies to the next dial; live writers are never closed for it.
     void set_me_writer_cap(std::uint32_t me_connections_per_dc_total);
 
-    /// Thread-safe. Media shaping limits in kbit/s (0 = unlimited): per proxy
-    /// user across its media (signed DC < 0) connections, and process-wide.
-    void set_media_limits(std::uint64_t user_kbps, std::uint64_t total_kbps) noexcept;
+    /// Thread-safe. Replaces the media shaping rules (Config::shaping). Rates
+    /// and burst apply to live connections on their next charge; a changed
+    /// DC selection applies to connections whose DC is chosen afterwards.
+    void set_shaping(const ShapingConfig& shaping) noexcept;
+
+    /// Thread-safe. Live counters of the media shaping classes.
+    ShapingState shaping_state() const noexcept;
 
     /// Thread-safe. Replaces the ad tag of every reactor: live ME sessions
     /// carry it in their next RPC_PROXY_REQ, new sessions start with it.

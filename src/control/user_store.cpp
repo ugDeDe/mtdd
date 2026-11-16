@@ -251,6 +251,16 @@ std::optional<std::string> UserStore::validate_policy(const UserPolicy& policy) 
              std::to_string(kMaxRateLimitBytesPerSecond) + " bytes per second";
     }
   }
+  // 0 is meaningful here: the user is exempt from the per-user media limit.
+  for (const auto& rate : {policy.media_rate_limit_up_bytes_per_sec,
+                           policy.media_rate_limit_down_bytes_per_sec}) {
+    if (rate && *rate != 0 &&
+        (*rate < kMinRateLimitBytesPerSecond || *rate > kMaxRateLimitBytesPerSecond)) {
+      return "media rate limits must be null, 0 or " +
+             std::to_string(kMinRateLimitBytesPerSecond) + ".." +
+             std::to_string(kMaxRateLimitBytesPerSecond) + " bytes per second";
+    }
+  }
   if (policy.note.size() > kMaxNoteBytes || !printable_utf8(policy.note)) {
     return "note must be at most " + std::to_string(kMaxNoteBytes) +
            " bytes of printable UTF-8";
@@ -519,6 +529,12 @@ Result<MutationOutcome> UserStore::update_user(const UpdateUserRequest& request)
   }
   if (patch.rate_limit_down_bytes_per_sec) {
     policy.rate_limit_down_bytes_per_sec = *patch.rate_limit_down_bytes_per_sec;
+  }
+  if (patch.media_rate_limit_up_bytes_per_sec) {
+    policy.media_rate_limit_up_bytes_per_sec = *patch.media_rate_limit_up_bytes_per_sec;
+  }
+  if (patch.media_rate_limit_down_bytes_per_sec) {
+    policy.media_rate_limit_down_bytes_per_sec = *patch.media_rate_limit_down_bytes_per_sec;
   }
   if (patch.note) policy.note = *patch.note;
   if (patch.tls_domain) policy.tls_domain = lower_ascii(*patch.tls_domain);

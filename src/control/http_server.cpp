@@ -292,6 +292,7 @@ struct ControlServer::Impl {
       case ApiRoute::suspects: handle_suspects(request, status); break;
       case ApiRoute::ja4: handle_ja4(request, status); break;
       case ApiRoute::ad_tag: handle_ad_tag(request, method, status); break;
+      case ApiRoute::shaping: handle_shaping(request, method, status); break;
       case ApiRoute::rotate_secret:
         handle_rotate(request, route.name, status);
         break;
@@ -451,6 +452,69 @@ struct ControlServer::Impl {
     audit(request, tag ? "ad_tag.override" : "ad_tag.reset", outcome, "", {"ad_tag"});
     status = 200;
     send_json(request, status, json{{"data", ad_tag_view()}});
+  }
+
+  // Live media shaping. The rules, their validation and the override state
+  // live behind the hooks (the leader owns the config types); this handler
+  // only checks the request shape, audits and serves the hook's view.
+  void send_shaping_view(evhttp_request* request, int& status) {
+    json view = json::parse(options.shaping_view_hook(), nullptr, false);
+    if (view.is_discarded() || !view.is_object()) {
+      status = 500;
+      send_error(request, status, "io_error", "shaping view is unavailable");
+      return;
+    }
+    status = 200;
+    send_json(request, status, json{{"data", std::move(view)}});
+  }
+
+  void handle_shaping(evhttp_request* request, ApiMethod method, int& status) {
+    if (!options.shaping_view_hook || !options.shaping_update_hook) {
+      status = 404;
+      send_error(request, status, "not_found", "live shaping is not available");
+      return;
+    }
+    if (method == ApiMethod::get) {
+      send_shaping_view(request, status);
+      return;
+    }
+    std::optional<std::string> patch;
+    std::vector<std::string> fields;
+    if (method == ApiMethod::patch) {
+      BodyRead body = read_body(request, options.max_body_bytes, false);
+      if (body.error) {
+        status = body.error->status;
+        send_error(request, status, body.error->type, body.error->message);
+        return;
+      }
+      if (body.value.empty()) {
+        status = 400;
+        send_error(request, status, "invalid_field",
+                   "shaping patch must name media_download and/or media_upload");
+        return;
+      }
+      for (auto rule = body.value.begin(); rule != body.value.end(); ++rule) {
+        if (!rule->is_object()) {
+          fields.push_back(rule.key());
+          continue;
+        }
+        for (auto field = rule->begin(); field != rule->end(); ++field) {
+          fields.push_back(rule.key() + "." + field.key());
+        }
+      }
+      patch = body.value.dump();
+    }
+    const std::string error = options.shaping_update_hook(patch);
+    if (!error.empty()) {
+      status = 400;
+      send_error(request, status, "invalid_field", error);
+      return;
+    }
+    MutationOutcome outcome;
+    outcome.applied = true;
+    audit(request, patch ? "shaping.override" : "shaping.reset", outcome, "",
+          patch ? std::move(fields) : std::vector<std::string>{"shaping"});
+    send_shaping_view(request, status);
   }
 
   void handle_config(evhttp_request* request, int& status) {
@@ -1126,8 +1190,10 @@ struct ControlServer::Impl {
                                  {"name", "secret", "enabled", "max_connections",
                                   "expires_at", "data_quota_bytes",
                                   "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                  "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
-                                  "ad_tag"})) {
+                                  "rate_limit_down_bytes_per_sec",
+                                  "media_rate_limit_up_bytes_per_sec",
+                                  "media_rate_limit_down_bytes_per_sec", "note", "canary",
+                                  "tls_domain", "ad_tag"})) {
       status = error->status;
       send_error(request, status, error->type, error->message);
       return;
@@ -1234,8 +1300,10 @@ struct ControlServer::Impl {
                                             {"enabled", "max_connections",
                                              "expires_at", "data_quota_bytes",
                                              "max_unique_ips", "max_devices", "rate_limit_up_bytes_per_sec",
-                                             "rate_limit_down_bytes_per_sec", "note", "canary", "tls_domain",
-                                  "ad_tag"})) {
+                                             "rate_limit_down_bytes_per_sec",
+                                             "media_rate_limit_up_bytes_per_sec",
+                                             "media_rate_limit_down_bytes_per_sec", "note",
+                                             "canary", "tls_domain", "ad_tag"})) {
         status = error->status;
         send_error(request, status, error->type, error->message);
         return;
