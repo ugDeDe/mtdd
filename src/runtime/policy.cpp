@@ -25,6 +25,16 @@
 //     bucket, no shared queue and no lock or atomic on the hot path. An
 //     unlimited connection pays one branch. A media rule's burst_kib sets the
 //     GCRA tolerance while the media share is the binding one.
+//   * Shares alone cannot hold a limit: every new connection would start with
+//     a fresh GCRA state, and on the ME route requests already sent are
+//     answered regardless. So each byte is also charged to shared budgets
+//     (control::SharedRateBucket): the user's own, the user's media class and
+//     the class total. A direction is paused while its share or any shared
+//     budget is overdrawn, and gated before it moves more data, so a new
+//     connection waits for an overdrawn budget too. Media requests forwarded
+//     to the ME pre-pay kMediaRequestEstimate, so connections resuming at
+//     once cannot all send requests into the same budget; answers consume the
+//     advance and the unused rest is refunded.
 //   * An overdrawn connection removes EPOLLIN from the source of that direction
 //     (and holds already-read ME requests); nothing is dropped or buffered
 //     additionally. process_rate_resumes() re-arms it on time.
@@ -32,6 +42,7 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -51,6 +62,9 @@ constexpr std::uint64_t kRateMinShareBytes = 1024U;
 // Nor does a split media burst drop below this.
 constexpr std::uint64_t kRateMinSplitBurstBytes = 16U * 1024U;
 constexpr std::int64_t kRateMaxCostNs = 1'000'000'000'000'000;
+// Advance charge per media request forwarded to the ME (a typical
+// upload.getFile part); see precharge_media_request().
+constexpr std::uint64_t kMediaRequestEstimate = 128U * 1024U;
 
 std::int64_t rate_ns_for(std::uint64_t bytes, std::uint64_t rate) noexcept {
     const long double ns = static_cast<long double>(bytes) * 1e9L / static_cast<long double>(rate);
@@ -265,6 +279,120 @@ bool Runtime::Impl::rate_share_stale(const Client& client) const noexcept {
     return false;
 }
 
+std::size_t Runtime::Impl::shared_limits(Client& client, std::size_t direction,
+                                         std::array<SharedLimit, 3>& out) noexcept {
+    std::size_t count = 0;
+    const std::uint64_t policy = direction == 0 ? client.policy_up : client.policy_down;
+    if (client.metrics && policy != 0) {
+        out[count++] = {&client.metrics->rate_bucket(kAllClasses[direction]), policy,
+                        std::max(policy, kRateMinBurstBytes)};
+    }
+    if (!client.media[direction]) return count;
+    auto& rule = shared_->media[direction];
+    const std::uint64_t burst = rule.burst.load(std::memory_order_relaxed);
+    const std::uint64_t user_cap = client.media_policy_set[direction]
+                                       ? client.media_policy[direction]
+                                       : rule.user_rate.load(std::memory_order_relaxed);
+    if (client.metrics && user_cap != 0) {
+        out[count++] = {&client.metrics->rate_bucket(kMediaClasses[direction]), user_cap,
+                        std::max({user_cap, burst, kRateMinBurstBytes})};
+    }
+    const std::uint64_t total = rule.total_rate.load(std::memory_order_relaxed);
+    if (total != 0) {
+        out[count++] = {&rule.total_bucket, total, std::max({total, burst, kRateMinBurstBytes})};
+    }
+    return count;
+}
+
+std::int64_t Runtime::Impl::shared_resume(Client& client, std::size_t direction,
+                                          std::int64_t now_ns) noexcept {
+    std::array<SharedLimit, 3> limits;
+    const std::size_t count = shared_limits(client, direction, limits);
+    std::int64_t resume = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        resume = std::max(resume,
+                          limits[i].bucket->resume_at(limits[i].rate, limits[i].tolerance, now_ns));
+    }
+    return resume;
+}
+
+void Runtime::Impl::pause_rate(Client& client, bool up, std::int64_t resume_ns,
+                               bool own) noexcept {
+    bool& flag = up ? client.rate_pause_c2s : client.rate_pause_s2c;
+    const std::size_t index = up ? 0 : 1;
+    if (own) {
+        client.rate_pause_own[index] = true;
+        client.rate_window_paused[index] = true;
+    }
+    if (flag) return;
+    flag = true;
+    if (up && client.media[0]) stats_.media_upload_throttled();
+    if (!up && client.media[1]) stats_.media_throttled();
+    if (!client.rate_listed) {
+        client.rate_listed = true;
+        rate_clients_.push_back(client.token);
+    }
+    const Time at = Time(std::chrono::nanoseconds(resume_ns));
+    if (at < next_rate_resume_) next_rate_resume_ = at;
+    update_client_interest(client);
+    if (client.route == Client::Route::direct) update_direct_interest(client);
+}
+
+bool Runtime::Impl::rate_gate(Client& client, control::Direction direction, Time now) noexcept {
+    const bool up = direction == control::Direction::client_to_server;
+    bool& flag = up ? client.rate_pause_c2s : client.rate_pause_s2c;
+    if (flag) return true;
+    if (rate_share_stale(client)) recompute_rate_share(client);
+    const std::uint64_t rate = up ? client.rate_up : client.rate_down;
+    if (rate == 0) return false;
+    const std::int64_t now_ns = steady_ns(now);
+    const std::int64_t tat = up ? client.rate_tat_up : client.rate_tat_down;
+    const std::int64_t own = tat - burst_ns(rate, up ? client.burst_up : client.burst_down);
+    const std::int64_t resume = std::max(own, shared_resume(client, up ? 0 : 1, now_ns));
+    if (resume <= now_ns) return false;
+    pause_rate(client, up, resume, own > now_ns);
+    return true;
+}
+
+bool Runtime::Impl::precharge_media_request(Client& client, Time now) noexcept {
+    if (!client.media[1] || client.rate_down == 0) return false;
+    std::array<SharedLimit, 3> limits;
+    const std::size_t count = shared_limits(client, 1, limits);
+    if (count == 0) return false;
+    const std::int64_t now_ns = steady_ns(now);
+    // At most one estimate outstanding per connection: a media connection
+    // also carries acks and pings that get no file-sized answer, and an
+    // advance per message would leave the budgets in a debt nobody repays.
+    // Later messages only check the budgets.
+    std::int64_t resume = 0;
+    if (client.precharge_down < kMediaRequestEstimate) {
+        const std::uint64_t advance = kMediaRequestEstimate - client.precharge_down;
+        client.precharge_down += advance;
+        for (std::size_t i = 0; i < count; ++i) {
+            resume = std::max(resume, limits[i].bucket->charge(advance, limits[i].rate,
+                                                               limits[i].tolerance, now_ns));
+        }
+    } else {
+        for (std::size_t i = 0; i < count; ++i) {
+            resume = std::max(resume, limits[i].bucket->resume_at(limits[i].rate,
+                                                                  limits[i].tolerance, now_ns));
+        }
+    }
+    if (resume <= now_ns) return false;
+    pause_rate(client, false, resume, false);
+    return true;
+}
+
+void Runtime::Impl::refund_precharge(Client& client) noexcept {
+    if (client.precharge_down == 0) return;
+    std::array<SharedLimit, 3> limits;
+    const std::size_t count = shared_limits(client, 1, limits);
+    for (std::size_t i = 0; i < count; ++i) {
+        limits[i].bucket->refund(client.precharge_down, limits[i].rate);
+    }
+    client.precharge_down = 0;
+}
+
 void Runtime::Impl::charge_rate(Client& client, control::Direction direction,
                                 std::uint64_t bytes, Time now) {
     // The split changed (a connection of this user, or a media user anywhere,
@@ -272,28 +400,30 @@ void Runtime::Impl::charge_rate(Client& client, control::Direction direction,
     // before charging.
     if (rate_share_stale(client)) recompute_rate_share(client);
     const bool up = direction == control::Direction::client_to_server;
+    const std::size_t index = up ? 0 : 1;
     const std::uint64_t rate = up ? client.rate_up : client.rate_down;
     if (rate == 0) return;
-    client.rate_window[up ? 0 : 1] += bytes;
+    client.rate_window[index] += bytes;
     const std::int64_t now_ns = steady_ns(now);
     std::int64_t& tat = up ? client.rate_tat_up : client.rate_tat_down;
     tat = std::max(tat, now_ns) + rate_ns_for(bytes, rate);
-    const std::int64_t resume = tat - burst_ns(rate, up ? client.burst_up : client.burst_down);
-    if (resume <= now_ns) return;
-    bool& flag = up ? client.rate_pause_c2s : client.rate_pause_s2c;
-    if (flag) return;
-    flag = true;
-    client.rate_window_paused[up ? 0 : 1] = true;
-    if (up && client.media[0]) stats_.media_upload_throttled();
-    if (!up && client.media[1]) stats_.media_throttled();
-    if (!client.rate_listed) {
-        client.rate_listed = true;
-        rate_clients_.push_back(client.token);
+    const std::int64_t own = tat - burst_ns(rate, up ? client.burst_up : client.burst_down);
+    std::int64_t resume = own;
+    // Shared budgets; an answer first uses up what its request pre-paid.
+    std::uint64_t shared_bytes = bytes;
+    if (!up && client.precharge_down != 0) {
+        const std::uint64_t covered = std::min(shared_bytes, client.precharge_down);
+        client.precharge_down -= covered;
+        shared_bytes -= covered;
     }
-    const Time at = Time(std::chrono::nanoseconds(resume));
-    if (at < next_rate_resume_) next_rate_resume_ = at;
-    update_client_interest(client);
-    if (client.route == Client::Route::direct) update_direct_interest(client);
+    std::array<SharedLimit, 3> limits;
+    const std::size_t count = shared_limits(client, index, limits);
+    for (std::size_t i = 0; i < count; ++i) {
+        resume = std::max(resume, limits[i].bucket->charge(shared_bytes, limits[i].rate,
+                                                           limits[i].tolerance, now_ns));
+    }
+    if (resume <= now_ns) return;
+    pause_rate(client, up, resume, own > now_ns);
 }
 
 void Runtime::Impl::set_rate_demand(Client& client, std::size_t direction, bool heavy,
@@ -320,7 +450,7 @@ void Runtime::Impl::set_rate_demand(Client& client, std::size_t direction, bool 
 
 void Runtime::Impl::update_rate_demand(Client& client) noexcept {
     const std::array<std::uint64_t, 2> rate{client.rate_up, client.rate_down};
-    const std::array<bool, 2> paused{client.rate_pause_c2s, client.rate_pause_s2c};
+    const std::array<bool, 2>& paused = client.rate_pause_own;
     for (std::size_t index = 0; index < 2; ++index) {
         bool heavy = false;
         std::int64_t light = 0;
@@ -331,6 +461,11 @@ void Runtime::Impl::update_rate_demand(Client& client) noexcept {
             if (!heavy) light = static_cast<std::int64_t>(moved);
         }
         set_rate_demand(client, index, heavy, light);
+        // No answer for a whole second: whatever the requests pre-paid is
+        // not coming, give it back to the shared budgets.
+        if (index == 1 && client.rate_window[1] == 0 && !client.rate_pause_s2c) {
+            refund_precharge(client);
+        }
         client.rate_window[index] = 0;
         client.rate_window_paused[index] = false;
     }
@@ -368,9 +503,11 @@ void Runtime::Impl::process_rate_resumes(Time now) {
         const auto check = [&](bool& flag, std::int64_t tat, std::uint64_t rate,
                                std::uint64_t burst, bool s2c) {
             if (!flag) return;
-            const std::int64_t resume = rate == 0 ? 0 : tat - burst_ns(rate, burst);
+            std::int64_t resume = rate == 0 ? 0 : tat - burst_ns(rate, burst);
+            resume = std::max(resume, shared_resume(client, s2c ? 1 : 0, now_ns));
             if (resume <= now_ns) {
                 flag = false;
+                client.rate_pause_own[s2c ? 1 : 0] = false;
                 changed = true;
                 if (s2c) s2c_resumed = true;
             } else {

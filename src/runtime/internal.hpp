@@ -1161,6 +1161,10 @@ struct SharedState {
         // payload of the class's light connections (work-conserving split).
         std::atomic<std::int64_t> heavy_users{0};
         std::atomic<std::int64_t> light_bytes{0};
+        // The class's process-wide budget (total_rate): every byte of every
+        // connection in the class is charged here, so connection churn or
+        // pipelined requests cannot multiply the total.
+        control::SharedRateBucket total_bucket;
         // Bumped when active_users or the rule changes, so connections in the
         // class recompute their share before the next charge.
         std::atomic<std::uint64_t> generation{0};
@@ -1462,8 +1466,15 @@ struct Runtime::Impl {
         // (heavy = held at its share; light = last-second payload otherwise).
         std::array<std::uint64_t, 2> rate_window{};
         std::array<bool, 2> rate_window_paused{};
+        // The current pause of that direction is the connection's own share
+        // (not only a shared budget): it makes the connection heavy.
+        std::array<bool, 2> rate_pause_own{};
         std::array<bool, 2> demand_heavy{};
         std::array<std::int64_t, 2> demand_light{};
+        // Advance charge for media requests sent to the Middle-End whose
+        // answers have not arrived yet (bytes, already charged to the shared
+        // download budgets); answers consume it first, the rest is refunded.
+        std::uint64_t precharge_down{0};
         // Generations the current share was computed for (user, and each
         // media class).
         std::uint64_t share_generation{0};
@@ -1936,6 +1947,27 @@ struct Runtime::Impl {
     void recompute_rate_share(Client& client) noexcept;
     bool rate_limited(const Client& client) const noexcept;
     bool rate_share_stale(const Client& client) const noexcept;
+    // Shared budgets a direction of this connection is charged to: the
+    // user's own (rate_limit_*), the user's media class and the class total.
+    struct SharedLimit {
+        control::SharedRateBucket* bucket{nullptr};
+        std::uint64_t rate{0};
+        std::uint64_t tolerance{0};
+    };
+    std::size_t shared_limits(Client& client, std::size_t direction,
+                              std::array<SharedLimit, 3>& out) noexcept;
+    std::int64_t shared_resume(Client& client, std::size_t direction, std::int64_t now_ns) noexcept;
+    // Pauses a direction until `resume_ns` (steady clock) unless already paused.
+    // `own`: the connection's own share is overdrawn (not only a shared
+    // budget); only that makes it heavy in the work-conserving split.
+    void pause_rate(Client& client, bool up, std::int64_t resume_ns, bool own) noexcept;
+    // Before a limited direction moves more data: pause it while its share
+    // or a shared budget is overdrawn. Returns true when paused.
+    bool rate_gate(Client& client, control::Direction direction, Time now) noexcept;
+    // ME route: charge the shared download budgets for one forwarded media
+    // request in advance. Returns true when that overdrew them (paused).
+    bool precharge_media_request(Client& client, Time now) noexcept;
+    void refund_precharge(Client& client) noexcept;
     // 1 Hz: classify each limited direction as heavy or light from the last
     // second and publish the change to the user's and the media counters.
     void update_rate_demand(Client& client) noexcept;

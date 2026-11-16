@@ -399,6 +399,10 @@ void Runtime::Impl::read_client(Client& client, Time now) {
     if (!client.held_server_hello.empty()) return;  // released by its deadline
     if (client.c2s_backpressured) return;  // resumed by flush_direct()/pump_c2s()
     if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
+    if (client.phase == Client::Phase::relay && client.rate_up != 0 &&
+        rate_gate(client, control::Direction::client_to_server, now)) {
+        return;
+    }
     if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
         if (client.phase != Client::Phase::relay) client.handshake_budget_stalled = true;

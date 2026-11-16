@@ -1688,6 +1688,74 @@ TEST(Runtime, MediaShareUnusedByALightConnectionGoesToTheHeavyOne) {
     }
 }
 
+TEST(Runtime, MediaTotalHoldsUnderConnectionChurnAndPipelinedRequests) {
+    // The load that broke the per-connection-only limit: many short media
+    // connections, each sending three requests at once (as Telegram does for
+    // file parts) and closing after the answers. Every new connection used to
+    // start with a fresh budget, and requests already forwarded to the ME are
+    // answered regardless, so the total ran several times over the limit.
+    constexpr std::size_t kAnswer = 128U * 1024U;
+    constexpr double kTotal = 4000.0 * 125.0;  // 4000 kbit/s = 500000 B/s
+    FakeMe me{me_secret(), 1000000, 0ms, 4, 0ms, 0ms, true, kAnswer, 30000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.shaping.media_download.total_kbps = 4000;
+        config.idle_timeout = 60s;
+        config.max_connections = 512;
+        config.max_handshakes = 512;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint32_t> sequence{0};
+    std::atomic<std::uint64_t> sessions{0};
+    const auto churn = [&] {
+        const auto base = static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        while (!stop.load()) {
+            // A distinct (timestamp, variant) per hello: no replay rejects.
+            const std::uint32_t n = sequence.fetch_add(1);
+            TestClient client(daemon.port(), secret_bytes());
+            if (!client.valid() ||
+                !client.send_hello(base - (n / 256U) % 100U, static_cast<std::uint8_t>(n % 256U)) ||
+                !client.start_obfuscation(-2)) {
+                continue;
+            }
+            bool ok = true;
+            for (std::size_t index = 0; index < 3 && ok; ++index) {
+                ok = client.send_message(burst_payload(index));
+            }
+            for (std::size_t index = 0; index < 3 && ok && !stop.load(); ++index) {
+                Bytes response;
+                ok = client.read_message(response, 3000) && response.size() == kAnswer;
+            }
+            if (ok) sessions.fetch_add(1);
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) threads.emplace_back(churn);
+    const auto metrics = daemon.services.stats.user("alice");
+    std::this_thread::sleep_for(2000ms);  // past the first second of tolerance
+    const std::uint64_t start = metrics->payload_s2c_bytes();
+    const std::uint64_t sessions_start = sessions.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(6000ms);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double rate = static_cast<double>(metrics->payload_s2c_bytes() - start) / seconds;
+    const std::uint64_t completed = sessions.load() - sessions_start;
+    stop.store(true);
+    for (auto& thread : threads) thread.join();
+    // Media keeps flowing (connections are served, not starved) ...
+    EXPECT_GT(rate, kTotal * 0.5) << rate;
+    EXPECT_GE(completed, 3U);
+    // ... but the total holds despite the churn.
+    EXPECT_LT(rate, kTotal * 1.3) << rate << " B/s over " << completed << " sessions";
+}
+
 TEST(Runtime, DeviceLimitClosesNewAuthKeyOnTheMiddleEndPath) {
     FakeMe me{me_secret()};
     Daemon daemon(me.port(), true);

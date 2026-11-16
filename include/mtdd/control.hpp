@@ -655,6 +655,27 @@ struct StatisticsSnapshot {
 // hold one for the lifetime of a connection and update it without a mutex. The
 // runtime batches payload per connection (64 KiB, the 1 Hz client pass, and
 // close), so payload totals read here trail live traffic by at most that much.
+// A rate budget shared by every connection it covers, on every reactor: a
+// GCRA "theoretical arrival time" in steady-clock nanoseconds behind one
+// atomic, so a new connection draws from the same budget instead of bringing
+// its own. The rate is passed per call (0 = unlimited), so a changed limit
+// needs no state migration.
+class SharedRateBucket {
+ public:
+  // Charges `bytes` (0 only checks) and returns the steady-clock time in ns
+  // at which the budget is back within `tolerance_bytes`, or 0 if it already
+  // is. Always succeeds (debt model).
+  int64_t charge(uint64_t bytes, uint64_t rate, uint64_t tolerance_bytes,
+                 int64_t now_ns) noexcept;
+  // Same resume time without charging anything.
+  int64_t resume_at(uint64_t rate, uint64_t tolerance_bytes, int64_t now_ns) const noexcept;
+  // Gives back `bytes` charged earlier (an unused advance charge).
+  void refund(uint64_t bytes, uint64_t rate) noexcept;
+
+ private:
+  std::atomic<int64_t> tat_{0};
+};
+
 class UserMetrics {
  public:
   void connection_opened() noexcept;
@@ -704,6 +725,9 @@ class UserMetrics {
   // direction (0 = unlimited); published by the runtime for /metrics.
   void set_rate_share(Direction direction, uint64_t bytes_per_sec) noexcept;
   uint64_t rate_share(Direction direction) const noexcept;
+  // The user's shared budget per rate class: what all of the user's
+  // connections in the class may move together.
+  SharedRateBucket& rate_bucket(RateClass rate_class) noexcept;
   // Bumped on every active-count change, so connections can refresh their
   // share as soon as the split changes instead of on the next 1 Hz pass.
   uint64_t active_generation() const noexcept;
@@ -744,6 +768,8 @@ class UserMetrics {
   std::atomic<int64_t> light_bytes_[kRateClasses]{};
   // [0] = up (client_to_server), [1] = down.
   std::atomic<uint64_t> rate_share_[2]{};
+  // Own cache line: charged by every reactor serving a limited user.
+  alignas(64) SharedRateBucket rate_buckets_[kRateClasses];
 };
 
 // What became of a ClientHello whose JA4 fingerprint was recorded.

@@ -311,6 +311,9 @@ void Runtime::Impl::pump_direct_c2s(Client& client) {
 void Runtime::Impl::read_direct_backend(Client& client, Time now) {
     if (client.direct_connecting || client.direct_eof || !client.out) return;
     if (client.rate_pause_s2c) return;  // resumed by process_rate_resumes()
+    if (client.rate_down != 0 && rate_gate(client, control::Direction::server_to_client, now)) {
+        return;
+    }
     if (!budget_allows(detail::kDirectReadReservation)) {
         if (!client.direct_budget_paused) {
             client.direct_budget_paused = true;

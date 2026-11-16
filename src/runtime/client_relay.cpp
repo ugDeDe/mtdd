@@ -245,10 +245,13 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
         return;
     }
     if (client.c2s.empty() || client.me == nullptr) return;
-    // Rate limit (per-connection share): hold the client's next requests while
-    // its download share is overdrawn. Downloads are request-driven, so answers
-    // slow down without any data being buffered here.
+    // Rate limit: hold the client's next requests while its download share or
+    // a shared download budget is overdrawn. Downloads are request-driven, so
+    // answers slow down without any data being buffered here.
     if (client.rate_pause_s2c) return;
+    if (client.rate_down != 0 && rate_gate(client, control::Direction::server_to_client, now)) {
+        return;
+    }
     MeConn& me = *client.me;
     if (me.state != MeConn::State::ready || me.session == nullptr) return;
     const std::uint64_t token = client.token;
@@ -301,6 +304,9 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
         reaccount(me);
         schedule_me_flush(me);
         if (clients_.find(token) == clients_.end()) return;
+        // A media request pre-pays its answer; once that overdraws a shared
+        // budget, the rest waits (pause_rate set rate_pause_s2c).
+        if (precharge_media_request(client, now)) break;
     }
     // A rare large request must not pin a multi-megabyte scratch buffer.
     if (me_encode_buffer_.capacity() > detail::kScratchShrinkBytes) {
@@ -511,6 +517,7 @@ void Runtime::Impl::close_client(std::uint64_t token, bool record_pending_handsh
     }
     client.fd.close();
     if (client.ip_counted) decrement_client_unique_ip(client);
+    refund_precharge(client);
     set_counted_active(client, false);
     // Every close (reject, policy sweep, error, shutdown via finalize()) runs
     // here exactly once, before the recycle below drops `metrics`: the batched

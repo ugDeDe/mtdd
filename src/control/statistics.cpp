@@ -344,6 +344,47 @@ void UserMetrics::set_rate_share(Direction direction, uint64_t bytes_per_sec) no
 uint64_t UserMetrics::rate_share(Direction direction) const noexcept {
   return rate_share_[media_index(direction)].load(std::memory_order_relaxed);
 }
+SharedRateBucket& UserMetrics::rate_bucket(RateClass rate_class) noexcept {
+  return rate_buckets_[static_cast<size_t>(rate_class)];
+}
+
+namespace {
+constexpr int64_t kSharedRateMaxCostNs = 1'000'000'000'000'000;  // ~11.5 days
+
+int64_t shared_rate_ns(uint64_t bytes, uint64_t rate) noexcept {
+  const long double ns = static_cast<long double>(bytes) * 1e9L /
+                         static_cast<long double>(rate);
+  if (ns >= static_cast<long double>(kSharedRateMaxCostNs)) return kSharedRateMaxCostNs;
+  return static_cast<int64_t>(ns);
+}
+}  // namespace
+
+int64_t SharedRateBucket::charge(uint64_t bytes, uint64_t rate, uint64_t tolerance_bytes,
+                                 int64_t now_ns) noexcept {
+  if (rate == 0) return 0;
+  const int64_t cost = shared_rate_ns(bytes, rate);
+  int64_t current = tat_.load(std::memory_order_relaxed);
+  int64_t next = 0;
+  do {
+    next = std::max(current, now_ns) + cost;
+  } while (!tat_.compare_exchange_weak(current, next, std::memory_order_relaxed,
+                                       std::memory_order_relaxed));
+  const int64_t resume = next - shared_rate_ns(tolerance_bytes, rate);
+  return resume > now_ns ? resume : 0;
+}
+
+int64_t SharedRateBucket::resume_at(uint64_t rate, uint64_t tolerance_bytes,
+                                    int64_t now_ns) const noexcept {
+  if (rate == 0) return 0;
+  const int64_t resume =
+      tat_.load(std::memory_order_relaxed) - shared_rate_ns(tolerance_bytes, rate);
+  return resume > now_ns ? resume : 0;
+}
+
+void SharedRateBucket::refund(uint64_t bytes, uint64_t rate) noexcept {
+  if (rate == 0 || bytes == 0) return;
+  tat_.fetch_sub(shared_rate_ns(bytes, rate), std::memory_order_relaxed);
+}
 uint64_t UserMetrics::active_connections() const noexcept {
   return active_.load(std::memory_order_relaxed);
 }
