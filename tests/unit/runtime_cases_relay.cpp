@@ -1958,3 +1958,61 @@ TEST(RelayMaxAge, SessionsOfOneAddressAreRetiredOneAtATime) {
     const bool b_closed = b.wait_closed_for(100);
     EXPECT_NE(a_closed, b_closed) << "exactly one of the two was retired";
 }
+
+// Many connections of one secret fetching small media ("photos") under a
+// shared limit: real bytes are far below the limit's budget for the run, so
+// every fetch must finish promptly. Unused 128 KiB request pre-payments of
+// waiting connections must not starve everyone (they once froze all
+// downloads for tens of seconds, whatever the configured rate).
+TEST(MediaShaping, SmallFetchesOfManyConnectionsAreNotStarvedByPrepayments) {
+    constexpr std::size_t kClients = 24;
+    constexpr std::size_t kFetches = 4;
+    constexpr std::size_t kAnswer = 8U * 1024U;
+    FakeMe me{me_secret(), 100000, 0ms, 1, 0ms, 0ms, true, kAnswer, 60000};
+    Daemon daemon(me.port(), true, [&](mtdd::Config& config) {
+        std::ofstream file{config.me_config_path, std::ios::binary};
+        file << "proxy_for -2 127.0.0.1:" << me.port() << ";\n";
+        config.shaping.media_download.total_kbps = 1600;  // 200 KB/s
+        config.idle_timeout = 120s;
+        config.max_connections = 64;
+        config.max_handshakes = 64;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 4s));
+    std::array<std::int64_t, kClients> slowest_ms{};
+    std::array<bool, kClients> done{};
+    const auto start = std::chrono::steady_clock::now();
+    const auto fetch = [&](std::size_t slot) {
+        TestClient client(daemon.port(), secret_bytes());
+        if (!client.valid() || !client.send_hello(0, static_cast<std::uint8_t>(slot)) ||
+            !client.start_obfuscation(-2)) {
+            return;
+        }
+        std::int64_t worst = 0;
+        for (std::size_t index = 0; index < kFetches; ++index) {
+            const auto asked = std::chrono::steady_clock::now();
+            if (!client.send_message(burst_payload(index))) return;
+            Bytes response;
+            if (!client.read_message(response, 40000) || response.size() < kAnswer) return;
+            worst = std::max<std::int64_t>(
+                worst, std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - asked)
+                           .count());
+        }
+        slowest_ms[slot] = worst;
+        done[slot] = true;
+    };
+    std::vector<std::thread> threads;
+    for (std::size_t slot = 0; slot < kClients; ++slot) threads.emplace_back(fetch, slot);
+    for (auto& thread : threads) thread.join();
+    const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    std::int64_t worst = 0;
+    for (std::size_t slot = 0; slot < kClients; ++slot) {
+        EXPECT_TRUE(done[slot]) << "client " << slot << " never got its photos";
+        worst = std::max(worst, slowest_ms[slot]);
+    }
+    // 24 x 4 x 8 KiB = 768 KiB at 200 KB/s (+ a one-second burst): ~3-4 s.
+    EXPECT_LT(total, 10000ms) << "total=" << total.count() << "ms";
+    EXPECT_LT(worst, 5000) << "a single small fetch waited " << worst << "ms";
+}

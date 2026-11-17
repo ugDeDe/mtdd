@@ -2,6 +2,28 @@
 
 namespace {
 
+TEST(SharedRateBucketTest, DebtIsBoundedToOneSecondPastTheTolerance) {
+  // 1 MB/s with a 1 MB tolerance; 10 000 connections each pre-pay 128 KiB at
+  // the same instant (about 1.3 GB, or 21 minutes of the rate). The budget
+  // forgives what is past one second, so nobody waits for the herd's debt.
+  mtdd::control::SharedRateBucket bucket;
+  constexpr std::uint64_t kRate = 1'000'000;
+  constexpr std::int64_t kNow = 1'000'000'000'000;
+  std::int64_t resume = 0;
+  for (int i = 0; i < 10'000; ++i) resume = bucket.charge(128U * 1024U, kRate, kRate, kNow);
+  EXPECT_GT(resume, kNow);
+  EXPECT_LE(resume, kNow + 1'000'000'000) << "at most one second of waiting";
+  EXPECT_EQ(bucket.resume_at(kRate, kRate, kNow), resume);
+  // Within the bound the debt model is unchanged: half a second more debt is
+  // half a second more waiting.
+  mtdd::control::SharedRateBucket exact;
+  EXPECT_EQ(exact.charge(kRate, kRate, kRate, kNow), 0) << "the tolerance is free";
+  EXPECT_EQ(exact.charge(kRate / 2, kRate, kRate, kNow), kNow + 500'000'000);
+  // Refunds still bring the resume time back.
+  exact.refund(kRate / 2, kRate);
+  EXPECT_EQ(exact.resume_at(kRate, kRate, kNow), 0);
+}
+
 TEST(StatisticsTest, CountersAndSnapshot) {
   Statistics stats;
   stats.set_ready(true);

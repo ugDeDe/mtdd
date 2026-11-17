@@ -545,6 +545,11 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     // downloads. A single answer can still exceed the rate momentarily.
     if (client.rate_down != 0) {
         charge_rate(client, control::Direction::server_to_client, payload.size(), now);
+        // An ME answer arrives whole: the request's advance has now paid for
+        // what it was for, and the unused rest goes back at once. Held for
+        // the next request instead, the rest of 128 KiB after a small photo
+        // would keep shared budgets overdrawn by every waiting connection.
+        refund_precharge(client);
     }
     client.awaiting_reply = false;
     ++me.ans_delivered;

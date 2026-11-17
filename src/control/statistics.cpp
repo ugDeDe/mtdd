@@ -350,6 +350,11 @@ SharedRateBucket& UserMetrics::rate_bucket(RateClass rate_class) noexcept {
 
 namespace {
 constexpr int64_t kSharedRateMaxCostNs = 1'000'000'000'000'000;  // ~11.5 days
+// A shared budget is never more than this far past its tolerance in debt:
+// whatever overshoots (one read or one pre-paid request per connection that
+// was admitted at the same instant, by many connections at once) is forgiven
+// instead of freezing every connection of the budget for its repayment.
+constexpr int64_t kSharedRateMaxDebtNs = 1'000'000'000;
 
 int64_t shared_rate_ns(uint64_t bytes, uint64_t rate) noexcept {
   const long double ns = static_cast<long double>(bytes) * 1e9L /
@@ -363,13 +368,15 @@ int64_t SharedRateBucket::charge(uint64_t bytes, uint64_t rate, uint64_t toleran
                                  int64_t now_ns) noexcept {
   if (rate == 0) return 0;
   const int64_t cost = shared_rate_ns(bytes, rate);
+  const int64_t tolerance = shared_rate_ns(tolerance_bytes, rate);
+  const int64_t ceiling = now_ns + tolerance + kSharedRateMaxDebtNs;
   int64_t current = tat_.load(std::memory_order_relaxed);
   int64_t next = 0;
   do {
-    next = std::max(current, now_ns) + cost;
+    next = std::min(std::max(current, now_ns) + cost, std::max(current, ceiling));
   } while (!tat_.compare_exchange_weak(current, next, std::memory_order_relaxed,
                                        std::memory_order_relaxed));
-  const int64_t resume = next - shared_rate_ns(tolerance_bytes, rate);
+  const int64_t resume = next - tolerance;
   return resume > now_ns ? resume : 0;
 }
 

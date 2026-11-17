@@ -65,6 +65,8 @@ constexpr std::int64_t kRateMaxCostNs = 1'000'000'000'000'000;
 // Advance charge per media request forwarded to the ME (a typical
 // upload.getFile part); see precharge_media_request().
 constexpr std::uint64_t kMediaRequestEstimate = 128U * 1024U;
+// Longest a paused connection sleeps before checking the budgets again.
+constexpr std::chrono::milliseconds kRateRecheck{250};
 
 std::int64_t rate_ns_for(std::uint64_t bytes, std::uint64_t rate) noexcept {
     const long double ns = static_cast<long double>(bytes) * 1e9L / static_cast<long double>(rate);
@@ -332,7 +334,8 @@ void Runtime::Impl::pause_rate(Client& client, bool up, std::int64_t resume_ns,
         client.rate_listed = true;
         rate_clients_.push_back(client.token);
     }
-    const Time at = Time(std::chrono::nanoseconds(resume_ns));
+    const Time at = std::min(Time(std::chrono::nanoseconds(resume_ns)),
+                             Clock::now() + kRateRecheck);
     if (at < next_rate_resume_) next_rate_resume_ = at;
     update_client_interest(client);
     if (client.route == Client::Route::direct) update_direct_interest(client);
@@ -391,6 +394,8 @@ void Runtime::Impl::refund_precharge(Client& client) noexcept {
         limits[i].bucket->refund(client.precharge_down, limits[i].rate);
     }
     client.precharge_down = 0;
+    // The budgets moved back: connections waiting on them look again at once.
+    if (count != 0) next_rate_resume_ = Time{};
 }
 
 void Runtime::Impl::charge_rate(Client& client, control::Direction direction,
@@ -462,10 +467,12 @@ void Runtime::Impl::update_rate_demand(Client& client) noexcept {
         }
         set_rate_demand(client, index, heavy, light);
         // No answer for a whole second: whatever the requests pre-paid is
-        // not coming, give it back to the shared budgets.
-        if (index == 1 && client.rate_window[1] == 0 && !client.rate_pause_s2c) {
-            refund_precharge(client);
-        }
+        // not coming, give it back to the shared budgets. Also while paused:
+        // a waiting connection otherwise holds its unused advance (most of
+        // 128 KiB after a small photo) for as long as it waits, and many
+        // waiting connections then keep the budget overdrawn for everyone.
+        // An answer that still arrives later is charged as it comes.
+        if (index == 1 && client.rate_window[1] == 0) refund_precharge(client);
         client.rate_window[index] = 0;
         client.rate_window_paused[index] = false;
     }
@@ -511,7 +518,11 @@ void Runtime::Impl::process_rate_resumes(Time now) {
                 changed = true;
                 if (s2c) s2c_resumed = true;
             } else {
-                next = std::min(next, Time(std::chrono::nanoseconds(resume)));
+                // Shared budgets also move by refunds and by other reactors:
+                // look again soon instead of sleeping to a resume time that
+                // a refund may already have brought forward.
+                next = std::min({next, Time(std::chrono::nanoseconds(resume)),
+                                 now + kRateRecheck});
             }
         };
         check(client.rate_pause_c2s, client.rate_tat_up, client.rate_up, client.burst_up, false);
