@@ -397,6 +397,41 @@ TEST(Config, S2cPaddingMaxDefaultsToFifteenAndIsBounded) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, HelloMaskingTimeoutDefaultsToFiveSecondsAndIsBounded) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.hello_masking_timeout, std::chrono::milliseconds(5000));
+    EXPECT_EQ(defaults.public_view()["hello_masking_timeout_ms"].get<std::int64_t>(), 5000);
+    auto value = minimal_config();
+    value["hello_masking_timeout_ms"] = 0;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").hello_masking_timeout.count(), 0);
+    value["hello_masking_timeout_ms"] = 60000;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").hello_masking_timeout.count(), 60000);
+    value["hello_masking_timeout_ms"] = 60001;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
+TEST(Config, RelayMaxAgeIsOffByDefaultAndValidated) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.relay_max_age_max.count(), 0);
+    EXPECT_EQ(defaults.relay_max_age_idle.count(), 5);
+    auto value = minimal_config();
+    value["relay_max_age_min_seconds"] = 1200;
+    auto parsed = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(parsed.relay_max_age_min.count(), 1200);
+    EXPECT_EQ(parsed.relay_max_age_max.count(), 1200) << "max defaults to min";
+    value["relay_max_age_max_seconds"] = 3600;
+    value["relay_max_age_idle_seconds"] = 10;
+    parsed = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(parsed.relay_max_age_max.count(), 3600);
+    EXPECT_EQ(parsed.relay_max_age_idle.count(), 10);
+    EXPECT_EQ(parsed.public_view()["relay_max_age_max_seconds"].get<std::int64_t>(), 3600);
+    value["relay_max_age_max_seconds"] = 600;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument) << "min > max";
+    value["relay_max_age_max_seconds"] = 3600;
+    value["relay_max_age_idle_seconds"] = 0;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, ServerHelloDelayAutoIsOnByDefaultAndBoolean) {
     const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_TRUE(defaults.server_hello_delay_auto);

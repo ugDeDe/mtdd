@@ -190,6 +190,24 @@ struct Config {
     // encrypted frames with 0..15 bytes, which every client accepts; 3 restores
     // the historical 0..3. Direct routes relay the DC's own framing untouched.
     std::uint32_t s2c_padding_max_bytes{15};
+    // With masking on, a ClientHello still incomplete this long after accept
+    // (nothing sent, or a partial record) is handed to the real site with the
+    // bytes received so far, so the site's own timeouts and close decide what
+    // the visitor sees instead of a fixed handshake_timeout close by mtdd.
+    // Telegram sends its ClientHello right after connect. 0 = off (wait
+    // handshake_timeout, then close); at or above handshake_timeout = off.
+    std::chrono::milliseconds hello_masking_timeout{5000};
+    // Relay session lifetime. Each session draws its own lifetime uniformly
+    // from [min, max] when it starts relaying; past it, the session is closed
+    // as soon as it has been silent for relay_max_age_idle (no bytes either
+    // way, no request awaiting its answer, nothing queued), so a transfer is
+    // never cut. Closes of one client address are spaced 30..90 s apart, so a
+    // device's connections are retired one by one. Hours-long TLS sessions
+    // with periodic pings are rare for HTTPS; the client reconnects. max 0
+    // (the default) = off; max defaults to min.
+    std::chrono::seconds relay_max_age_min{0};
+    std::chrono::seconds relay_max_age_max{0};
+    std::chrono::seconds relay_max_age_idle{5};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
     // Client socket liveness. Keepalive probes start after this much silence

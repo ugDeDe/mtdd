@@ -462,6 +462,9 @@ TEST(ServerHelloProbe, CapturesTheServerHelloOfADefaultOpenSslServer) {
         mtdd::detail::probe_server("127.0.0.1", server.port(), std::string(kDomain), 5s);
     ASSERT_TRUE(probe.has_value());
     EXPECT_EQ(probe->flight, server.flight_for(kDomain));
+    // OpenSSL sends EncryptedExtensions, Certificate, CertificateVerify and
+    // Finished as separate records; FakeTLS can answer with only one.
+    EXPECT_EQ(probe->records, 4u);
     EXPECT_EQ(probe->cipher, 0x1301) << "the client's (Chrome) order is honoured";
     EXPECT_EQ(probe->extensions, kVersionsThenShare) << "OpenSSL: 43 then 51";
     EXPECT_FALSE(probe->key_share_first);
@@ -732,6 +735,10 @@ TEST(ServerHelloAutoDelay, MeasuredDomainHoldsTheHelloForItsProcessingTime) {
     ASSERT_TRUE(wait_for([&] { return processing_measured(daemon.services.stats); }, 10s));
 
     const auto text = daemon.services.stats.prometheus_text();
+    EXPECT_NE(text.find("mtdd_masking_server_flight_records{domain=\"" + std::string(kDomain) +
+                        "\"} 4"),
+              std::string::npos)
+        << "the OpenSSL flight's record count is exported";
     const std::string median = "mtdd_masking_server_processing_us{domain=\"" +
                                std::string(kDomain) + "\",quantile=\"0.5\"} ";
     const auto at = text.find(median);

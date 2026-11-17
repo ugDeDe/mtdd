@@ -316,6 +316,11 @@ Runtime::Impl::Client* Runtime::Impl::make_client(io::UniqueFd fd, Time now,
     handshake_reserved = false;
     try {
         deadlines_.set(token, now + config_.handshake_timeout);
+        if (masking_enabled() && config_.hello_masking_timeout.count() > 0 &&
+            config_.hello_masking_timeout < config_.handshake_timeout) {
+            raw->deadline_kind = Client::DeadlineKind::hello_masking;
+            deadlines_.set(token, now + config_.hello_masking_timeout);
+        }
         reaccount(*raw);
         update_client_interest(*raw);
         if (!config_.proxy_protocol) admit_client_peer(*raw, now);
@@ -664,6 +669,21 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         return;
     }
 
+    // The replay cache starts empty on every start: a hello signed before
+    // this process started (still inside the clock-skew window right after a
+    // restart) may be a capture replayed against the fresh cache. It gets the
+    // real site, like any replay. Only hellos from the skew window before the
+    // start are affected, i.e. at most the first client_clock_skew_seconds of
+    // uptime, and a client then simply reconnects.
+    if (config_.client_clock_skew_seconds != 0 &&
+        static_cast<std::int64_t>(info.timestamp) < shared_->started_unix) {
+        if (client.watched) watch_log(client, "auth", "result=replay_before_start");
+        record_ja4(client, record, control::Ja4Outcome::replay);
+        shared_->replay_rejected_per_worker[worker_index_].fetch_add(
+            1, std::memory_order_relaxed);
+        refuse_replay(control::RejectReason::auth_failed);
+        return;
+    }
     // Replay is checked on the authenticated canonical HMAC before any
     // ServerHello bytes are produced or the ClientHello reaches FakeTLS. The
     // cache is shared by all reactors, so a hello observed by one reactor is
@@ -1300,6 +1320,7 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
             telemetry.relay_with_hello_capacity.fetch_add(1, std::memory_order_relaxed);
         }
         client.phase = Client::Phase::relay;
+        client.max_age_at = draw_max_age(now);
         schedule_client_deadline(client, now);
         update_client_interest(client);
         reaccount(client);
@@ -1342,6 +1363,7 @@ void Runtime::Impl::client_tls_ready(Client& client, Time now) {
         telemetry.relay_with_hello_capacity.fetch_add(1, std::memory_order_relaxed);
     }
     client.phase = Client::Phase::relay;
+    client.max_age_at = draw_max_age(now);
     schedule_client_deadline(client, now);
     update_client_interest(client);
     reaccount(client);

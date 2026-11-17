@@ -260,7 +260,10 @@ TEST(HelloAdmission, ClientClockSkewWindowFollowsTheConfig) {
         // Two seconds inside the edge (the test and the reactor read the clock
         // at slightly different times).
         if (window != 0) {
-            EXPECT_TRUE(at(static_cast<std::int64_t>(window) - 2));
+            // Inside the window but signed before this daemon started: the
+            // fresh replay cache cannot vouch for it, so it is masked like a
+            // replay (HelloSignedBeforeStartIsMaskedLikeAReplay).
+            EXPECT_FALSE(at(static_cast<std::int64_t>(window) - 2));
             EXPECT_TRUE(at(-static_cast<std::int64_t>(window) + 2));
             EXPECT_FALSE(at(static_cast<std::int64_t>(window) + 3));
             EXPECT_FALSE(at(-static_cast<std::int64_t>(window) - 3));

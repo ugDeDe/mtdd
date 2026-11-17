@@ -1872,3 +1872,89 @@ TEST(Runtime, MiddleEndAnswersCarryUpToFifteenPaddingBytes) {
         EXPECT_TRUE(me.future().get().ok);
     }
 }
+
+namespace {
+std::uint64_t max_age_closes(const mtdd::control::Statistics& stats) {
+    return stats.snapshot().relay_closes_total[static_cast<std::size_t>(
+        mtdd::control::RelayCloseReason::max_age)];
+}
+
+void short_max_age(mtdd::Config& c) {
+    c.relay_max_age_min = 1s;
+    c.relay_max_age_max = 1s;
+    c.relay_max_age_idle = 1s;
+    c.idle_timeout = 60s;
+}
+} // namespace
+
+// Past its drawn lifetime, a silent session is closed (FIN) with reason
+// max_age; the client simply reconnects.
+TEST(RelayMaxAge, SilentSessionPastItsLifetimeIsClosed) {
+    FakeMe me{me_secret(), 1, 0ms, 1, 0ms, 0ms, false, 0, 10000};
+    Daemon daemon(me.port(), true, short_max_age);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+    Bytes response;
+    ASSERT_TRUE(client.read_message(response));
+    EXPECT_TRUE(client.wait_closed_for(6000)) << "lifetime 1 s + 1 s of silence + sweep";
+    EXPECT_TRUE(wait_for([&] { return max_age_closes(daemon.services.stats) == 1U; }, 2s));
+}
+
+// A session that keeps talking is never cut, however old; it goes once quiet.
+TEST(RelayMaxAge, ActiveSessionIsKeptUntilItFallsSilent) {
+    constexpr std::size_t kMessages = 12;
+    FakeMe me{me_secret(), kMessages, 0ms, 1, 0ms, 0ms, true, 0, 15000};
+    Daemon daemon(me.port(), true, short_max_age);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    // ~4.4 s of traffic every 400 ms: well past the 1 s lifetime, never 1 s quiet.
+    for (std::size_t i = 0; i < kMessages - 1; ++i) {
+        ASSERT_TRUE(client.send_message(burst_payload(i))) << i;
+        Bytes response;
+        ASSERT_TRUE(client.read_message(response)) << i;
+        std::this_thread::sleep_for(400ms);
+    }
+    EXPECT_EQ(max_age_closes(daemon.services.stats), 0U);
+    EXPECT_TRUE(client.wait_closed_for(5000)) << "closed once it fell silent";
+    EXPECT_EQ(max_age_closes(daemon.services.stats), 1U);
+}
+
+// Two sessions of one address past their lifetime: one is retired, the other
+// only after the 30..90 s per-address spacing.
+TEST(RelayMaxAge, SessionsOfOneAddressAreRetiredOneAtATime) {
+    FakeMe me{me_secret(), 2, 0ms, 1, 0ms, 0ms, true, 0, 15000, kBurstSize, false};
+    Daemon daemon(me.port(), true, short_max_age);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+    TestClient a(daemon.port(), secret_bytes());
+    TestClient b(daemon.port(), secret_bytes());
+    std::uint8_t variant = 1;
+    for (auto* client : {&a, &b}) {
+        ASSERT_TRUE(client->valid());
+        // Distinct hellos: an identical second one would be a replay.
+        ASSERT_TRUE(client->send_hello(0, variant++));
+        ASSERT_TRUE(client->start_obfuscation(2));
+        ASSERT_TRUE(client->send_message(burst_payload(0)));
+        Bytes response;
+        ASSERT_TRUE(client->read_message(response));
+    }
+    ASSERT_TRUE(wait_for([&] { return max_age_closes(daemon.services.stats) == 1U; }, 6s));
+    // The other one survives well past its own lifetime and silence.
+    std::this_thread::sleep_for(3s);
+    EXPECT_EQ(max_age_closes(daemon.services.stats), 1U);
+    const bool a_closed = a.wait_closed_for(100);
+    const bool b_closed = b.wait_closed_for(100);
+    EXPECT_NE(a_closed, b_closed) << "exactly one of the two was retired";
+}

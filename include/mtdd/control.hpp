@@ -375,8 +375,9 @@ enum class RelayCloseReason : uint8_t {
   revoked,         // user disabled, deleted or rotated
   shutdown,
   device_limit,    // a new device (auth key) beyond the user's max_devices
+  max_age,         // relay_max_age_*: an idle session past its drawn lifetime
 };
-inline constexpr std::size_t kRelayCloseReasons = 11;
+inline constexpr std::size_t kRelayCloseReasons = 12;
 enum class Direction { client_to_server, server_to_client };
 enum class BufferState { queued, pending_write, relay };
 enum class MeResult { success, failure, timeout };
@@ -902,7 +903,9 @@ class Statistics {
     uint64_t low_us{0};     // p25
     uint64_t median_us{0};  // p50
     uint64_t high_us{0};    // p75
-    uint64_t samples{0};
+    uint64_t samples{0};    // 0: no processing time measured yet
+    // ApplicationData records of the real server's flight (FakeTLS sends 1).
+    uint64_t flight_records{0};
   };
   using ServerTimingLister = std::function<std::vector<ServerTimingInfo>()>;
   void set_server_timing_lister(ServerTimingLister lister);

@@ -1613,6 +1613,10 @@ std::string Statistics::prometheus_text() const {
                 snapshot.server_hello_auto_delay_us_total);
   for (const auto& entry : server_timings()) {
     const std::string domain = "domain=\"" + escape_label(entry.domain) + "\"";
+    if (entry.flight_records != 0) {
+      append_metric(out, "mtdd_masking_server_flight_records", domain, entry.flight_records);
+    }
+    if (entry.samples == 0) continue;
     append_metric(out, "mtdd_masking_server_processing_us", domain + ",quantile=\"0.25\"",
                   entry.low_us);
     append_metric(out, "mtdd_masking_server_processing_us", domain + ",quantile=\"0.5\"",
@@ -1666,7 +1670,7 @@ std::string Statistics::prometheus_text() const {
     static constexpr std::array<const char*, kRelayCloseReasons> kNames{
         "other",   "client_eof",   "client_error", "client_timeout", "idle_timeout",
         "me_lost", "backpressure", "remote_close", "revoked",        "shutdown",
-        "device_limit"};
+        "device_limit", "max_age"};
     for (std::size_t index = 0; index < kRelayCloseReasons; ++index) {
       append_metric(out, "mtdd_relay_closes_total",
                     std::string("reason=\"") + kNames[index] + "\"",

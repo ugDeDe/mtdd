@@ -161,6 +161,20 @@ TEST(ServerHelloShape, OutOfRangeLengthsAreClampedToOneLegalRecord) {
   EXPECT_EQ(client_accepts(hello, hello_response(hello, random, huge)), kServerFlightMax);
 }
 
+TEST(ServerHelloShape, FlightNeverExceedsTheIosLimit) {
+  // iOS (MTTcpConnection) closes on a hello ApplicationData body above
+  // 10 KiB; a measured larger flight is answered with the largest legal one.
+  static_assert(kServerFlightMax == 10 * 1024);
+  const auto random = system_random();
+  ServerHelloOptions measured;
+  measured.app_data_min = 12000;
+  measured.app_data_max = 15000;
+  const Bytes hello = classical_hello();
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(client_accepts(hello, hello_response(hello, random, measured)), 10240u);
+  }
+}
+
 TEST(ServerHelloShape, UnmeasuredFallbackIsADistributionNotAConstant) {
   const auto random = system_random();
   std::set<std::size_t> seen;

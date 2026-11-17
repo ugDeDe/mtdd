@@ -140,11 +140,17 @@ Runtime::RuntimeState::RuntimeState(const Config& config,
     // masking_dns outlives the lister: the destructor clears it first.
     statistics.set_server_timing_lister([resolver = masking_dns.get()]() {
         std::vector<control::Statistics::ServerTimingInfo> out;
-        for (const auto& [domain, timing] : resolver->server_timings()) {
-            out.push_back({domain, static_cast<std::uint64_t>(timing.low.count()),
-                           static_cast<std::uint64_t>(timing.median.count()),
-                           static_cast<std::uint64_t>(timing.high.count()),
-                           static_cast<std::uint64_t>(timing.samples)});
+        for (const auto& [domain, profile] : resolver->server_profiles()) {
+            control::Statistics::ServerTimingInfo info;
+            info.domain = domain;
+            if (const auto& timing = profile.timing) {
+                info.low_us = static_cast<std::uint64_t>(timing->low.count());
+                info.median_us = static_cast<std::uint64_t>(timing->median.count());
+                info.high_us = static_cast<std::uint64_t>(timing->high.count());
+                info.samples = static_cast<std::uint64_t>(timing->samples);
+            }
+            info.flight_records = static_cast<std::uint64_t>(profile.flight_records);
+            out.push_back(std::move(info));
         }
         return out;
     });

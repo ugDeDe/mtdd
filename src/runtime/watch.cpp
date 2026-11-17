@@ -138,7 +138,7 @@ const char* close_name(control::RelayCloseReason reason) {
     static constexpr const char* kNames[] = {
         "other",   "client_eof",   "client_error", "client_timeout", "idle_timeout",
         "me_lost", "backpressure", "remote_close", "revoked",        "shutdown",
-        "device_limit"};
+        "device_limit", "max_age"};
     const auto index = static_cast<std::size_t>(reason);
     return index < std::size(kNames) ? kNames[index] : "?";
 }

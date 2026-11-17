@@ -360,6 +360,10 @@ enum class PqAnswer : std::uint8_t { unknown, pq, classical };
 struct ServerProbe {
     // Encrypted first flight as one record body (see measure_server_flight).
     std::size_t flight{0};
+    // ApplicationData records that flight came in. FakeTLS can only ever send
+    // one (every client reads exactly one); more is visible to an active
+    // check comparing the proxy with the real server.
+    std::size_t records{0};
     // From its final ServerHello; 0 / empty when it could not be parsed.
     std::uint16_t cipher{0};  // chosen from 1301:1302:1303 offered in that order
     std::uint16_t group{0};
@@ -487,13 +491,15 @@ public:
         // Answers a classical group although X25519MLKEM768 is offered
         // (FakeTLS then answers X25519, its only classical shape).
         bool decline_pq{false};
+        // Most ApplicationData records any sample's flight came in (0: unknown).
+        std::size_t flight_records{0};
         // Processing time over the domain's last ServerTimingHistory samples
         // (successful probes only); nullopt until one probe succeeded.
         std::optional<ServerTiming> timing;
     };
     std::optional<ServerProfile> server_profile(std::string_view domain);
-    // Every probed domain with a measured processing time, for metrics.
-    std::vector<std::pair<std::string, ServerTiming>> server_timings();
+    // Every probed domain with a measurement, for metrics.
+    std::vector<std::pair<std::string, ServerProfile>> server_profiles();
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -507,6 +513,8 @@ private:
         std::chrono::milliseconds backoff;
         std::optional<ServerProfile> profile;  // last good measurement
         ServerTimingHistory timing;            // successful probes only
+        // Flight record count already reported in the journal (0: none yet).
+        std::size_t warned_records{0};
     };
     struct Names {
         std::vector<std::string> resolve;
@@ -1100,6 +1108,40 @@ private:
 // State shared by all reactors. Hot-path relay traffic never touches this
 // object; only admission (connection/handshake reservation, replay cache,
 // unique-IP accounting) and shutdown coordination do.
+// Process-wide spacing of max-age closes per client address: one close per
+// address, then that address waits until the caller's drawn `until`, so a
+// device's sessions are retired one at a time across all reactors.
+inline constexpr std::chrono::seconds kMaxAgeSpacingMin{30};
+inline constexpr std::chrono::seconds kMaxAgeSpacingMax{90};
+class MaxAgeGate {
+public:
+    using Clock = std::chrono::steady_clock;
+    // True when `ip` may retire a session now; it is then held until `until`.
+    bool try_take(const IpKey& ip, Clock::time_point now, Clock::time_point until) {
+        const std::lock_guard lock{mutex_};
+        auto [it, inserted] = next_.try_emplace(ip, until);
+        if (!inserted) {
+            if (now < it->second) return false;
+            it->second = until;
+        }
+        return true;
+    }
+    void prune(Clock::time_point now) {
+        const std::lock_guard lock{mutex_};
+        for (auto it = next_.begin(); it != next_.end();) {
+            it = now >= it->second ? next_.erase(it) : std::next(it);
+        }
+    }
+    std::size_t size() const {
+        const std::lock_guard lock{mutex_};
+        return next_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<IpKey, Clock::time_point, IpKeyHash> next_;
+};
+
 struct SharedState {
     SharedState(std::size_t worker_count, std::size_t budget_per_worker)
         : workers(worker_count == 0 ? 1 : worker_count),
@@ -1107,6 +1149,12 @@ struct SharedState {
           replay(replay_capacity()) {}
 
     std::atomic<bool> stop{false};
+    MaxAgeGate max_age;
+    // Wall clock (Unix seconds) when this process's replay cache started
+    // empty. A hello signed before it may have been seen by a previous run.
+    std::int64_t started_unix{std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count()};
     // Live-reloadable ME pool tunables (Runtime::set_tunables). Reactors pick
     // them up on their housekeeping tick when the generation changes.
     std::atomic<std::uint32_t> me_clients_per_writer{0};
@@ -1381,7 +1429,9 @@ struct Runtime::Impl {
             fallback_connect,
             fallback_idle,
             // held_server_hello is released when it fires (server_hello_delay_*)
-            server_hello_delay
+            server_hello_delay,
+            // ClientHello still incomplete at hello_masking_timeout: masking
+            hello_masking
         };
 
         std::uint64_t token{};
@@ -1584,6 +1634,7 @@ struct Runtime::Impl {
         // first MTProto frames looked like.
         Time accepted_at{};
         Time auth_at{};            // FakeTLS authenticated, Time{} otherwise
+        Time max_age_at{};         // relay_max_age_*: drawn lifetime end, Time{} = none
         bool canary{false};        // authenticated as a bait user
         std::uint8_t zero_key_frames{0};  // frames with auth_key_id 0 (key exchange)
         bool saw_req_dh{false};    // key exchange went past req_pq
@@ -1949,6 +2000,13 @@ struct Runtime::Impl {
     void suspect_close(Client& client, Time now);
     bool suspect_shadow_ban(Client& client, Time now);
     Time next_suspect_prune_{};
+    Time next_max_age_sweep_{};
+    std::vector<std::uint64_t> max_age_due_;
+    Time next_max_age_prune_{};
+    // relay_max_age_*: draw a relay session's lifetime end (Time{} when off),
+    // and close idle sessions past theirs, one per client address at a time.
+    Time draw_max_age(Time now);
+    void retire_aged_clients(Time now);
     // Fair-share rate limits: recompute this connection's share, and publish
     // this reactor's active-connection counts (1 Hz, from the gauge pass).
     void recompute_rate_share(Client& client) noexcept;

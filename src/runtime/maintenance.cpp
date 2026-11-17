@@ -150,6 +150,11 @@ void Runtime::Impl::housekeeping(Time now) {
             }
         }
     }
+    try {
+        retire_aged_clients(now);
+    } catch (...) {
+        // Allocation failure: the next sweep retries.
+    }
     finish_eof_clients(now, true);
     finish_direct_eof(now);
     finish_fallback_pairs(now);
@@ -159,6 +164,74 @@ void Runtime::Impl::housekeeping(Time now) {
     // a client; re-evaluate this reactor's listener so a reactor that paused
     // accepting at the global cap resumes without waiting for local traffic.
     update_listener_interest();
+}
+
+Runtime::Impl::Time Runtime::Impl::draw_max_age(Time now) {
+    const auto low = config_.relay_max_age_min;
+    const auto high = config_.relay_max_age_max;
+    if (high.count() <= 0) return Time{};
+    auto lifetime = std::chrono::duration_cast<std::chrono::milliseconds>(low);
+    const auto span = std::chrono::duration_cast<std::chrono::milliseconds>(high - low);
+    if (span.count() > 0) {
+        std::array<std::uint8_t, 8> draw{};
+        random_(draw);
+        std::uint64_t value = 0;
+        for (const auto byte : draw) value = (value << 8) | byte;
+        lifetime += std::chrono::milliseconds(
+            static_cast<std::int64_t>(value % static_cast<std::uint64_t>(span.count() + 1)));
+    }
+    return now + lifetime;
+}
+
+void Runtime::Impl::retire_aged_clients(Time now) {
+    if (config_.relay_max_age_max.count() <= 0 || stopping_) return;
+    if (worker_index_ == 0 && now >= next_max_age_prune_) {
+        next_max_age_prune_ = now + std::chrono::seconds(60);
+        shared_->max_age.prune(now);
+    }
+    if (now < next_max_age_sweep_) return;
+    next_max_age_sweep_ = now + std::chrono::seconds(1);
+    const auto quiet = config_.relay_max_age_idle;
+    std::vector<std::uint64_t>& due = max_age_due_;
+    due.clear();
+    for (const auto& [token, owned] : clients_) {
+        const Client& client = *owned;
+        if (client.phase != Client::Phase::relay || client.close_requested ||
+            client.max_age_at == Time{} || now < client.max_age_at) {
+            continue;
+        }
+        // Only a silent session: nothing read or written lately, no request
+        // waiting for its answer, nothing queued either way, not held by the
+        // rate limiter. A transfer in progress is never cut.
+        if (client.awaiting_reply || now - client.last_activity < quiet ||
+            client.rate_pause_c2s || client.rate_pause_s2c || client.in_s2c_batch ||
+            !client.c2s.empty() || (client.out && !client.out->empty()) ||
+            client.s2c_offset < client.s2c_wire.size() ||
+            (client.direct_out && !client.direct_out->empty())) {
+            continue;
+        }
+        due.push_back(token);
+    }
+    for (const std::uint64_t token : due) {
+        const auto found = clients_.find(token);
+        if (found == clients_.end()) continue;
+        const Client& client = *found->second;
+        std::array<std::uint8_t, 2> draw{};
+        random_(draw);
+        const auto spread = static_cast<std::int64_t>(
+            (detail::kMaxAgeSpacingMax - detail::kMaxAgeSpacingMin).count() * 1000);
+        const auto spacing = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 detail::kMaxAgeSpacingMin) +
+                             std::chrono::milliseconds(
+                                 ((static_cast<std::int64_t>(draw[0]) << 8) | draw[1]) %
+                                 (spread + 1));
+        if (!shared_->max_age.try_take(detail::hello_ip_key(client.peer), now, now + spacing)) {
+            continue;  // another session of this address was just retired
+        }
+        if (client.watched) watch_log(*found->second, "close", "reason=max_age");
+        close_client(token, control::RelayCloseReason::max_age);
+    }
+    due.clear();
 }
 
 bool Runtime::Impl::budget_allows(std::size_t extra) const {

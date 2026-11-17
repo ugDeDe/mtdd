@@ -980,6 +980,97 @@ TEST(Runtime, FallbackPreservesUnauthenticatedClientHelloAndTail) {
         [&] { return daemon.services.stats.snapshot().connections_active == 0; }, 2000ms));
 }
 
+// A silent connection must not be closed by the proxy at its own fixed
+// handshake_timeout: after hello_masking_timeout the real site gets it, so the
+// site's timeouts and close are what a probe observes.
+TEST(Runtime, SilentConnectionIsHandedToTheSiteAfterHelloMaskingTimeout) {
+    EchoBackend echo;
+    Daemon daemon(1, false, [&](mtdd::Config& config) {
+        config.fallback_port = echo.port();
+        config.handshake_timeout = 10s;
+        config.hello_masking_timeout = 300ms;
+    });
+    const int fd = connect_loopback(daemon.port());
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(echo.accepted(), 0U);
+    EXPECT_TRUE(wait_for([&] { return echo.accepted() >= 1U; }, 3000ms))
+        << "the site gets the connection long before handshake_timeout";
+    EXPECT_EQ(peer_state(fd, 50), 2) << "the proxy itself does not close it";
+    const Bytes later{'G', 'E', 'T', ' ', '/'};
+    ASSERT_TRUE(send_all(fd, later));
+    Bytes echoed(later.size());
+    ASSERT_TRUE(recv_exact(fd, echoed.data(), echoed.size(), 3000));
+    EXPECT_EQ(echoed, later);
+    ::close(fd);
+}
+
+TEST(Runtime, PartialClientHelloIsHandedToTheSiteWithItsBytes) {
+    EchoBackend echo;
+    Daemon daemon(1, false, [&](mtdd::Config& config) {
+        config.fallback_port = echo.port();
+        config.handshake_timeout = 10s;
+        config.hello_masking_timeout = 300ms;
+    });
+    const int fd = connect_loopback(daemon.port());
+    ASSERT_GE(fd, 0);
+    // A record header announcing 512 bytes, then only 100 of them.
+    Bytes head{0x16, 0x03, 0x01, 0x02, 0x00};
+    for (int i = 0; i < 100; ++i) head.push_back(static_cast<std::uint8_t>(i));
+    ASSERT_TRUE(send_all(fd, head));
+    Bytes echoed(head.size());
+    ASSERT_TRUE(recv_exact(fd, echoed.data(), echoed.size(), 3000))
+        << "the bytes received so far reach the site verbatim";
+    EXPECT_EQ(echoed, head);
+    const Bytes rest(412, 0x33);
+    ASSERT_TRUE(send_all(fd, rest));
+    Bytes tail(rest.size());
+    ASSERT_TRUE(recv_exact(fd, tail.data(), tail.size(), 3000));
+    EXPECT_EQ(tail, rest);
+    ::close(fd);
+}
+
+TEST(Runtime, HelloMaskingTimeoutZeroKeepsTheHandshakeTimeoutClose) {
+    EchoBackend echo;
+    Daemon daemon(1, false, [&](mtdd::Config& config) {
+        config.fallback_port = echo.port();
+        config.handshake_timeout = 1s;
+        config.hello_masking_timeout = 0ms;
+    });
+    const int fd = connect_loopback(daemon.port());
+    ASSERT_GE(fd, 0);
+    EXPECT_TRUE(wait_closed(fd, 4000));
+    EXPECT_EQ(echo.accepted(), 0U);
+    ::close(fd);
+}
+
+// The replay cache starts empty on every start: a valid hello signed before
+// the process started may be a capture and is masked like a replay.
+TEST(Runtime, HelloSignedBeforeStartIsMaskedLikeAReplay) {
+    EchoBackend echo;
+    Daemon daemon(1, false, [&](mtdd::Config& config) { config.fallback_port = echo.port(); });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    // Inside the default 120 s skew window, but before this process started.
+    const Bytes hello =
+        make_client_hello(secret_bytes(), static_cast<std::uint32_t>(now - 30), kDomain, 11);
+    const int fd = connect_loopback(daemon.port());
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(send_all(fd, hello));
+    Bytes echoed(hello.size());
+    ASSERT_TRUE(recv_exact(fd, echoed.data(), echoed.size(), 3000))
+        << "no ServerHello: the site gets the hello verbatim";
+    EXPECT_EQ(echoed, hello);
+    EXPECT_GE(stat_counter(daemon.services.stats, "handshakes", "replay"), 1U);
+    ::close(fd);
+
+    // A hello signed now is served as usual.
+    TestClient fresh(daemon.port(), secret_bytes());
+    ASSERT_TRUE(fresh.valid());
+    EXPECT_TRUE(fresh.send_hello()) << "a current timestamp still authenticates";
+}
+
 TEST(Runtime, FallbackReplayIsMaskedVerbatim) {
     EchoBackend echo;
     Daemon daemon(1, false, [&](mtdd::Config& config) { config.fallback_port = echo.port(); });

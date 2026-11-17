@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -175,11 +176,12 @@ std::optional<MaskingResolver::ServerProfile> MaskingResolver::server_profile(
     return found->second.profile;
 }
 
-std::vector<std::pair<std::string, ServerTiming>> MaskingResolver::server_timings() {
-    std::vector<std::pair<std::string, ServerTiming>> out;
+std::vector<std::pair<std::string, MaskingResolver::ServerProfile>>
+MaskingResolver::server_profiles() {
+    std::vector<std::pair<std::string, ServerProfile>> out;
     const std::lock_guard lock{mutex_};
     for (const auto& [name, probe] : probes_) {
-        if (probe.profile && probe.profile->timing) out.emplace_back(name, *probe.profile->timing);
+        if (probe.profile) out.emplace_back(name, *probe.profile);
     }
     std::sort(out.begin(), out.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -189,7 +191,7 @@ std::vector<std::pair<std::string, ServerTiming>> MaskingResolver::server_timing
 std::optional<MaskingResolver::ServerProfile> MaskingResolver::probe_profile(
     const std::string& address, std::uint16_t port, const std::string& name,
     std::vector<std::chrono::microseconds>& processing) {
-    ServerProfile profile{protocol::kServerFlightMax, 0, 0, false, false, std::nullopt};
+    ServerProfile profile{protocol::kServerFlightMax, 0, 0, false, false, 0, std::nullopt};
     for (std::size_t i = 0; i < kServerFlightSamples; ++i) {
         const auto sample = probe_server(address, port, name, kServerFlightProbeTimeout,
                                          [this] { return cancel_.load(); });
@@ -197,6 +199,7 @@ std::optional<MaskingResolver::ServerProfile> MaskingResolver::probe_profile(
         if (sample->processing) processing.push_back(*sample->processing);
         profile.min = std::min(profile.min, sample->flight);
         profile.max = std::max(profile.max, sample->flight);
+        profile.flight_records = std::max(profile.flight_records, sample->records);
         if (i == 0) {
             profile.cipher = sample->cipher;
             profile.key_share_first = sample->key_share_first;
@@ -242,6 +245,18 @@ void MaskingResolver::run_probe(std::unique_lock<std::mutex>& lock, const std::s
         for (const auto sample : processing) probe.timing.add(sample);
         profile->timing = probe.timing.summary();
         probe.profile = profile;
+        if (profile->flight_records > 1 && profile->flight_records != probe.warned_records) {
+            probe.warned_records = profile->flight_records;
+            // One write per line keeps it whole in the journal.
+            std::cerr << ("mtdd: masking domain " + name + " sends its TLS 1.3 flight in " +
+                          std::to_string(profile->flight_records) +
+                          " ApplicationData records; FakeTLS can only send one, so an active "
+                          "check comparing the proxy with the real server tells them apart. "
+                          "Prefer a domain whose server packs the flight into one record "
+                          "(mtdd_masking_server_flight_records)\n");
+        } else if (profile->flight_records <= 1) {
+            probe.warned_records = 0;
+        }
         probe.backoff = {};
         probe.next_attempt = now + kServerFlightRefresh + random_below(kServerFlightProbeJitter);
     } else {

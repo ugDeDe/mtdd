@@ -387,6 +387,27 @@ void Runtime::Impl::on_client_deadline(Client& client, Time now) {
         on_fallback_deadline(client, now);
         return;
     }
+    if (client.deadline_kind == Client::DeadlineKind::hello_masking) {
+        if (client.phase == Client::Phase::tls_hello && masking_enabled()) {
+            // A silent or partial ClientHello: hand what arrived to the real
+            // site, whose own timeouts and close the visitor then sees. A
+            // fixed close by the proxy itself would set it apart from that
+            // site.
+            if (client.watched) {
+                watch_log(client, "masking",
+                          "reason=hello_timeout bytes=" + std::to_string(client.hello.size()));
+            }
+            const auto partial = std::move(client.hello);
+            client.hello.clear();
+            (void)start_fallback(client, partial, now, partial);
+            return;
+        }
+        // Still reading a PROXY header (or masking switched off): the
+        // ordinary handshake deadline from accept.
+        client.deadline_kind = Client::DeadlineKind::handshake;
+        deadlines_.set(client.token, client.accepted_at + config_.handshake_timeout);
+        return;
+    }
     if (client.deadline_kind == Client::DeadlineKind::handshake) {
         if (client.phase != Client::Phase::relay) {
             if (client.handshake_budget_stalled) ++budget_handshake_stalls_;

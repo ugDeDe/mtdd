@@ -230,6 +230,7 @@ std::optional<ServerProbe> handshake(int fd, const std::string& server_name,
     if (SSL_version(ssl.get()) == TLS1_3_VERSION && counter.done && counter.records > 0) {
         result.emplace();
         result->flight = counter.bodies + 5 * (counter.records - 1);
+        result->records = counter.records;
         result->retried = observed.hello.retried;
         if (latency) {
             result->hello_latency =

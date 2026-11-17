@@ -455,12 +455,14 @@ class Socks5Client {
 };
 
 // The ApplicationData record after ServerHello + CCS stands in for the real
-// server's encrypted EncryptedExtensions..Finished flight. The client accepts
-// exactly one such record (tdlib TlsInit::wait_hello_response), so its body is
-// at most one TLSCiphertext (2^14 + 256). Without a measurement of the real
-// server, the body length is drawn from the reference MTProxy fallback range.
+// server's encrypted EncryptedExtensions..Finished flight. Every client accepts
+// exactly one such record (tdlib TlsInit::wait_hello_response, tdesktop
+// TlsSocket::checkHelloParts34, Android ConnectionSocket, iOS MTTcpConnection),
+// and iOS rejects a body above 10 KiB, so the body is at most 10240 bytes.
+// Without a measurement of the real server, the body length is drawn from the
+// reference MTProxy fallback range.
 inline constexpr std::size_t kServerFlightMin = 256;
-inline constexpr std::size_t kServerFlightMax = kFakeTlsMaxRecordBody;
+inline constexpr std::size_t kServerFlightMax = 10 * 1024;
 inline constexpr std::size_t kServerFlightFallbackMin = 2500;
 inline constexpr std::size_t kServerFlightFallbackMax = 3619;
 
