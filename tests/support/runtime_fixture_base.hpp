@@ -481,6 +481,11 @@ public:
     bool read_message(Bytes& payload, int timeout_ms = 3000) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (true) {
+            while (s2c_plain_.size() >= 4 && (rd32(s2c_plain_, 0) & 0x80000000U) != 0) {
+                // Quick ack: a bare 4-byte length word with the top bit set.
+                quick_acks_.push_back(rd32(s2c_plain_, 0));
+                s2c_plain_.erase(s2c_plain_.begin(), s2c_plain_.begin() + 4);
+            }
             if (s2c_plain_.size() >= 4) {
                 const std::uint32_t length = rd32(s2c_plain_, 0);
                 if (length == 0 || length > (4U << 20)) return false;
@@ -507,12 +512,17 @@ public:
             }
             if (header[0] == 0x15) return false;
             if (header[0] != 0x17 || !s2c_) continue;
+            record_lengths_.push_back(length);
             s2c_->apply(body);
             append(s2c_plain_, body);
         }
     }
 
     const Bytes& hello_bytes() const { return hello_; }
+    // Bodies of post-handshake ApplicationData records read so far, and quick
+    // ack words decoded from them.
+    const std::vector<std::size_t>& record_lengths() const { return record_lengths_; }
+    const std::vector<std::uint32_t>& quick_acks() const { return quick_acks_; }
     void close() {
         if (fd_ >= 0) {
             ::close(fd_);
@@ -547,6 +557,8 @@ private:
     std::optional<mtdd::protocol::crypto::AesCtr> c2s_;
     std::optional<mtdd::protocol::crypto::AesCtr> s2c_;
     Bytes s2c_plain_;
+    std::vector<std::size_t> record_lengths_;
+    std::vector<std::uint32_t> quick_acks_;
 };
 
 // ---------------------------------------------------------------------------
@@ -594,6 +606,10 @@ mtdd::Config make_config(const std::filesystem::path& directory, std::uint16_t m
     config.max_connections = 64;
     config.max_handshakes = 32;
     config.max_frame_bytes = 2U * 1024U * 1024U;
+    // TestClient, like tdlib, strips only len % 4; whole padding words would
+    // stay in its payload. Runtime cases compare exact ME answers, so keep the
+    // padding within one word unless a case opts into the full 0..15.
+    config.s2c_padding_max_bytes = 3;
     config.connection_queue_bytes = 256U * 1024U;
     config.global_buffer_bytes = 64U * 1024U * 1024U;
     config.handshake_timeout = 2s;

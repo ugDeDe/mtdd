@@ -165,12 +165,12 @@ void encode_transport_message(ProtoTag tag, std::span<const std::uint8_t> data,
     throw std::invalid_argument("transport payload must be non-empty and 4-byte aligned");
   }
   std::size_t padding = 0;
-  std::array<std::uint8_t, 3> pad{};
+  std::array<std::uint8_t, kSecureMaxPadding> pad{};
   if (tag == ProtoTag::Secure) {
     if (random && *random) {
       std::uint8_t r = 0;
       (*random)(std::span<std::uint8_t>(&r, 1));
-      padding = r % 4;
+      padding = r % (secure_padding_limit(data.size(), kSecureMaxPadding) + 1);
       if (padding) (*random)(std::span<std::uint8_t>(pad).first(padding));
     }
   }

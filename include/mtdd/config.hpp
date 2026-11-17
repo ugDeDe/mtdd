@@ -185,6 +185,11 @@ struct Config {
     // measured yet answers at once. Manual bounds above 0 always win.
     bool server_hello_delay_auto{true};
     static constexpr std::chrono::milliseconds kMaxAutoServerHelloDelay{100};
+    // Upper bound of the random padding on FakeTLS answers relayed from the
+    // Middle-End (padded intermediate), 0..15. Telegram DCs themselves pad
+    // encrypted frames with 0..15 bytes, which every client accepts; 3 restores
+    // the historical 0..3. Direct routes relay the DC's own framing untouched.
+    std::uint32_t s2c_padding_max_bytes{15};
     std::chrono::seconds idle_timeout{1800};
     std::chrono::seconds shutdown_timeout{10};
     // Client socket liveness. Keepalive probes start after this much silence

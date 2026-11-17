@@ -1795,3 +1795,80 @@ TEST(Runtime, DeviceLimitClosesNewAuthKeyOnTheMiddleEndPath) {
               1U);
     EXPECT_EQ(snapshot.users.at("alice").devices, 1U);
 }
+
+// A quick ack alone would be a TLS record with a 4-byte body, which real TLS
+// never sends (AEAD overhead alone is 17 bytes). It must reach the client in
+// the same record as the next answer, even when the answer arrives in a later
+// ME read.
+TEST(Runtime, MiddleEndQuickAckRidesWithTheNextAnswer) {
+    FakeMe me{me_secret(), 1, 0ms, 1, 0ms, 0ms, false, 0, 1500, kBurstSize, true, 0, false,
+              "127.0.0.1", 200ms};
+    Daemon daemon(me.port(), true);
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+    TestClient client(daemon.port(), secret_bytes());
+    ASSERT_TRUE(client.valid());
+    ASSERT_TRUE(client.send_hello());
+    ASSERT_TRUE(client.start_obfuscation(2));
+    ASSERT_TRUE(client.send_message(burst_payload(0)));
+
+    // The ack is in flight 200 ms before the answer: nothing may reach the
+    // client meanwhile.
+    EXPECT_FALSE(client.peer_sent_data(120));
+
+    Bytes response;
+    ASSERT_TRUE(client.read_message(response));
+    EXPECT_EQ(response, (Bytes{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44}));
+    ASSERT_EQ(client.quick_acks().size(), 1u);
+    EXPECT_EQ(client.quick_acks()[0], rd32(Bytes(kFakeMeQuickAck.begin(), kFakeMeQuickAck.end()), 0));
+    // Ack and answer share one record: 4 (ack) + 4 (length) + 8 + 0..15 padding.
+    ASSERT_EQ(client.record_lengths().size(), 1u);
+    EXPECT_GE(client.record_lengths()[0], 16u);
+    EXPECT_LE(client.record_lengths()[0], 16u + mtdd::protocol::kSecureMaxPadding);
+    ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+    EXPECT_TRUE(me.future().get().ok);
+}
+
+// s2c_padding_max_bytes = 15 (the production default) reaches the ME answer
+// path: whole padding words appear after MTProto-sized answers, never more
+// than three; a transport-code-sized answer keeps at most 3 padding bytes.
+TEST(Runtime, MiddleEndAnswersCarryUpToFifteenPaddingBytes) {
+    constexpr std::size_t kAnswers = 64;
+    for (const std::size_t answer_bytes : {std::size_t{40}, std::size_t{0}}) {
+        // response_bytes 0 = the fixture's plain 8-byte answer (< 24: a code).
+        const std::size_t size = answer_bytes == 0 ? 8 : answer_bytes;
+        FakeMe me{me_secret(), kAnswers, 0ms, 1, 0ms, 0ms, true, answer_bytes, 1500};
+        Daemon daemon(me.port(), true,
+                      [](mtdd::Config& c) { c.s2c_padding_max_bytes = 15; });
+        ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+        ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+        ASSERT_TRUE(wait_for([&] { return daemon.services.stats.ready(); }, 3s));
+
+        TestClient client(daemon.port(), secret_bytes());
+        ASSERT_TRUE(client.valid());
+        ASSERT_TRUE(client.send_hello());
+        ASSERT_TRUE(client.start_obfuscation(2));
+        const Bytes prefix{0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44};
+        std::size_t with_padding_words = 0;
+        for (std::size_t i = 0; i < kAnswers; ++i) {
+            ASSERT_TRUE(client.send_message(burst_payload(i)));
+            Bytes response;
+            ASSERT_TRUE(client.read_message(response)) << i;
+            ASSERT_GE(response.size(), size) << i;
+            // TestClient keeps whole padding words, as tdlib does.
+            EXPECT_LE(response.size() - size, 12u) << i;
+            EXPECT_EQ(Bytes(response.begin(), response.begin() + 8), prefix) << i;
+            if (response.size() > size) ++with_padding_words;
+        }
+        if (size >= mtdd::protocol::kMinMtprotoMessage) {
+            // P(no padding >= 4 in 64 answers) = (1/4)^64.
+            EXPECT_GT(with_padding_words, 0u);
+        } else {
+            EXPECT_EQ(with_padding_words, 0u) << "a transport code got >= 4 padding bytes";
+        }
+        ASSERT_EQ(me.future().wait_for(5s), std::future_status::ready);
+        EXPECT_TRUE(me.future().get().ok);
+    }
+}

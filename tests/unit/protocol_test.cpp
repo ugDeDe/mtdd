@@ -708,7 +708,7 @@ TEST(FakeTls, FusedTransportSendMatchesTwoStepSend) {
     return conn;
   };
 
-  for (const std::size_t size : {4u, 12u, 4096u, 16384u, 20000u, 65536u}) {
+  for (const std::size_t size : {4u, 12u, 4096u, 16384u, 16392u, 16396u, 20000u, 65536u}) {
     for (std::uint64_t seed : {0u, 1u, 2u, 3u}) {
       Bytes payload(size);
       for (std::size_t i = 0; i < payload.size(); ++i) {
@@ -1013,7 +1013,7 @@ TEST(Transport, SecurePaddingAndEncoding) {
   ASSERT_GE(wire.size(), 8u);
   std::uint32_t declared = rd32(wire);
   EXPECT_GE(declared, 4u);
-  EXPECT_LE(declared, 7u);
+  EXPECT_LE(declared, 4u + kSecureMaxPadding);
   TransportDecoder dec({tag, 1 << 20});
   std::vector<TransportDecoder::Message> msgs;
   // Split every boundary.
@@ -1024,6 +1024,69 @@ TEST(Transport, SecurePaddingAndEncoding) {
   Bytes ack;
   encode_quick_ack(tag, {1, 2, 3, 4}, ack);
   EXPECT_EQ(ack, from_hex("01020304"));
+}
+
+TEST(Transport, SecurePaddingSpansZeroToFifteenUniformly) {
+  // Telegram DCs pad encrypted s2c frames with 0..15 bytes, so clients accept
+  // it. Every padding length must occur equally often over all random bytes,
+  // so small solo records do not cluster at (len - 28) % 16 in {12..15}.
+  const Bytes msg(24 + 16, 0x5a);
+  std::array<std::size_t, kSecureMaxPadding + 1> seen{};
+  for (unsigned value = 0; value < 256; ++value) {
+    bool first = true;
+    const RandomFn random([&](std::span<std::uint8_t> out) {
+      for (auto& byte : out) byte = first ? static_cast<std::uint8_t>(value) : 0xa5;
+      first = false;
+    });
+    Bytes wire;
+    encode_transport_message(ProtoTag::Secure, msg, wire, &random);
+    const std::uint32_t declared = rd32(wire);
+    ASSERT_GE(declared, msg.size());
+    const std::size_t padding = declared - msg.size();
+    ASSERT_LE(padding, kSecureMaxPadding);
+    EXPECT_EQ(padding, value % (kSecureMaxPadding + 1));
+    EXPECT_EQ(wire.size(), 4 + declared);
+    ++seen[padding];
+
+    TransportDecoder dec({ProtoTag::Secure, 1 << 20});
+    std::vector<TransportDecoder::Message> msgs;
+    ASSERT_EQ(dec.feed(wire, msgs), Status::Ok);
+    ASSERT_EQ(msgs.size(), 1u);
+    // Like tdlib, the decoder trims only len % 4; whole padding words stay
+    // in the payload and MTProto drops them (tdlib: size & 15 before decrypt).
+    EXPECT_EQ(Bytes(msgs[0].data.begin(),
+                    msgs[0].data.begin() + static_cast<std::ptrdiff_t>(msg.size())),
+              msg);
+  }
+  for (std::size_t padding = 0; padding < seen.size(); ++padding) {
+    EXPECT_EQ(seen[padding], 256u / seen.size()) << "padding=" << padding;
+  }
+}
+
+TEST(Transport, TransportCodesKeepAtMostThreePaddingBytes) {
+  // A 4-byte -404 must stay below the clients' error-code size thresholds
+  // (tdlib < 16, tdesktop < 12 bytes); real MTProto messages (>= 24) get 0..15.
+  static_assert(secure_padding_limit(4, 15) == 3);
+  static_assert(secure_padding_limit(20, 15) == 3);
+  static_assert(secure_padding_limit(24, 15) == 15);
+  static_assert(secure_padding_limit(24, 3) == 3);
+  static_assert(secure_padding_limit(4, 0) == 0);
+  static_assert(secure_padding_limit(64, 99) == 15);
+  for (const std::size_t size : {4u, 8u, 12u, 16u, 20u}) {
+    std::size_t largest = 0;
+    for (unsigned value = 0; value < 256; ++value) {
+      bool first = true;
+      const RandomFn random([&](std::span<std::uint8_t> out) {
+        for (auto& byte : out) byte = first ? static_cast<std::uint8_t>(value) : 0x5a;
+        first = false;
+      });
+      const Bytes code(size, 0xff);
+      Bytes wire;
+      encode_transport_message(ProtoTag::Secure, code, wire, &random);
+      largest = std::max<std::size_t>(largest, rd32(wire) - size);
+    }
+    EXPECT_EQ(largest, kTransportCodeMaxPadding) << "size=" << size;
+  }
 }
 
 TEST(Transport, RejectsMalformedAndUnsupported) {

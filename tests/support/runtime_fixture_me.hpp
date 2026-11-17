@@ -37,6 +37,10 @@ Bytes burst_payload(std::size_t index) {
     return payload;
 }
 
+// Confirm token FakeMe sends in RPC_SIMPLE_ACK (top bit set, as a quick ack
+// length word on the client transport).
+inline const std::array<std::uint8_t, 4> kFakeMeQuickAck{0x01, 0x02, 0x03, 0x84};
+
 class FakeMe {
 public:
     explicit FakeMe(std::array<std::uint8_t, 128> secret, std::size_t frames = 1,
@@ -49,13 +53,15 @@ public:
                     std::size_t min_inner = kBurstSize,
                     bool require_sequence = true, std::size_t orphan_answers = 0,
                     bool inbound_control = false,
-                    const char* listen_host = "127.0.0.1")
+                    const char* listen_host = "127.0.0.1",
+                    std::optional<std::chrono::milliseconds> quick_ack_lead = std::nullopt)
         : secret_(std::move(secret)), frames_expected_(frames), delay_(delay),
           connections_(connections), handshake_delay_(handshake_delay),
           drop_delay_(drop_delay), respond_each_(respond_each),
           response_bytes_(response_bytes), idle_read_timeout_ms_(idle_read_timeout_ms),
           min_inner_(min_inner), require_sequence_(require_sequence),
-          orphan_answers_(orphan_answers), inbound_control_(inbound_control) {
+          orphan_answers_(orphan_answers), inbound_control_(inbound_control),
+          quick_ack_lead_(quick_ack_lead) {
         auto listener = mtdd::io::listen_tcp(listen_host, 0);
         if (!listener.ok()) throw std::runtime_error("fake ME cannot listen");
         listener_ = std::move(listener.fd);
@@ -298,7 +304,16 @@ private:
         if (!respond_each_) {
             const std::array<std::uint8_t, 8> returned{0xaa, 0xbb, 0xcc, 0xdd,
                                                        0x11, 0x22, 0x33, 0x44};
-            write_response(fd, 0, observation.conn_id, returned, outgoing);
+            std::int32_t answer_seq = 0;
+            if (quick_ack_lead_) {
+                Bytes ack;
+                put32(ack, 0x3bac409bU);
+                append(ack, observation.conn_id);
+                append(ack, kFakeMeQuickAck);
+                write_frame(fd, answer_seq++, ack, &outgoing);
+                if (quick_ack_lead_->count() > 0) sleep_wait(*quick_ack_lead_);
+            }
+            write_response(fd, answer_seq, observation.conn_id, returned, outgoing);
         }
         if (orphan_answers_ != 0) {
             // Deliver answers for conn ids no client owns, then observe whether
@@ -396,6 +411,9 @@ private:
     bool require_sequence_{true};
     std::size_t orphan_answers_{0};
     bool inbound_control_{false};
+    // When set, the single (non respond_each) answer is preceded by an
+    // RPC_SIMPLE_ACK carrying kFakeMeQuickAck, sent this long before it.
+    std::optional<std::chrono::milliseconds> quick_ack_lead_;
     mtdd::io::UniqueFd listener_;
     std::uint16_t port_{0};
     std::thread thread_;

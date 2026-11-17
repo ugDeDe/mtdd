@@ -37,7 +37,7 @@ using ClockFn = std::function<std::int64_t()>;
 RandomFn system_random();
 // Same CSPRNG, served from a private 16 KiB block refilled with one RAND_bytes
 // call. OpenSSL's RAND_bytes checks getpid() for fork safety on every call
-// (a real system call under musl); per-message padding asked for 1-3 bytes at
+// (a real system call under musl); per-message padding asked for 1-15 bytes at
 // a time and each handshake for ~3 KiB. Requests above 4 KiB bypass the block.
 // Not thread-safe: give each reactor its own instance.
 RandomFn buffered_random();
@@ -45,6 +45,29 @@ RandomFn buffered_random();
 inline constexpr std::size_t kObfuscationHandshakeSize = 64;
 inline constexpr std::size_t kFakeTlsMaxClientHello = 4096;
 inline constexpr std::size_t kFakeTlsMaxRecordBody = 16384 + 256;
+// Largest server->client ApplicationData body mtdd writes: a full TLS 1.3 AEAD
+// record (2^14 plaintext + inner content type + 16-byte tag). A bare 16384 is a
+// length no real TLS 1.2/1.3 AEAD server ever emits. Clients accept bodies up
+// to the 16-bit length field (tdlib, tdesktop) or 64 KiB (Android).
+inline constexpr std::size_t kFakeTlsServerRecordBody = 16384 + 1 + 16;
+// Secure (padded intermediate) s2c padding is 0..kSecureMaxPadding random
+// bytes. Telegram DCs send 0..15 on encrypted frames, so every client accepts
+// it; 0..3 would leave small solo records with (len - 28) % 16 in {12..15}.
+inline constexpr std::size_t kSecureMaxPadding = 15;
+// Payloads shorter than the smallest MTProto message (auth_key_id + msg_key or
+// msg_id + length + body: 24 bytes) are transport codes such as -404. Clients
+// tell them apart by total packet size (tdlib: < 16 bytes, tdesktop: < 12), so
+// they keep the historical 0..3 padding: more would turn a code into a broken
+// "encrypted message".
+inline constexpr std::size_t kMinMtprotoMessage = 24;
+inline constexpr std::size_t kTransportCodeMaxPadding = 3;
+inline constexpr std::size_t secure_padding_limit(std::size_t payload_size,
+                                                  std::size_t configured) noexcept {
+  const std::size_t limit = configured < kSecureMaxPadding ? configured : kSecureMaxPadding;
+  return payload_size < kMinMtprotoMessage && limit > kTransportCodeMaxPadding
+             ? kTransportCodeMaxPadding
+             : limit;
+}
 inline constexpr std::size_t kAdTagSize = 16;
 inline constexpr std::size_t kMiddleEndDefaultMaxFrame = 1u << 24;
 // X25519MLKEM768 key_share sizes: ML-KEM-768 public key 1184 + X25519 32 for
@@ -536,6 +559,9 @@ class FakeTlsConnection {
     std::size_t max_client_hello{kFakeTlsMaxClientHello};
     std::size_t max_record_body{kFakeTlsMaxRecordBody};
     std::size_t max_pending_plaintext{1u << 20};
+    // Upper bound of the random Secure padding send_transport_message() adds
+    // (clamped to kSecureMaxPadding). 3 restores the historical 0..3.
+    std::size_t secure_max_padding{kSecureMaxPadding};
     ServerHelloOptions server_hello;
   };
 
@@ -563,14 +589,15 @@ class FakeTlsConnection {
               std::vector<std::uint8_t>& plaintext_out);
 
   // Encrypts and TLS-frames payload for the client, appending to to_client.
-  // Splits into <=16 KiB application-data records.
+  // Splits into application-data records of at most kFakeTlsServerRecordBody.
   //
   // Record coalescing: when @p open_record is non-null and holds the offset of
   // the last ApplicationData record header in @p to_client (kNoOpenRecord when
   // there is none), bytes are first appended to that record's body until it
-  // reaches 16 KiB, then new records follow. On return it names the last record
-  // written. AES-CTR is a continuous stream, so the client decodes extended and
-  // fresh records identically; this only removes per-message record headers.
+  // reaches kFakeTlsServerRecordBody, then new records follow. On return it
+  // names the last record written. AES-CTR is a continuous stream, so the
+  // client decodes extended and fresh records identically; this only removes
+  // per-message record headers.
   static constexpr std::size_t kNoOpenRecord = static_cast<std::size_t>(-1);
   Status send(std::span<const std::uint8_t> plaintext, std::vector<std::uint8_t>& to_client,
               std::size_t* open_record = nullptr);
@@ -637,8 +664,8 @@ class TransportDecoder {
   Bytes buffer_;
 };
 
-// Appends one framed server->client message. For Secure, 0..3 random padding
-// bytes are added when `random` is non-null (zero padding otherwise).
+// Appends one framed server->client message. For Secure, 0..kSecureMaxPadding
+// random padding bytes are added when `random` is non-null (zero otherwise).
 void encode_transport_message(ProtoTag tag, std::span<const std::uint8_t> data,
                               std::vector<std::uint8_t>& out, const RandomFn* random = nullptr);
 void encode_quick_ack(ProtoTag tag, std::array<std::uint8_t, 4> confirm,

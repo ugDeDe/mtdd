@@ -977,6 +977,7 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
     tls_config.max_client_hello = protocol::kFakeTlsMaxClientHello;
     tls_config.max_record_body = protocol::kFakeTlsMaxRecordBody;
     tls_config.max_pending_plaintext = detail::kReadBatch + 2U * protocol::kFakeTlsMaxRecordBody;
+    tls_config.secure_max_padding = config_.s2c_padding_max_bytes;
     if (!user.policy.tls_domain.empty()) {
         tls_config.expected_server_name = user.policy.tls_domain;
     } else if (!config_.tls_domain.empty()) {

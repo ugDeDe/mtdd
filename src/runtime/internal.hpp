@@ -1405,6 +1405,13 @@ struct Runtime::Impl {
         std::vector<std::uint8_t> s2c_batch;
         std::size_t s2c_open_record{protocol::FakeTlsConnection::kNoOpenRecord};
         bool in_s2c_batch{false};
+        // Latest RPC_SIMPLE_ACK confirm not yet sent. A quick ack is never
+        // written on its own: alone it would be a TLS record with a 4-byte
+        // body, which real TLS (>= 17 bytes of AEAD overhead) never sends. It
+        // rides in front of the next answer to this client instead; a newer
+        // ack replaces an unsent one. Quick acks are an optional hint to the
+        // client, so a late or dropped one costs nothing.
+        std::optional<std::array<std::uint8_t, 4>> pending_quick_ack;
         std::size_t s2c_offset{0};
         std::deque<protocol::TransportDecoder::Message> c2s;
         std::size_t c2s_capacity{0}; // allocated bytes of c2s message vectors

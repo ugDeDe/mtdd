@@ -381,6 +381,22 @@ TEST(Config, ServerHelloDelayIsOffByDefaultAndBounded) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, S2cPaddingMaxDefaultsToFifteenAndIsBounded) {
+    const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(defaults.s2c_padding_max_bytes, 15U);
+    EXPECT_EQ(defaults.public_view()["s2c_padding_max_bytes"].get<std::uint32_t>(), 15U);
+
+    auto value = minimal_config();
+    value["s2c_padding_max_bytes"] = 3;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").s2c_padding_max_bytes, 3U);
+    value["s2c_padding_max_bytes"] = 0;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").s2c_padding_max_bytes, 0U);
+    value["s2c_padding_max_bytes"] = 16;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["s2c_padding_max_bytes"] = -1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Config, ServerHelloDelayAutoIsOnByDefaultAndBoolean) {
     const auto defaults = mtdd::Config::parse(minimal_config(), "/work");
     EXPECT_TRUE(defaults.server_hello_delay_auto);

@@ -825,7 +825,7 @@ Status FakeTlsConnection::send(std::span<const std::uint8_t> plaintext,
                                std::vector<std::uint8_t>& to_client, std::size_t* open_record) {
   auto& s = *impl_;
   if (s.state != State::Ready) return Status::ProtocolError;
-  constexpr std::size_t kMaxBody = 16384;
+  constexpr std::size_t kMaxBody = kFakeTlsServerRecordBody;
   const std::size_t records = plaintext.size() / kMaxBody + (plaintext.size() % kMaxBody != 0);
   const std::size_t available = to_client.max_size() - to_client.size();
   if (plaintext.size() > available || records > (available - plaintext.size()) / kTlsHeaderSize) {
@@ -883,11 +883,11 @@ Status FakeTlsConnection::send_transport_message(ProtoTag tag,
   if (s.state != State::Ready) return Status::ProtocolError;
 
   std::size_t padding = 0;
-  std::array<std::uint8_t, 3> pad{};
+  std::array<std::uint8_t, kSecureMaxPadding> pad{};
   if (tag == ProtoTag::Secure && random) {
     std::uint8_t r = 0;
     random(std::span<std::uint8_t>(&r, 1));
-    padding = r % 4;
+    padding = r % (secure_padding_limit(payload.size(), s.cfg.secure_max_padding) + 1);
     if (padding) random(std::span<std::uint8_t>(pad).first(padding));
   }
 
@@ -902,7 +902,7 @@ Status FakeTlsConnection::send_transport_message(ProtoTag tag,
   }
 
   const std::size_t frame_size = 4 + payload.size() + padding;
-  constexpr std::size_t kMaxBody = 16384;
+  constexpr std::size_t kMaxBody = kFakeTlsServerRecordBody;
   const std::size_t records = frame_size / kMaxBody + (frame_size % kMaxBody != 0);
   const std::size_t available = to_client.max_size() - to_client.size();
   if (frame_size > available || records > (available - frame_size) / kTlsHeaderSize) {

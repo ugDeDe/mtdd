@@ -64,7 +64,7 @@ TEST(FakeTlsSend, PreallocatedOutputNeedsNoPerRecordCppAllocation) {
 TEST(FakeTlsSend, MultiRecordAppendPreservesPrefixAndCipherContinuity) {
     auto connection = ready_fake_tls();
     auto decryptor = fake_tls_client_decryptor();
-    for (const std::size_t size : {0u, 1u, 16383u, 16384u, 16385u, 131073u}) {
+    for (const std::size_t size : {0u, 1u, 16383u, 16384u, 16385u, 16401u, 16402u, 131073u}) {
         Bytes plaintext(size);
         for (std::size_t i = 0; i < size; ++i) plaintext[i] = static_cast<std::uint8_t>(i * 17);
         const auto original = plaintext;
@@ -83,7 +83,7 @@ TEST(FakeTlsSend, MultiRecordAppendPreservesPrefixAndCipherContinuity) {
             const std::size_t length = (static_cast<std::size_t>(output[offset + 3]) << 8) |
                                        output[offset + 4];
             ASSERT_GT(length, 0u);
-            ASSERT_LE(length, 16384u);
+            ASSERT_LE(length, protocol::kFakeTlsServerRecordBody);
             ASSERT_LE(length, output.size() - offset - 5);
             auto body = std::span<std::uint8_t>(output).subspan(offset + 5, length);
             decryptor.apply(body);
@@ -107,7 +107,7 @@ Bytes decode_records(const Bytes& wire, protocol::crypto::AesCtr& decryptor,
         const std::size_t length =
             (static_cast<std::size_t>(wire[offset + 3]) << 8) | wire[offset + 4];
         EXPECT_GT(length, 0u);
-        EXPECT_LE(length, 16384u);
+        EXPECT_LE(length, protocol::kFakeTlsServerRecordBody);
         EXPECT_LE(length, wire.size() - offset - 5);
         Bytes body(wire.begin() + static_cast<std::ptrdiff_t>(offset + 5),
                    wire.begin() + static_cast<std::ptrdiff_t>(offset + 5 + length));
@@ -224,6 +224,104 @@ TEST(FakeTlsSend, BatchCapacityGrowsGeometricallyAndStreamIsIntact) {
         pos += 4 + len;
     }
     EXPECT_EQ(pos, stream.size());
+}
+
+// Record body lengths of `wire`, in order.
+std::vector<std::size_t> record_lengths(const Bytes& wire) {
+    std::vector<std::size_t> lengths;
+    std::size_t offset = 0;
+    while (wire.size() - offset >= 5) {
+        const std::size_t length =
+            (static_cast<std::size_t>(wire[offset + 3]) << 8) | wire[offset + 4];
+        lengths.push_back(length);
+        offset += 5 + length;
+    }
+    EXPECT_EQ(offset, wire.size());
+    return lengths;
+}
+
+TEST(FakeTlsSend, FullRecordsHaveTls13AeadLength) {
+    // A full TLS 1.3 AEAD record is 2^14 + 1 + 16 = 16401 bytes; a bare 16384
+    // never appears in real TLS. Bulk data must use the real full length.
+    static_assert(protocol::kFakeTlsServerRecordBody == 16401);
+    static_assert(protocol::kFakeTlsServerRecordBody <= protocol::kFakeTlsMaxRecordBody);
+    constexpr std::size_t kFull = protocol::kFakeTlsServerRecordBody;
+    {
+        auto connection = ready_fake_tls();
+        auto decryptor = fake_tls_client_decryptor();
+        Bytes plaintext(3 * kFull + 5);
+        for (std::size_t i = 0; i < plaintext.size(); ++i) {
+            plaintext[i] = static_cast<std::uint8_t>(i * 11);
+        }
+        Bytes wire;
+        std::size_t open = protocol::FakeTlsConnection::kNoOpenRecord;
+        ASSERT_EQ(connection.send(plaintext, wire, &open), protocol::Status::Ok);
+        EXPECT_EQ(record_lengths(wire), (std::vector<std::size_t>{kFull, kFull, kFull, 5}));
+        std::size_t records = 0;
+        EXPECT_EQ(decode_records(wire, decryptor, records), plaintext);
+    }
+    {
+        // Fused framing: a 64 KiB answer extending an open record fills it to
+        // exactly 16401 and continues in full-size records.
+        auto connection = ready_fake_tls();
+        auto decryptor = fake_tls_client_decryptor();
+        std::uint8_t state = 1;
+        const protocol::RandomFn random([&state](std::span<std::uint8_t> out) {
+            for (auto& byte : out) byte = state++;
+        });
+        Bytes wire;
+        std::size_t open = protocol::FakeTlsConnection::kNoOpenRecord;
+        const Bytes small(40, 0x11);
+        const Bytes large(64 * 1024, 0x22);
+        ASSERT_EQ(connection.send_transport_message(protocol::ProtoTag::Secure, small, wire,
+                                                    random, &open),
+                  protocol::Status::Ok);
+        ASSERT_EQ(connection.send_transport_message(protocol::ProtoTag::Secure, large, wire,
+                                                    random, &open),
+                  protocol::Status::Ok);
+        const auto lengths = record_lengths(wire);
+        ASSERT_GE(lengths.size(), 2u);
+        for (std::size_t i = 0; i + 1 < lengths.size(); ++i) EXPECT_EQ(lengths[i], kFull) << i;
+        EXPECT_GT(lengths.back(), 0u);
+        EXPECT_LE(lengths.back(), kFull);
+        std::size_t records = 0;
+        const Bytes stream = decode_records(wire, decryptor, records);
+        // Two frames: 4-byte headers, payloads, up to 15 padding bytes each.
+        const std::size_t framed = 4 + small.size() + 4 + large.size();
+        ASSERT_GE(stream.size(), framed);
+        EXPECT_LE(stream.size() - framed, 2 * protocol::kSecureMaxPadding);
+        EXPECT_EQ(Bytes(stream.begin() + 4, stream.begin() + 4 + 40), small);
+    }
+}
+
+TEST(FakeTlsSend, FusedSendKeepsTransportCodesWithinThreePaddingBytes) {
+    // The ME path (send_transport_message) carries Telegram's 4-byte -404:
+    // whatever the configured maximum, it must keep a client-recognizable size.
+    std::size_t largest_code = 0;
+    std::size_t largest_message = 0;
+    for (unsigned value = 0; value < 256; ++value) {
+        for (const std::size_t size : {4u, 40u}) {
+            auto connection = ready_fake_tls();
+            auto decryptor = fake_tls_client_decryptor();
+            bool first = true;
+            const protocol::RandomFn random([&](std::span<std::uint8_t> out) {
+                for (auto& byte : out) byte = first ? static_cast<std::uint8_t>(value) : 0x5a;
+                first = false;
+            });
+            Bytes wire;
+            ASSERT_EQ(connection.send_transport_message(protocol::ProtoTag::Secure,
+                                                        Bytes(size, 0xfc), wire, random),
+                      protocol::Status::Ok);
+            std::size_t records = 0;
+            const Bytes stream = decode_records(wire, decryptor, records);
+            ASSERT_GE(stream.size(), 4u + size);
+            const std::size_t padding = stream.size() - 4 - size;
+            auto& largest = size == 4 ? largest_code : largest_message;
+            largest = std::max(largest, padding);
+        }
+    }
+    EXPECT_EQ(largest_code, protocol::kTransportCodeMaxPadding);
+    EXPECT_EQ(largest_message, protocol::kSecureMaxPadding);
 }
 
 TEST(FakeTlsSend, AliasedInputSurvivesOutputReallocation) {

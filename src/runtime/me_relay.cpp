@@ -482,6 +482,19 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         return;
     }
     try {
+        if (client.pending_quick_ack) {
+            // Same open record as the answer below: the ack is never a record
+            // of its own (see Client::pending_quick_ack).
+            frame_buffer_.clear();
+            protocol::encode_quick_ack(client.tls->proto_tag(), *client.pending_quick_ack,
+                                       frame_buffer_);
+            client.pending_quick_ack.reset();
+            if (client.tls->send(frame_buffer_, client.s2c_batch, &client.s2c_open_record) !=
+                protocol::Status::Ok) {
+                defer_close(client.token);
+                return;
+            }
+        }
         // Fused transport framing + TLS record encoding: the intermediate
         // transport header/padding is written directly into the TLS record body
         // (byte-identical wire for the same random stream), so no separate
@@ -559,28 +572,9 @@ void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
         // Ownership mismatch: never close another writer's logical connection.
         return;
     }
-    try {
-        frame_buffer_.clear();
-        protocol::encode_quick_ack(client.tls->proto_tag(), confirm, frame_buffer_);
-        // Same ordered stream as payload answers of this ME read.
-        if (client.tls->send(frame_buffer_, client.s2c_batch, &client.s2c_open_record) !=
-            protocol::Status::Ok) {
-            defer_close(client.token);
-            detail::trim_scratch(frame_buffer_);
-            return;
-        }
-        if (!client.in_s2c_batch) {
-            client.in_s2c_batch = true;
-            s2c_batch_tokens_.push_back(client.token);
-        }
-    } catch (const std::bad_alloc&) {
-        defer_close(client.token);
-    } catch (const std::exception&) {
-        defer_me_failure(me);
-    } catch (...) {
-        defer_me_failure(me);
-    }
-    detail::trim_scratch(frame_buffer_);
+    // Held until the next answer to this client (deliver_payload) so it is
+    // never a TLS record of its own.
+    client.pending_quick_ack = confirm;
 }
 
 void Runtime::Impl::MeSink::on_proxy_payload(const detail::ConnId& id,
